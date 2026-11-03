@@ -194,7 +194,9 @@ fn pulse(world: &World, now: i64) -> Vec<Job> {
     }
     crate::svc::jumps::orphaned_cynos(&mut w);
     crate::svc::jumps::close_bridges(&mut w, now);
-    out.deliver(&w)
+    let jobs = out.deliver(&w);
+    crate::svc::space::refresh_views(&w);
+    jobs
 }
 
 async fn perform(server: &Server, db: &mut Client, job: Job) {

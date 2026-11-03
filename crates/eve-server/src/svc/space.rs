@@ -6,6 +6,8 @@
 //! client in the system, which then runs the same motion locally. A client that
 //! (re)builds its ballpark gets a SetState of the whole park.
 
+use std::collections::HashSet;
+
 use eve_marshal::Value;
 use tracing::{debug, warn};
 
@@ -25,6 +27,12 @@ const CELESTIAL_GROUPS: [i32; 6] = [6, 7, 8, 9, 10, 15];
 const DEFAULT_WARP_RANGE: f64 = 15_000.0;
 /// The menu's "approach" with no range (menusvc.py:1598 `range or 50`).
 const DEFAULT_FOLLOW_RANGE: f64 = 50.0;
+/// How far from their own ship a pilot sees other ships: their grid. The
+/// client's ballpark (and so its overview) holds only these. A ship comes into
+/// view inside GRID_RANGE and leaves it beyond GRID_RANGE_OUT, so one on the
+/// edge does not flicker in and out.
+pub const GRID_RANGE: f64 = 300_000.0;
+const GRID_RANGE_OUT: f64 = 330_000.0;
 
 /// `ship`: Undock is served by `conn` (it changes the session); nothing else
 /// on the ship object is implemented yet.
@@ -185,8 +193,151 @@ pub fn broadcast(world: &WorldState, solar_system_id: i64, only: Option<i64>, en
         Some(c) => vec![c],
         None => world.in_space(solar_system_id),
     };
-    let args = Value::Tuple(vec![Value::List(entries), Value::Int(0)]);
-    world.notify(&targets, "DoDestinyUpdate", args);
+    send(world, solar_system_id, &targets, &entries);
+}
+
+/// DoDestinyUpdate to each of `clients`, less what concerns ships off its grid.
+pub fn send(world: &WorldState, solar_system_id: i64, clients: &[i64], entries: &[Value]) {
+    if entries.is_empty() {
+        return;
+    }
+    let park = world.parks.get(&solar_system_id);
+    for &client in clients {
+        let ego = park.and_then(|p| ego_of(p, client));
+        let Some(mine) = world.with_hidden(client, |hidden| {
+            entries.iter().filter_map(|e| sift(e, park, ego, hidden)).collect::<Vec<_>>()
+        }) else {
+            continue;
+        };
+        if !mine.is_empty() {
+            world.notify(&[client], "DoDestinyUpdate", Value::Tuple(vec![Value::List(mine), Value::Int(0)]));
+        }
+    }
+}
+
+/// The ship `client_id` flies in `park`.
+fn ego_of(park: &Park, client_id: i64) -> Option<&Ship> {
+    park.ships.values().find(|s| s.client_id == client_id && s.is_player())
+}
+
+/// Whether `ship` is on `ego`'s grid; `shown` if the client has it already.
+fn on_grid(ego: &Ship, ship: &Ship, shown: bool) -> bool {
+    let reach = if shown { GRID_RANGE_OUT } else { GRID_RANGE };
+    ship.id == ego.id || (ship.pos - ego.pos).len_sq() <= reach * reach
+}
+
+/// The ships a SetState for `ego` leaves out: those off its grid, and other
+/// pilots' cloaked ones.
+pub fn hidden_from(park: &Park, ego: i64) -> HashSet<i64> {
+    let Some(me) = park.ships.get(&ego) else { return HashSet::new() };
+    park.ships
+        .values()
+        .filter(|s| s.id != ego && (s.cloaked || !on_grid(me, s, false)))
+        .map(|s| s.id)
+        .collect()
+}
+
+/// A destiny entry's opcode and arguments.
+fn parts(e: &Value) -> Option<(&[u8], &[Value])> {
+    let call = e.seq()?.get(1)?.seq()?;
+    Some((call.first()?.as_bytes()?, call.get(1)?.seq()?))
+}
+
+/// A slim item's itemID.
+fn slim_id(slim: &Value) -> Option<i64> {
+    match slim {
+        Value::Instance { state, .. } => state.get_str("itemID")?.as_i64(),
+        _ => None,
+    }
+}
+
+/// One destiny entry as a client with `hidden` ships is to get it, if at all.
+/// An AddBalls for a single ship decides whether the client has it; a
+/// RemoveBalls loses the ships it never had; anything else about a hidden ship
+/// is dropped.
+fn sift(e: &Value, park: Option<&Park>, ego: Option<&Ship>, hidden: &mut HashSet<i64>) -> Option<Value> {
+    let Some((opcode, args)) = parts(e) else { return Some(e.clone()) };
+    let arg_id = |i: usize| args.get(i).and_then(Value::as_i64);
+    match opcode {
+        b"SetState" => Some(e.clone()),
+        b"AddBalls" => {
+            let slims = args.first().and_then(Value::seq).and_then(|c| c.get(1)).and_then(Value::seq).unwrap_or(&[]);
+            let ship = match slims {
+                [one] => slim_id(one).and_then(|id| park?.ships.get(&id)),
+                _ => None,
+            };
+            match (ship, ego) {
+                (Some(s), Some(me)) if s.id != me.id => {
+                    if !s.cloaked && on_grid(me, s, false) {
+                        hidden.remove(&s.id);
+                        Some(e.clone())
+                    } else {
+                        hidden.insert(s.id);
+                        None
+                    }
+                }
+                _ => Some(e.clone()),
+            }
+        }
+        b"RemoveBalls" => {
+            let Some(ids) = args.first().and_then(Value::seq) else { return Some(e.clone()) };
+            let kept: Vec<Value> =
+                ids.iter().filter(|v| !v.as_i64().is_some_and(|id| hidden.remove(&id))).cloned().collect();
+            if kept.is_empty() {
+                None
+            } else if kept.len() == ids.len() {
+                Some(e.clone())
+            } else {
+                let stamp = e.seq().and_then(|t| t.first()).cloned().unwrap_or(Value::Int(0));
+                Some(Value::Tuple(vec![
+                    stamp,
+                    Value::Tuple(vec![Value::bytes("RemoveBalls"), Value::Tuple(vec![Value::List(kept)])]),
+                ]))
+            }
+        }
+        b"OnSpecialFX" if arg_id(3).is_some_and(|t| hidden.contains(&t)) => None,
+        _ if arg_id(0).is_some_and(|id| hidden.contains(&id)) => None,
+        _ => Some(e.clone()),
+    }
+}
+
+/// Brings every in-space client's view up to date with where the ships are:
+/// AddBalls for those that came onto its grid, RemoveBalls for those that
+/// left it. Cloaked ships are `cloak`'s business.
+pub fn refresh_views(world: &WorldState) {
+    for park in world.parks.values() {
+        if park.players().next().is_none() {
+            continue;
+        }
+        for client in world.in_space(park.solar_system_id) {
+            let Some(me) = ego_of(park, client) else { continue };
+            let mut entries = Vec::new();
+            let mut gone = Vec::new();
+            world.with_hidden(client, |hidden| {
+                hidden.retain(|id| park.ships.contains_key(id));
+                for s in park.ships.values().filter(|s| s.id != me.id && !s.cloaked) {
+                    let shown = !hidden.contains(&s.id);
+                    match (shown, on_grid(me, s, shown)) {
+                        (false, true) => {
+                            hidden.remove(&s.id);
+                            entries.extend(add_ball_entries(park, s.id));
+                        }
+                        (true, false) => {
+                            hidden.insert(s.id);
+                            gone.push(Value::Int(s.id));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            if !gone.is_empty() {
+                entries.insert(0, entry(park.tick, "RemoveBalls", vec![Value::List(gone)]));
+            }
+            if !entries.is_empty() {
+                world.notify(&[client], "DoDestinyUpdate", Value::Tuple(vec![Value::List(entries), Value::Int(0)]));
+            }
+        }
+    }
 }
 
 fn ship_ball(ship: &Ship) -> Ball {
@@ -304,6 +455,14 @@ pub fn command_entry(ship: &Ship, tick: i64) -> Value {
     }
 }
 
+/// effects.Warping for a ship that has just been given a warp: after WarpTo,
+/// so destiny already has the ball in warp mode. The client's effect draws the
+/// tunnel and the "Warp Drive Active" indication for its own ship, and stops
+/// itself once the ball leaves warp (warp.py ShakeCameraAndDoStuff).
+pub fn warp_fx(ship: &Ship, tick: i64) -> Option<Value> {
+    ship.warping().then(|| special_fx(tick, ship.id, None, "effects.Warping"))
+}
+
 /// The opcodes that put a ship back on its current course, for a client that
 /// has just been given the ship standing still.
 pub fn course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
@@ -315,7 +474,13 @@ pub fn course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
 }
 
 /// SetState for `ego`: the whole park, then every moving ship's course.
-pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)], char_gangs: &[(i64, i64)]) -> Vec<Value> {
+pub fn set_state_entries(
+    park: &Park,
+    ego: i64,
+    hidden: &HashSet<i64>,
+    station_owners: &[(i64, i64)],
+    char_gangs: &[(i64, i64)],
+) -> Vec<Value> {
     const DRONE_HEADER: &[&str] =
         &["droneID", "ownerID", "controllerID", "activityState", "typeID", "controllerOwnerID"];
     let mut balls: Vec<Ball> = park
@@ -351,8 +516,8 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)], c
             slims.push(f.slim(s));
         }
     }
-    // Cloaked ships are seen only by their pilots.
-    for ship in park.ships.values().filter(|s| !s.cloaked || s.id == ego) {
+    // Cloaked ships are seen only by their pilots; ships off the grid not at all.
+    for ship in park.ships.values().filter(|s| (!s.cloaked || s.id == ego) && !hidden.contains(&s.id)) {
         balls.push(ship_ball(ship));
         slims.push(ship_slim(ship));
         damage.push((Value::Int(ship.id), health(ship)));
@@ -383,9 +548,11 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)], c
         ("allianceBridges", Value::List(Vec::new())),
     ]);
     let mut entries = vec![entry(park.tick, "SetState", vec![bag])];
-    for ship in park.ships.values() {
+    for ship in park.ships.values().filter(|s| !hidden.contains(&s.id)) {
         entries.extend(course_entries(ship, park.tick));
     }
+    // Reset mid-warp: the pilot's tunnel goes on.
+    entries.extend(park.ships.get(&ego).and_then(|s| warp_fx(s, park.tick)));
     entries
 }
 
@@ -447,8 +614,7 @@ pub fn add_ship(world: &mut WorldState, system: i64, ship: Ship) {
     park.ships.insert(ship_id, ship);
     let entries = add_ball_entries(park, ship_id);
     let others: Vec<i64> = world.in_space(system).into_iter().filter(|c| *c != owner).collect();
-    let args = Value::Tuple(vec![Value::List(entries), Value::Int(0)]);
-    world.notify(&others, "DoDestinyUpdate", args);
+    send(world, system, &others, &entries);
 }
 
 /// Gives a ship in a park a new course and tells the system (a warp opens
@@ -467,6 +633,7 @@ pub fn order(world: &mut WorldState, system: i64, ship_id: i64, command: Command
     }
     park.command(ship_id, command);
     entries.insert(0, command_entry(&park.ships[&ship_id], tick));
+    entries.extend(warp_fx(&park.ships[&ship_id], tick));
     broadcast(world, system, None, entries);
 }
 
@@ -482,8 +649,7 @@ pub fn remove_ship(world: &mut WorldState, system: i64, ship_id: i64) -> Option<
     let entries = remove_ball_entries(park.tick, ship_id);
     out.deliver(world);
     let others: Vec<i64> = world.in_space(system).into_iter().filter(|c| *c != ship.client_id).collect();
-    let args = Value::Tuple(vec![Value::List(entries), Value::Int(0)]);
-    world.notify(&others, "DoDestinyUpdate", args);
+    send(world, system, &others, &entries);
     Some(ship)
 }
 
@@ -505,11 +671,14 @@ async fn push_set_state(ctx: &Ctx<'_>) {
     let pilots: Vec<i64> = park.ships.values().map(|s| s.pilot.char_id).filter(|c| *c != 0).collect();
     let char_gangs = world.gangs.memberships(pilots);
     let Some(park) = world.parks.get(&system) else { return };
-    let mut entries = set_state_entries(park, ship_id, &owners, &char_gangs);
+    let hidden = hidden_from(park, ship_id);
+    let mut entries = set_state_entries(park, ship_id, &hidden, &owners, &char_gangs);
+    let shown = park.ships.len() - hidden.len();
+    world.with_hidden(ctx.client_id, |h| *h = hidden);
     if let Some(gate) = arrival {
         entries.push(special_fx(park.tick, ship_id, Some(gate), "effects.JumpIn"));
     }
-    debug!("SetState: {} ball(s), ego {ship_id}", park.celestials.len() + park.ships.len());
+    debug!("SetState: {} ball(s), ego {ship_id}", park.celestials.len() + shown);
     broadcast(&world, system, Some(ctx.client_id), entries);
     world.sees(ctx.client_id, system);
 }
@@ -632,6 +801,7 @@ fn steer(ctx: &Ctx<'_>, system: i64, ship_id: i64, order: Order, method: &str) -
             }
             park.command(ship_id, command);
             entries.insert(0, command_entry(&park.ships[&ship_id], tick));
+            entries.extend(warp_fx(&park.ships[&ship_id], tick));
             (entries, what)
         }
     };
@@ -839,7 +1009,7 @@ mod tests {
     #[test]
     fn set_state_comes_first_and_moving_ships_are_put_back_on_course() {
         let park = park_with_moving_ship();
-        let entries = set_state_entries(&park, 1, &[], &[]);
+        let entries = set_state_entries(&park, 1, &HashSet::new(), &[], &[]);
         let opcode = |e: &Value| match e {
             Value::Tuple(t) => match &t[1] {
                 Value::Tuple(ev) => ev[0].clone(),

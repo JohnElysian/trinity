@@ -83,6 +83,11 @@ struct Client {
     /// The system whose ballpark the client has been sent (SetState). Until
     /// then it has no ballpark, and a destiny update would fail in michelle.
     sees: Option<i64>,
+    /// Ships in that ballpark the client has not been given, being off its
+    /// grid (or cloaked): destiny updates about them are held back
+    /// (`space::send`). Behind its own lock so a broadcast, which only reads
+    /// the world, can keep it current.
+    hidden: Mutex<HashSet<i64>>,
 }
 
 struct Channel {
@@ -209,7 +214,7 @@ impl WorldState {
     /// Registers a connection; notifications for it arrive on the receiver.
     pub fn connect(&mut self, client_id: i64) -> UnboundedReceiver<Push> {
         let (tx, rx) = unbounded_channel();
-        self.clients.insert(client_id, Client { tx, presence: None, sees: None });
+        self.clients.insert(client_id, Client { tx, presence: None, sees: None, hidden: Mutex::default() });
         rx
     }
 
@@ -235,6 +240,9 @@ impl WorldState {
             // Docked or gone elsewhere, its ballpark is gone with it.
             if presence.is_none_or(|p| p.docked || Some(p.solar_system_id) != c.sees) {
                 c.sees = None;
+                if let Ok(h) = c.hidden.get_mut() {
+                    h.clear();
+                }
             }
             c.presence = presence;
         }
@@ -247,6 +255,13 @@ impl WorldState {
         }
     }
 
+
+    /// Runs `f` on the ships hidden from `client_id`; None if it is not connected.
+    pub fn with_hidden<R>(&self, client_id: i64, f: impl FnOnce(&mut HashSet<i64>) -> R) -> Option<R> {
+        let c = self.clients.get(&client_id)?;
+        let mut hidden = c.hidden.lock().unwrap_or_else(|e| e.into_inner());
+        Some(f(&mut hidden))
+    }
 
     /// The connections playing `char_id` (at most one, in practice).
     pub fn clients_of(&self, char_id: i64) -> Vec<i64> {
