@@ -1,4 +1,4 @@
-# RMR server settings. Restart the server after changing this file.
+# Trinity server settings. Restart the server after changing this file.
 # Anything left out takes the default shown here. An RMR_* environment
 # variable, where one is named, overrides the setting.
 

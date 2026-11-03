@@ -12,15 +12,41 @@ pub async fn tutorial_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "GetTutorialInfo" => tutorial_info(ctx, arg(0).unwrap_or(0)).await,
         "GetTutorialVersionInfo" => tutorial_info(ctx, arg(0).unwrap_or(0)).await,
 
-        "LogAppClosed" | "LogClosed" | "LogAborted" | "LogCompleted" => Value::None,
-        // Trinity restores a pilot's tutorial progress from these events
-        // (tutorialsvc.py GetCharacterTutorialState) when its own settings
-        // have none; none recorded means it starts from its defaults.
-        "GetCharacterTutorialState" => Value::List(Vec::new()),
+        "LogAppClosed" | "LogClosed" | "LogAborted" | "LogCompleted" => return Some(log_progress(call,ctx).await),
+        "GetCharacterTutorialState" => ctx.rowset(&["tutorialID","pageID","eventTypeID"],
+            r#"SELECT "tutorialID","pageID","eventTypeID" FROM "chrTutorialState" WHERE "characterID"=$1 ORDER BY "updatedAt","tutorialID""#,
+            &[&(ctx.session.char_id.unwrap_or(0) as i32)]).await,
 
         _ => return None,
     };
     Some(Outcome::Value(value))
+}
+
+pub async fn ensure(db:&tokio_postgres::Client) -> Result<(),tokio_postgres::Error> {
+    db.batch_execute(r#"CREATE TABLE IF NOT EXISTS "chrTutorialState" (
+        "characterID" integer NOT NULL,"tutorialID" integer NOT NULL,"pageID" integer NOT NULL,
+        "eventTypeID" integer NOT NULL,"elapsedSeconds" bigint NOT NULL,"updatedAt" bigint NOT NULL,
+        PRIMARY KEY ("characterID","tutorialID"))"#).await
+}
+
+async fn log_progress(call:&Call,ctx:&Ctx<'_>) -> Outcome {
+    let Some(character)=ctx.session.char_id else {return Outcome::custom("Select a character first.")};
+    let Some(tutorial)=call.arg_i64(0).and_then(|id|i32::try_from(id).ok()).filter(|id|*id>0) else {return Outcome::custom("Invalid tutorial.")};
+    let Some(page)=call.arg_i64(1).and_then(|id|i32::try_from(id).ok()).filter(|id|*id>=0) else {return Outcome::custom("Invalid tutorial page.")};
+    let elapsed=call.arg_i64(2).unwrap_or(0).max(0);
+    // tutorialsvc.py: 155 finishes a sequence, 158 disables tutorials. The
+    // original event IDs for both resumable close events are unavailable;
+    // 0 represents their shared client-visible nonterminal behavior.
+    let event=match call.method.as_str(){"LogCompleted"=>155i32,"LogAborted"=>158,_=>0};
+    let result=ctx.db.execute(r#"INSERT INTO "chrTutorialState" ("characterID","tutorialID","pageID","eventTypeID","elapsedSeconds","updatedAt")
+        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT ("characterID","tutorialID") DO UPDATE
+        SET "pageID"=$3,"eventTypeID"=CASE WHEN "chrTutorialState"."eventTypeID" IN (155,158) AND $4=0
+            THEN "chrTutorialState"."eventTypeID" ELSE $4 END,"elapsedSeconds"=$5,"updatedAt"=$6"#,
+        &[&(character as i32),&tutorial,&page,&event,&elapsed,&crate::bulkdata::filetime_now()]).await;
+    match result {
+        Ok(_)=>Outcome::Value(Value::None),
+        Err(e)=>{error!("saving tutorial progress: {}",crate::logging::chain(&e));Outcome::custom("Tutorial progress could not be saved.")}
+    }
 }
 
 /// Trinity tutorial IDs this data has no tutorial for, and the tutorial whose
@@ -63,7 +89,9 @@ async fn tutorial_info(ctx: &Ctx<'_>, tutorial_id: i64) -> Value {
 
     // An aliased tutorial shows its source's pages under its own ID.
     let asked = tutorial_id as i32;
-    let id = alias_source(asked);
+    let id = if ctx.query_one(r#"SELECT 1 FROM tutorials WHERE "tutorialID"=$1"#,&[&asked]).await.is_some() {
+        asked
+    } else {alias_source(asked)};
 
     let tutorial_sql = r#"SELECT $2::integer,"tutorialVName","nextTutorialID"
                             FROM tutorials WHERE "tutorialID" = $1"#;
@@ -101,4 +129,39 @@ async fn tutorial_info(ctx: &Ctx<'_>, tutorial_id: i64) -> Value {
         ("criterias", criterias),
         ("pagecriterias", pagecriterias),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn progress_survives_reconnect_and_close_preserves_completion() {
+        let fixture = crate::test_support::Database::load().await;
+        let character = fixture.id().await;
+        let session = crate::session::Session { char_id: Some(character as i64), ..Default::default() };
+        let ctx = fixture.ctx(&session);
+        let call = |method: &str, tutorial, page| Call {
+            service: "tutorialSvc".into(), method: method.into(),
+            args: vec![Value::Int(tutorial), Value::Int(page), Value::Int(47)], kwargs: vec![],
+        };
+        for (method, tutorial, page) in [("LogClosed", 5, 2), ("LogCompleted", 7, 8), ("LogAppClosed", 7, 8), ("LogAborted", 9, 1)] {
+            assert!(matches!(tutorial_svc(&call(method, tutorial, page), &ctx).await, Some(Outcome::Value(Value::None))));
+        }
+        assert!(matches!(tutorial_svc(&call("LogClosed", 5, -1), &ctx).await, Some(Outcome::UserError { .. })));
+        let connection = crate::db::connect(&fixture.url).await.unwrap();
+        let rows = connection.query(r#"SELECT "tutorialID","pageID","eventTypeID","elapsedSeconds" FROM "chrTutorialState" WHERE "characterID"=$1 ORDER BY "tutorialID""#, &[&character]).await.unwrap();
+        let saved: Vec<(i32, i32, i32, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect();
+        assert_eq!(saved, vec![(5, 2, 0, 47), (7, 8, 155, 47), (9, 1, 158, 47)]);
+        let read = Call { service: "tutorialSvc".into(), method: "GetCharacterTutorialState".into(), args: vec![], kwargs: vec![] };
+        let expected = rowset(&["tutorialID", "pageID", "eventTypeID"], vec![
+            Value::List(vec![Value::Int(5), Value::Int(2), Value::Int(0)]),
+            Value::List(vec![Value::Int(7), Value::Int(8), Value::Int(155)]),
+            Value::List(vec![Value::Int(9), Value::Int(1), Value::Int(158)]),
+        ]);
+        assert!(matches!(tutorial_svc(&read, &ctx).await, Some(Outcome::Value(value)) if value == expected));
+        let other = crate::session::Session { char_id: Some(fixture.id().await as i64), ..Default::default() };
+        assert!(matches!(tutorial_svc(&read, &fixture.ctx(&other)).await, Some(Outcome::Value(value)) if value == rowset(&["tutorialID", "pageID", "eventTypeID"], vec![])));
+    }
 }

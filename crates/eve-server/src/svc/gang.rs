@@ -33,7 +33,7 @@ const ACTIVE: &str = "Active";
 #[derive(Debug, Default)]
 pub struct Gangs {
     next_id: i64,
-    gangs: HashMap<i64, Gang>,
+    pub(super) gangs: HashMap<i64, Gang>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -42,6 +42,7 @@ pub struct Gang {
     /// In the order they joined.
     pub members: Vec<i64>,
     pub invited: Vec<i64>,
+    pub fleet: Option<super::fleet::Fleet>,
 }
 
 impl Gang {
@@ -53,12 +54,19 @@ impl Gang {
 
 /// Who is left after a member goes, and whether they led.
 #[derive(Debug, PartialEq)]
-struct Departure {
+pub(super) struct Departure {
     rest: Vec<i64>,
     was_leader: bool,
 }
 
 impl Gangs {
+    #[cfg(test)]
+    pub(crate) fn test_members(&mut self, members: Vec<i64>) -> i64 {
+        let id=self.form(members[0]);
+        self.gangs.get_mut(&id).unwrap().members=members;
+        id
+    }
+
     /// The gang `char_id` is a member of.
     pub fn of(&self, char_id: i64) -> Option<i64> {
         self.gangs.iter().find(|(_, g)| g.members.contains(&char_id)).map(|(id, _)| *id)
@@ -73,14 +81,14 @@ impl Gangs {
         char_ids.into_iter().filter_map(|c| self.of(c).map(|g| (c, g))).collect()
     }
 
-    fn form(&mut self, leader: i64) -> i64 {
+    pub(super) fn form(&mut self, leader: i64) -> i64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.gangs.insert(id, Gang { leader: Some(leader), members: vec![leader], invited: Vec::new() });
+        self.gangs.insert(id, Gang { leader: Some(leader), members: vec![leader], invited: Vec::new(), fleet: None });
         id
     }
 
-    fn join(&mut self, gang_id: i64, char_id: i64) -> bool {
+    pub(super) fn join(&mut self, gang_id: i64, char_id: i64) -> bool {
         let Some(g) = self.gangs.get_mut(&gang_id) else { return false };
         if !g.invited.contains(&char_id) {
             return false;
@@ -92,7 +100,7 @@ impl Gangs {
         true
     }
 
-    fn depart(&mut self, gang_id: i64, char_id: i64) -> Option<Departure> {
+    pub(super) fn depart(&mut self, gang_id: i64, char_id: i64) -> Option<Departure> {
         let g = self.gangs.get_mut(&gang_id)?;
         if !g.members.contains(&char_id) {
             return None;
@@ -264,9 +272,12 @@ fn invite_bot(ctx: &Ctx<'_>, me: i64, invitee: i64, mine: Option<&(i64, Gang)>) 
 /// A hired bot joins the gang it was invited to.
 pub fn bot_joins(w: &mut WorldState, gang_id: i64, bot: i64) {
     let Some(g) = w.gangs.gangs.get_mut(&gang_id) else { return };
-    g.invited.retain(|c| *c != bot);
     let before = g.members.clone();
-    w.gangs.join(gang_id, bot);
+    if !w.gangs.join(gang_id, bot) { return; }
+    if w.gangs.get(gang_id).is_some_and(|g| g.fleet.is_some()) {
+        super::fleet::bot_joined(w, gang_id, bot, &before);
+        return;
+    }
     tell(w, &before, "OnGangJoin", vec![Value::Int(bot), Value::text(ACTIVE)]);
     for m in &before {
         tell_system(w, *m, Some(gang_id));
@@ -277,6 +288,7 @@ pub fn bot_joins(w: &mut WorldState, gang_id: i64, bot: i64) {
 pub fn bot_declines(w: &mut WorldState, bot: i64) {
     for g in w.gangs.gangs.values_mut() {
         g.invited.retain(|c| *c != bot);
+        if let Some(f) = &mut g.fleet { f.decline(bot); }
     }
 }
 
@@ -306,7 +318,7 @@ fn accept(ctx: &Ctx<'_>, me: i64, gang_id: i64) -> Refused<Value> {
     Ok(Value::None)
 }
 
-fn leave(w: &mut WorldState, me: i64) -> Refused<()> {
+pub(super) fn leave(w: &mut WorldState, me: i64) -> Refused<()> {
     let gang_id = w.gangs.of(me).ok_or_else(|| message("gangNotMemberOfAnyGang"))?;
     part(w, gang_id, me, true);
     info!("{me} left gang {gang_id}");
@@ -314,7 +326,7 @@ fn leave(w: &mut WorldState, me: i64) -> Refused<()> {
 }
 
 /// KickMember(charID): the leader puts a member out; on oneself it is leaving.
-fn kick(w: &mut WorldState, me: i64, target: i64) -> Refused<Value> {
+pub(super) fn kick(w: &mut WorldState, me: i64, target: i64) -> Refused<Value> {
     if target == me {
         return leave(w, me).map(|_| Value::None);
     }
@@ -327,7 +339,7 @@ fn kick(w: &mut WorldState, me: i64, target: i64) -> Refused<Value> {
     Ok(Value::None)
 }
 
-fn disband(w: &mut WorldState, me: i64) -> Refused<Value> {
+pub(super) fn disband(w: &mut WorldState, me: i64) -> Refused<Value> {
     let gang_id = led_by(w, me)?;
     let members = w.gangs.gangs.remove(&gang_id).map(|g| g.members).unwrap_or_default();
     for m in &members {
@@ -376,10 +388,12 @@ pub fn logged_off(w: &mut WorldState, char_id: i64) {
 
 /// `char_id` goes from the gang; the rest hear it, and the session follows
 /// if they are still here to have one.
-fn part(w: &mut WorldState, gang_id: i64, char_id: i64, own_session: bool) {
+pub(super) fn part(w: &mut WorldState, gang_id: i64, char_id: i64, own_session: bool) {
+    let modern = w.gangs.get(gang_id).is_some_and(|g| g.fleet.is_some());
     let Some(d) = w.gangs.depart(gang_id, char_id) else { return };
+    if modern { super::fleet::departed(w, gang_id, char_id); }
     tell(w, &d.rest, "OnGangLeave", vec![Value::Int(char_id)]);
-    if d.was_leader {
+    if d.was_leader && !modern {
         tell(w, &d.rest, "OnGangLeader", vec![Value::None]);
     }
     if own_session {
@@ -389,7 +403,7 @@ fn part(w: &mut WorldState, gang_id: i64, char_id: i64, own_session: bool) {
 }
 
 /// The gang the caller leads.
-fn led_by(w: &WorldState, me: i64) -> Refused<i64> {
+pub(super) fn led_by(w: &WorldState, me: i64) -> Refused<i64> {
     let gang_id = w.gangs.of(me).ok_or_else(|| message("gangNotMemberOfAnyGang"))?;
     if w.gangs.gangs[&gang_id].sitting_leader() != Some(me) {
         return Err(message("gangMustBeLeader"));
@@ -412,39 +426,39 @@ fn set_leader(w: &mut WorldState, gang_id: i64, leader: Option<i64>) {
     tell(w, &members, "OnGangLeader", vec![Value::int_or_none(leader)]);
 }
 
-fn set_session(w: &WorldState, char_id: i64, gang_id: Option<i64>, leader: bool) {
+pub(super) fn set_session(w: &WorldState, char_id: i64, gang_id: Option<i64>, leader: bool) {
     for client in w.clients_of(char_id) {
         w.push_move(client, Move::Gang { gang_id, leader });
     }
 }
 
-fn tell(w: &WorldState, members: &[i64], event: &'static str, args: Vec<Value>) {
+pub(super) fn tell(w: &WorldState, members: &[i64], event: &'static str, args: Vec<Value>) {
     let clients: Vec<i64> = members.iter().flat_map(|m| w.clients_of(*m)).collect();
     w.notify(&clients, event, Value::Tuple(args));
 }
 
 /// OnCharGangChange(charID, gangID) to the pilots in space where `char_id` is.
-fn tell_system(w: &WorldState, char_id: i64, gang_id: Option<i64>) {
+pub(super) fn tell_system(w: &WorldState, char_id: i64, gang_id: Option<i64>) {
     let Some(p) = w.presence_of(char_id).filter(|p| !p.docked) else { return };
     let event = Value::Tuple(vec![Value::Int(char_id), Value::int_or_none(gang_id)]);
     w.notify(&w.in_space(p.solar_system_id), "OnCharGangChange", event);
 }
 
 /// A character's side in a war: its corporation's alliance, or the corporation.
-async fn side_of(db: &impl GenericClient, char_id: i64) -> i64 {
+pub(super) async fn side_of(db: &impl GenericClient, char_id: i64) -> i64 {
     let sql = r#"SELECT COALESCE(NULLIF(co."allianceID", 0), c."corporationID")
                    FROM "character_" c JOIN "corporation" co ON co."corporationID" = c."corporationID"
                   WHERE c."characterID" = $1"#;
     db.query_opt(sql, &[&(char_id as i32)]).await.ok().flatten().and_then(|r| int(&r, 0)).unwrap_or(0)
 }
 
-async fn name_of(db: &impl GenericClient, char_id: i64) -> String {
+pub(super) async fn name_of(db: &impl GenericClient, char_id: i64) -> String {
     let sql = r#"SELECT "characterName" FROM "character_" WHERE "characterID" = $1"#;
     db.query_opt(sql, &[&(char_id as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_default()
 }
 
 /// Corporation and alliance names, in the order given.
-async fn names_of(db: &impl GenericClient, owners: &[i64]) -> Vec<String> {
+pub(super) async fn names_of(db: &impl GenericClient, owners: &[i64]) -> Vec<String> {
     let mut names = Vec::new();
     for o in owners {
         let sql = r#"SELECT COALESCE((SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $1),
@@ -462,7 +476,7 @@ fn dedup(mut v: Vec<i64>) -> Vec<i64> {
     v
 }
 
-fn message_with(key: &str, args: &[(&str, Value)]) -> Outcome {
+pub(super) fn message_with(key: &str, args: &[(&str, Value)]) -> Outcome {
     Outcome::UserError { msg: key.into(), args: args.iter().map(|(k, v)| ((*k).into(), v.clone())).collect() }
 }
 

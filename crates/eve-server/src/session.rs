@@ -9,7 +9,7 @@ pub const CORP_ROLE_ACCOUNTANT: i64 = 256;
 
 pub const PERSIST_VARS: &[&str] = &[
     "userid", "languageID", "regionid", "constellationid", "role", "charid",
-    "allianceid", "corpid", "gangid", "gangrole", "shipid", "stationid",
+    "allianceid", "corpid", "gangid", "gangrole", "wingid", "squadid", "shipid", "stationid",
     "solarsystemid", "solarsystemid2", "address", "callback", "userType",
     "hqID", "baseID", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther",
 ];
@@ -40,6 +40,8 @@ pub struct Session {
     pub roles_at_other: i64,
     pub gang_id: Option<i64>,
     pub gang_role: Option<i64>,
+    pub wing_id: Option<i64>,
+    pub squad_id: Option<i64>,
 
     /// Not session variables: the selected character's name and type, for
     /// what other players are shown.
@@ -94,6 +96,8 @@ impl Session {
             "baseID" => Value::int_or_none(self.base_id),
             "gangid" => Value::int_or_none(self.gang_id),
             "gangrole" => Value::int_or_none(self.gang_role),
+            "wingid" => Value::int_or_none(self.wing_id),
+            "squadid" => Value::int_or_none(self.squad_id),
             "rolesAtAll" => Value::Long(self.roles_at_all),
             "rolesAtHQ" => Value::Long(self.roles_at_hq),
             "rolesAtBase" => Value::Long(self.roles_at_base),

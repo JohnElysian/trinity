@@ -183,7 +183,32 @@ pub async fn drop_can(db: &mut Client, world: &World, solar_system_id: i64, pos:
     }
     let result = async {
         let mut txn = ItemTxn::begin(db).await?;
-        let can = txn
+        let can = stage_can(&mut txn, solar_system_id, pos, owner_id, &stash).await?.expect("nonempty stash");
+        let events = txn.commit().await?;
+        Ok::<_, tokio_postgres::Error>((can, events))
+    }
+    .await;
+    let (can, events) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            error!("dropping a can in {solar_system_id}: {}", crate::logging::chain(&e));
+            return;
+        }
+    };
+    {
+        let w = world.lock();
+        for client in w.clients_of(owner_id) {
+            for event in &events { w.notify(&[client], "OnItemChange", event.clone()); }
+        }
+    }
+    show_can(world, solar_system_id, can);
+}
+
+/// Stage surviving cargo with its container in the caller's transaction, so
+/// a ship cannot disappear while its cargo is left loose in the solar system.
+pub(crate) async fn stage_can(txn: &mut ItemTxn<'_>, solar_system_id: i64, pos: Vec3, owner_id: i64, stash: &[Stash]) -> Result<Option<Can>, tokio_postgres::Error> {
+    if stash.is_empty() { return Ok(None); }
+    let can = txn
             .create(NewItem {
                 type_id: TYPE_CARGO_CONTAINER,
                 owner_id,
@@ -194,7 +219,7 @@ pub async fn drop_can(db: &mut Client, world: &World, solar_system_id: i64, pos:
             })
             .await?;
         txn.set_position(can, pos.tuple()).await?;
-        for s in &stash {
+        for s in stash {
             match *s {
                 Stash::New { type_id, quantity } => {
                     let singleton = false;
@@ -208,32 +233,19 @@ pub async fn drop_can(db: &mut Client, world: &World, solar_system_id: i64, pos:
             .query_one(r#"SELECT COALESCE("typeName", '') FROM "invTypes" WHERE "typeID" = $1"#, &[&(TYPE_CARGO_CONTAINER as i32)])
             .await
             .map(|r| r.get(0))?;
-        let events = txn.commit().await?;
-        Ok::<_, tokio_postgres::Error>((can, name, events))
-    }
-    .await;
-    let (can_id, name, events) = match result {
-        Ok(v) => v,
-        Err(e) => {
-            error!("dropping a can in {solar_system_id}: {}", crate::logging::chain(&e));
-            return;
-        }
-    };
+    Ok(Some(Can { id: can, type_id: TYPE_CARGO_CONTAINER, name, pos, radius: 14.0, owner_id, expires_ms: crate::combat::now_ms() + LIFETIME_MS }))
+}
+
+pub(crate) fn show_can(world: &World, solar_system_id: i64, can: Can) {
     let mut w = world.lock();
-    // The owner sees its items leave a ship it no longer has.
-    for client in w.clients_of(owner_id) {
-        for event in &events {
-            w.notify(&[client], "OnItemChange", event.clone());
-        }
-    }
     let Some(park) = w.parks.get_mut(&solar_system_id) else { return };
-    let can = Can { id: can_id, type_id: TYPE_CARGO_CONTAINER, name, pos, radius: 14.0, owner_id, expires_ms: crate::combat::now_ms() + LIFETIME_MS };
+    let can_id = can.id;
     let blob = crate::destiny::encode(crate::destiny::stamp(park.tick), &[crate::destiny::Ball::celestial(can.id, can.radius, can.pos.tuple(), &can.name, false)]);
     let chunk = Value::Tuple(vec![Value::Bytes(blob), Value::List(vec![slim(&can)]), Value::Dict(Vec::new())]);
     let add = entry(park.tick, "AddBalls", vec![chunk]);
     park.cans.insert(can_id, can);
     space::broadcast(&w, solar_system_id, None, vec![add]);
-    info!("can {can_id} dropped in {solar_system_id} with {} stack(s)", stash.len());
+    info!("can {can_id} dropped in {solar_system_id}");
 }
 
 /// After items left some containers: any of them that is a can in space and
@@ -269,17 +281,7 @@ pub async fn clear_emptied(db: &tokio_postgres::Client, world: &World, solar_sys
 pub async fn scrap(db: &mut Client, can_id: i64) {
     let result = async {
         let mut txn = ItemTxn::begin(db).await?;
-        let inside: Vec<i64> = txn
-            .tx()
-            .query(r#"SELECT "itemID" FROM entity WHERE "locationID" = $1"#, &[&(can_id as i32)])
-            .await?
-            .iter()
-            .map(|r| r.get::<_, i32>(0) as i64)
-            .collect();
-        for id in inside {
-            txn.destroy(id).await?;
-        }
-        txn.destroy(can_id).await?;
+        txn.destroy_tree(can_id,None,&[]).await?;
         txn.commit().await
     }
     .await;
@@ -291,6 +293,34 @@ pub async fn scrap(db: &mut Client, can_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn surviving_cargo_rolls_back_with_ship_and_expiry_removes_nested_items() {
+        let mut fixture = crate::test_support::Database::load().await;
+        let owner = fixture.id().await as i64;
+        let mut txn = ItemTxn::begin(&mut fixture.db).await.unwrap();
+        let ship = txn.create(NewItem {type_id:606,owner_id:owner,location_id:30000142,flag:0,quantity:1,singleton:true}).await.unwrap();
+        let container = txn.create(NewItem {type_id:3293,owner_id:owner,location_id:ship,flag:5,quantity:1,singleton:true}).await.unwrap();
+        let cargo = txn.create(NewItem {type_id:34,owner_id:owner,location_id:container,flag:5,quantity:20,singleton:false}).await.unwrap();
+        txn.tx().execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,3,1)"#,&[&(cargo as i32)]).await.unwrap();
+        txn.commit().await.unwrap();
+        let mut txn = ItemTxn::begin(&mut fixture.db).await.unwrap();
+        let abandoned = stage_can(&mut txn,30000142,Vec3::ZERO,owner,&[Stash::Existing(container)]).await.unwrap().unwrap().id;
+        txn.destroy(ship).await.unwrap();
+        drop(txn);
+        assert!(fixture.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(abandoned as i32)]).await.unwrap().is_none());
+        assert_eq!(fixture.db.query_one(r#"SELECT "locationID" FROM entity WHERE "itemID"=$1"#,&[&(container as i32)]).await.unwrap().get::<_,i32>(0) as i64,ship);
+        assert!(fixture.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(ship as i32)]).await.unwrap().is_some());
+        let mut txn = ItemTxn::begin(&mut fixture.db).await.unwrap();
+        let can = stage_can(&mut txn,30000142,Vec3::new(1.0,2.0,3.0),owner,&[Stash::Existing(container)]).await.unwrap().unwrap().id;
+        txn.destroy(ship).await.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(fixture.db.query_one(r#"SELECT "locationID" FROM entity WHERE "itemID"=$1"#,&[&(container as i32)]).await.unwrap().get::<_,i32>(0) as i64,can);
+        scrap(&mut fixture.db,can).await;
+        assert_eq!(fixture.db.query_one(r#"SELECT count(*) FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![can as i32,container as i32,cargo as i32]]).await.unwrap().get::<_,i64>(0),0);
+        assert_eq!(fixture.db.query_one(r#"SELECT count(*) FROM entity_attributes WHERE "itemID"=$1"#,&[&(cargo as i32)]).await.unwrap().get::<_,i64>(0),0);
+    }
 
     #[test]
     fn rolls_respect_the_bounty() {

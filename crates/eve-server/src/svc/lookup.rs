@@ -27,6 +27,12 @@ pub async fn lookup_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             find(ctx, &["characterName", "characterID", "typeID"], sql, "characterName", &search, exact).await
         }
         "LookupCorporations" => corporations(ctx, &search, exact, false).await,
+        "LookupAlliances" | "LookupAllianceShortNames" => {
+            let sql = r#"SELECT "allianceName", "allianceID", 16159 AS "typeID", "shortName"
+                           FROM alliances WHERE deleted = 0 AND {match}"#;
+            let column = if call.method == "LookupAlliances" { "allianceName" } else { "shortName" };
+            find(ctx, &["allianceName", "allianceID", "typeID", "shortName"], sql, column, &search, exact).await
+        }
         "LookupPlayerCorporations" => corporations(ctx, &search, exact, true).await,
         "LookupCorporationTickers" => {
             let sql = r#"SELECT "corporationName", "corporationID", 2 AS "typeID", "tickerName"

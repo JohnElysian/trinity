@@ -7,7 +7,7 @@
 //! (invCache.py:111 reads them: an item at quantity 0 is gone, one whose old
 //! location is 0 is new).
 
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 
 use eve_marshal::Value;
 use tokio_postgres::{Client, Transaction};
@@ -163,6 +163,53 @@ impl<'c> ItemTxn<'c> {
         Ok(())
     }
 
+    /// Destroy only the subtree still attached when each row is locked. A
+    /// transfer that wins a child lock may move its entire subtree away; do
+    /// not follow or delete it using a stale list collected before the wait.
+    /// `protected` lets ship loss retain its pilot even in malformed nesting.
+    pub async fn destroy_tree(&mut self, root:i64, expected_parent:Option<i64>, protected:&[i64]) -> DbResult<()> {
+        let mut pending=vec![(root,expected_parent)];
+        let mut seen=HashSet::new();
+        while let Some((id,parent))=pending.pop() {
+            if protected.contains(&id) || seen.contains(&id) { continue; }
+            let Some(item)=self.item(id).await? else { continue; };
+            if parent.is_some_and(|parent|item.location_id!=parent) { continue; }
+            seen.insert(id);
+            let children=self.tx.query(r#"SELECT "itemID" FROM entity WHERE "locationID"=$1 ORDER BY "itemID""#,
+                &[&(id as i32)]).await?;
+            for row in children.into_iter().rev() { pending.push((i64::from(row.get::<_,i32>(0)),Some(id))); }
+            self.destroy(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Hand over the subtree still attached when each item is locked. Children
+    /// moved elsewhere while we waited are no longer part of the handover.
+    /// False means custody was invalid; callers must roll back the transaction.
+    pub async fn transfer_tree(&mut self, root:i64, from:i64, to:i64) -> DbResult<bool> {
+        let mut pending=vec![(root,None)];
+        let mut seen=HashSet::new();
+        while let Some((id,parent))=pending.pop() {
+            if !seen.insert(id) { return Ok(false); }
+            let Some(item)=self.item(id).await? else {
+                if id==root { return Ok(false); }
+                continue;
+            };
+            if parent.is_some_and(|parent|item.location_id!=parent) { continue; }
+            if item.owner_id!=from || matches!(item.flag,7|36|57|61|88|89) {
+                return Ok(false);
+            }
+            // Characters and their active ships cannot be handed over as cargo.
+            if self.tx.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 OR "shipID"=$1 LIMIT 1"#,
+                &[&(id as i32)]).await?.is_some() { return Ok(false); }
+            let children=self.tx.query(r#"SELECT "itemID" FROM entity WHERE "locationID"=$1 ORDER BY "itemID""#,
+                &[&(id as i32)]).await?;
+            for row in children.into_iter().rev() { pending.push((i64::from(row.get::<_,i32>(0)),Some(id))); }
+            self.set_owner(id,to).await?;
+        }
+        Ok(true)
+    }
+
     /// A new item; returns its ID.
     pub async fn create(&mut self, new: NewItem) -> DbResult<i64> {
         let r = self
@@ -197,7 +244,7 @@ impl<'c> ItemTxn<'c> {
                 r#"SELECT "itemID" FROM entity
                     WHERE "ownerID" = $1 AND "locationID" = $2 AND "flag" = $3
                       AND "typeID" = $4 AND "singleton" = 0
-                    ORDER BY "itemID" LIMIT 1"#,
+                    ORDER BY "itemID" LIMIT 1 FOR UPDATE"#,
                 &[
                     &(new.owner_id as i32),
                     &(new.location_id as i32),
@@ -209,8 +256,8 @@ impl<'c> ItemTxn<'c> {
         match existing {
             Some(r) => {
                 let id = r.get::<_, i32>(0) as i64;
-                let have = self.item(id).await?.map_or(0, |i| i.quantity);
-                self.set_quantity(id, have + new.quantity).await?;
+                let Some(item)=self.item(id).await? else { return self.create(new).await; };
+                self.set_quantity(id, item.quantity + new.quantity).await?;
                 Ok(id)
             }
             None => self.create(new).await,
@@ -220,6 +267,15 @@ impl<'c> ItemTxn<'c> {
     /// Commit, and return the `OnItemChange` argument tuples for everything
     /// that changed.
     pub async fn commit(self) -> DbResult<Vec<Value>> {
+        let events=self.prepare_events().await?;
+        self.commit_prepared().await?;
+        Ok(events)
+    }
+
+    /// Capture notifications before an operation's final acceptance check.
+    /// Durable operation owners retain these across a lost COMMIT reply;
+    /// publishing them still requires proof that the transaction committed.
+    pub(crate) async fn prepare_events(&self) -> DbResult<Vec<Value>> {
         let ids: Vec<i32> = self.order.iter().map(|i| *i as i32).collect();
         let sql = format!(r#"{INVITEM_SELECT} e."itemID" = ANY($1)"#);
         let after: HashMap<i64, Vec<Value>> = self
@@ -229,8 +285,6 @@ impl<'c> ItemTxn<'c> {
             .iter()
             .map(|r| (r.get::<_, i32>(0) as i64, invitem_cells(r)))
             .collect();
-        self.tx.commit().await?;
-
         let mut events = Vec::new();
         for id in &self.order {
             let before = self.before.get(id).cloned().flatten();
@@ -257,6 +311,11 @@ impl<'c> ItemTxn<'c> {
         }
         Ok(events)
     }
+
+    /// Send only COMMIT, with no intervening query after final validation.
+    pub(crate) async fn commit_prepared(self) -> DbResult<()> {
+        self.tx.commit().await
+    }
 }
 
 pub struct NewItem {
@@ -273,5 +332,91 @@ pub fn notify(world: &crate::world::World, client_id: i64, events: Vec<Value>) {
     let world = world.lock();
     for event in events {
         world.notify(&[client_id], "OnItemChange", event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait on PostgreSQL's lock graph, not a timing assumption: the competing
+    /// operation must already have reached the locked row before we commit.
+    async fn wait_for_lock(db:&Client,pid:i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(10),async {
+            loop {
+                if db.query_one("SELECT cardinality(pg_blocking_pids($1))>0",&[&pid]).await.unwrap().get::<_,bool>(0) { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("worker reaches the competing transaction's row lock");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn recursive_cleanup_keeps_a_subtree_moved_while_waiting_for_its_lock() {
+        let mut fixture=crate::test_support::Database::load().await;
+        let owner=i64::from(fixture.id().await);
+        let mut seed=ItemTxn::begin(&mut fixture.db).await.unwrap();
+        let root=seed.create(NewItem {type_id:3293,owner_id:owner,location_id:30000142,flag:0,quantity:1,singleton:true}).await.unwrap();
+        let moved=seed.create(NewItem {type_id:3293,owner_id:owner,location_id:root,flag:0,quantity:1,singleton:true}).await.unwrap();
+        let nested=seed.create(NewItem {type_id:34,owner_id:owner,location_id:moved,flag:5,quantity:12,singleton:false}).await.unwrap();
+        let attached=seed.create(NewItem {type_id:35,owner_id:owner,location_id:root,flag:0,quantity:3,singleton:false}).await.unwrap();
+        seed.tx().execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,3,1)"#,&[&(nested as i32)]).await.unwrap();
+        seed.commit().await.unwrap();
+        let mut moving_db=crate::db::connect(&fixture.url).await.unwrap();
+        let mut moving=ItemTxn::begin(&mut moving_db).await.unwrap();
+        moving.move_to(moved,60014689,4).await.unwrap();
+        let mut deleting_db=crate::db::connect(&fixture.url).await.unwrap();
+        let pid:i32=deleting_db.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+        let cleanup=tokio::spawn(async move {
+            let mut tx=ItemTxn::begin(&mut deleting_db).await.unwrap();
+            tx.destroy_tree(root,None,&[]).await.unwrap();
+            tx.commit().await.unwrap()
+        });
+        wait_for_lock(&fixture.db,pid).await;
+        moving.commit().await.unwrap();
+        cleanup.await.unwrap();
+        let rows=fixture.db.query(r#"SELECT "itemID","locationID" FROM entity WHERE "itemID"=ANY($1) ORDER BY "itemID""#,
+            &[&vec![root as i32,moved as i32,nested as i32,attached as i32]]).await.unwrap();
+        assert_eq!(rows.len(),2,"only the moved container and its contents survive");
+        assert_eq!((rows[0].get::<_,i32>(0) as i64,rows[0].get::<_,i32>(1)),(moved,60014689));
+        assert_eq!((rows[1].get::<_,i32>(0) as i64,rows[1].get::<_,i32>(1) as i64),(nested,moved));
+        assert!(fixture.db.query_opt(r#"SELECT 1 FROM entity_attributes WHERE "itemID"=$1"#,&[&(nested as i32)]).await.unwrap().is_some());
+        // A stale root expectation also protects the complete subtree.
+        let mut tx=ItemTxn::begin(&mut fixture.db).await.unwrap();
+        tx.destroy_tree(moved,Some(root),&[]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(fixture.db.query_one(r#"SELECT count(*) FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![moved as i32,nested as i32]]).await.unwrap().get::<_,i64>(0),2);
+        let mut tx=ItemTxn::begin(&mut fixture.db).await.unwrap();
+        tx.destroy_tree(moved,None,&[]).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn stacking_recreates_a_target_deleted_while_waiting_instead_of_losing_goods() {
+        let mut fixture=crate::test_support::Database::load().await;
+        let owner=i64::from(fixture.id().await);
+        let mut seed=ItemTxn::begin(&mut fixture.db).await.unwrap();
+        let old=seed.create(NewItem {type_id:34,owner_id:owner,location_id:60014689,flag:4,quantity:5,singleton:false}).await.unwrap();
+        seed.commit().await.unwrap();
+        let mut deleting_db=crate::db::connect(&fixture.url).await.unwrap();
+        let mut deleting=ItemTxn::begin(&mut deleting_db).await.unwrap();
+        deleting.destroy(old).await.unwrap();
+        let mut adding_db=crate::db::connect(&fixture.url).await.unwrap();
+        let pid:i32=adding_db.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+        let adding=tokio::spawn(async move {
+            let mut tx=ItemTxn::begin(&mut adding_db).await.unwrap();
+            let id=tx.stack_onto(NewItem {type_id:34,owner_id:owner,location_id:60014689,flag:4,quantity:7,singleton:false}).await.unwrap();
+            tx.commit().await.unwrap();
+            id
+        });
+        wait_for_lock(&fixture.db,pid).await;
+        deleting.commit().await.unwrap();
+        let new=adding.await.unwrap();
+        assert_ne!(new,old);
+        let rows=fixture.db.query(r#"SELECT "itemID",quantity FROM entity WHERE "ownerID"=$1 AND "locationID"=60014689 AND "typeID"=34"#,&[&(owner as i32)]).await.unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!((rows[0].get::<_,i32>(0) as i64,rows[0].get::<_,i32>(1)),(new,7));
+        fixture.db.execute(r#"DELETE FROM entity WHERE "itemID"=$1"#,&[&(new as i32)]).await.unwrap();
     }
 }

@@ -37,6 +37,7 @@ pub enum Move {
     Affiliation,
     /// The character joined, left or now leads (or no longer leads) a gang.
     Gang { gang_id: Option<i64>, leader: bool },
+    Fleet { gang_id: Option<i64>, role: i64, wing_id: Option<i64>, squad_id: Option<i64> },
     /// A GM's /tr: into a station, or to a point in a system's space (only
     /// from space).
     Teleport { station_id: Option<i64>, solar_system_id: i64, constellation_id: i64, region_id: i64, pos: (f64, f64, f64) },
@@ -105,6 +106,27 @@ pub struct WorldState {
     pub trades: HashMap<i64, crate::svc::pvptrade::Trade>,
     /// Solar system -> its ballpark. Created when the first ship arrives.
     pub parks: HashMap<i64, Park>,
+    /// Original ship configuration is transient and clears on leaving space.
+    pub maintenance: HashMap<i64, crate::svc::maintenance::Configuration>,
+    pub maintenance_repairs: HashMap<i64, crate::svc::maintenance::Repair>,
+    pub pending_station_arrivals: HashMap<i64, crate::losses::pending::Pending>,
+    pub pending_travel: HashMap<i64, crate::travel::Pending>,
+    pub pending_portals: HashMap<i64, crate::svc::jumps::portal::Pending>,
+    /// Disconnected hulls retained through an accepted cycle or reservation.
+    pub retained_logouts: HashMap<i64,(i64,i64)>,
+    pub pending_logouts: HashMap<i64,crate::conn::logout::Pending>,
+    /// Accepted generator cycles outlive loss of a usable portal destination.
+    pub portal_cycles: HashMap<i64, Bridge>,
+    pub portal_retry_cursor: i64,
+    pub travel_retry_cursor:i64,
+    pub pending_station_arrival_cursor: i32,
+    /// Confirmed space losses retained until their durable settlement succeeds.
+    pub pending_ship_losses: HashMap<i64, crate::losses::Loss>,
+    /// Round-robin durable loss scan, so quarantined records cannot starve later losses.
+    pub pending_ship_loss_cursor: i32,
+    /// Work produced by an atomically published first module cycle, drained by
+    /// the heartbeat together with its own jobs.
+    pub pending_jobs: Vec<crate::heartbeat::Job>,
     pub gangs: crate::svc::gang::Gangs,
     /// The online bots by solar system: (in space, docked), for the star map.
     pub bot_counts: HashMap<i64, (i64, i64)>,
@@ -124,6 +146,8 @@ pub struct WorldState {
     pub clone_offers: HashMap<i64, (i64, i64)>,
     /// Titans' open jump portals, by titan.
     pub bridges: HashMap<i64, Bridge>,
+    /// Portal startups whose source and publication slot are reserved.
+    pub pending_bridges: HashSet<i64>,
     /// Scanner and survey probes out, by probe.
     pub probes: HashMap<i64, crate::svc::scan::Probe>,
     /// Each pilot's last probe analysis.
@@ -132,17 +156,23 @@ pub struct WorldState {
     pub bot_panels: BotPanels,
 }
 
-/// A titan's jump portal, open to a gang member's cynosural field.
-#[derive(Debug, Clone)]
+/// A titan's jump portal, open to a member's field or an alliance beacon.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Bridge {
+    pub generation: i64,
+    pub started_ms: i64,
     pub titan_pilot: i64,
+    pub generator_id: i64,
     pub system: i64,
     pub to_system: i64,
     pub beacon: i64,
-    pub member: i64,
+    /// None identifies a fixed alliance cynosural generator array.
+    pub member: Option<i64>,
     pub until_ms: i64,
     /// Strontium a kilogram a light year, for each ship through.
     pub mass_factor: f64,
+    /// Minimum original attribute1253; covert portals require two.
+    pub harmonics: i64,
 }
 
 /// The bot simulation's dashboard windows, ready to send.

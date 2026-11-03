@@ -12,6 +12,14 @@ pub async fn config(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let flag = |i: usize| arg(i).unwrap_or(0) != 0;
 
     let value = match call.method.as_str() {
+        "CacheFileGetRegions" => map_objects(ctx, LOCATION_UNIVERSE, true, false, false, false).await,
+        "CacheFileGetConstellations" => map_objects(ctx, call.arg_id(1), false, true, false, false).await,
+        "CacheFileGetSystems" => map_objects(ctx, call.arg_id(1), false, false, true, false).await,
+        "CacheFileGetLandmarks" => landmarks(ctx).await,
+        "GetMapOffices" => ctx.rowset(&["stationID","corporationID"],
+            r#"SELECT o."stationID",o."corporationID" FROM "crpOffices" o
+               JOIN "staStations" s ON s."stationID"=o."stationID" WHERE s."solarSystemID"=$1
+               ORDER BY o."stationID",o."corporationID""#, &[&(call.arg_id(0) as i32)]).await,
         "GetOwnersEx" | "GetMultiOwnersEx" => owners(ctx, &ids()).await,
         "GetLocationsEx" | "GetMultiLocationsEx" => locations(ctx, &ids()).await,
         "GetCorpTickerNamesEx" | "GetMultiCorpTickerNamesEx" => {

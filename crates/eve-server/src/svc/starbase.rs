@@ -661,7 +661,7 @@ pub async fn lost(db: &mut Client, id: i64, tower: bool) {
 /// Whether the caller may act on `s` under a tower deploy setting: 0 needs
 /// the Starbase Config role in the owning corporation, 1 any of its members,
 /// 2 any member of its alliance. Owners may always.
-fn allowed(ctx: &Ctx<'_>, s: &Structure, deploy: i16) -> bool {
+pub(crate) fn allowed(ctx: &Ctx<'_>, s: &Structure, deploy: i16) -> bool {
     if ctx.session.char_id == Some(s.owner_id) {
         return true;
     }
@@ -1004,6 +1004,10 @@ pub async fn pos_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let tower = call.arg_id(0);
     let flag = |i: usize| call.args.get(i).map(|v| v.as_i64().unwrap_or(0) != 0).unwrap_or(false);
     let result = match call.method.as_str() {
+        "GetControlTowers" => Ok(super::bridges::towers(ctx).await),
+        "GetJumpArrays" => Ok(super::bridges::list(ctx).await),
+        "InstallJumpBridgeLink" => return Some(super::bridges::install(ctx, call.arg_id(0), call.arg_id(1), call.arg_id(2)).await),
+        "UninstallJumpBridgeLink" => return Some(super::bridges::uninstall(ctx, call.arg_id(0)).await),
         "GetControlTowerFuelRequirements" => {
             let header = ["controlTowerTypeID", "resourceTypeID", "purpose", "quantity", "minSecurityLevel", "factionID"];
             let sql = r#"SELECT "controlTowerTypeID", "resourceTypeID", "purpose", "quantity", "minSecurityLevel", "factionID"

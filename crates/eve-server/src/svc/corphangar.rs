@@ -45,18 +45,31 @@ pub fn mine(ctx: &Ctx<'_>, office: (i64, i64)) -> bool {
     ctx.session.corp_id == Some(office.0) && ctx.session.station_id == Some(office.1)
 }
 
-fn roles(ctx: &Ctx<'_>) -> i64 {
-    ctx.session.roles_at_all | ctx.session.roles_at_hq | ctx.session.roles_at_base | ctx.session.roles_at_other
+pub(crate) fn roles_at(ctx: &Ctx<'_>, station: Option<i64>) -> i64 {
+    let s = ctx.session;
+    s.roles_at_all | match station.filter(|id| *id > 0) {
+        Some(id) if Some(id) == s.hq_id => s.roles_at_hq,
+        Some(id) if Some(id) == s.base_id => s.roles_at_base,
+        _ => s.roles_at_other,
+    }
 }
 
 pub fn may_take(ctx: &Ctx<'_>, flag: i64) -> bool {
-    let r = roles(ctx);
+    may_take_at(ctx, flag, ctx.session.station_id)
+}
+
+pub(crate) fn may_take_at(ctx: &Ctx<'_>, flag: i64, station: Option<i64>) -> bool {
+    let r = roles_at(ctx, station);
     r & CORP_ROLE_DIRECTOR != 0 || division(flag).is_some_and(|d| r & (ROLE_HANGAR_TAKE_1 << (d - 1)) != 0)
 }
 
 pub fn may_query(ctx: &Ctx<'_>, flag: i64) -> bool {
-    let r = roles(ctx);
-    r & CORP_ROLE_DIRECTOR != 0 || division(flag).is_some_and(|d| r & ((ROLE_HANGAR_QUERY_1 << (d - 1)) | (ROLE_HANGAR_TAKE_1 << (d - 1))) != 0)
+    may_query_at(ctx, flag, ctx.session.station_id)
+}
+
+pub(crate) fn may_query_at(ctx: &Ctx<'_>, flag: i64, station: Option<i64>) -> bool {
+    let r = roles_at(ctx, station);
+    r & CORP_ROLE_DIRECTOR != 0 || division(flag).is_some_and(|d| r & (ROLE_HANGAR_QUERY_1 << (d - 1)) != 0)
 }
 
 /// The flags of an office the caller may look into.

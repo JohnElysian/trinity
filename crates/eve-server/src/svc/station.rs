@@ -20,6 +20,13 @@ pub async fn station_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "GetConstellation" => get_constellation(ctx, call.arg_id(0)).await,
         "GetRegion" => get_region(ctx, call.arg_id(0)).await,
         "GetAllianceSystems" => alliance_systems(ctx).await,
+        "GetAllianceConstellations" => ctx.rowset(&["constellationID","allianceID"],
+            r#"SELECT "constellationID","allianceID" FROM "mapConstellations"
+               WHERE "allianceID" IS NOT NULL AND "allianceID"<>0 ORDER BY "constellationID""#, &[]).await,
+        "GetStationsByRegion" => ctx.rowset(&["stationID","stationName","solarSystemID","constellationID","regionID","x","y","z"],
+            r#"SELECT "stationID","stationName","solarSystemID","constellationID","regionID",x,y,z
+               FROM "staStations" WHERE "regionID"=$1 ORDER BY "stationName","stationID""#,
+            &[&(call.arg_id(0) as i32)]).await,
         _ => return None,
     };
     Some(Outcome::Value(value))

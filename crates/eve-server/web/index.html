@@ -10,6 +10,7 @@
 <body>
   <nav class="neocom" aria-label="Windows">
     <a href="#w-status" title="Server Status">STA</a>
+    <a href="#w-map" title="Sovereignty Map">SOV</a>
     <a href="#w-wars" title="War Report">WAR</a>
     <a href="#w-pilots" title="Pilots Online">PIL</a>
     <a href="#w-systems" title="Busiest Systems">MAP</a>
@@ -32,6 +33,22 @@
       <div class="body">
         <p class="statusline" id="statusline">STATUS: CONNECTING…</p>
         <dl class="info" id="status"></dl>
+      </div>
+    </section>
+
+    <section class="window wide map" id="w-map">
+      <header class="caption"><span class="glyph"></span><h2>Sovereignty Map</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <div class="toolbar">
+          <label>Region <select id="map-region"><option value="">New Eden (all regions)</option></select></label>
+          <button type="button" id="map-reset">Reset view</button>
+          <span class="note" id="map-summary"></span>
+        </div>
+        <div class="map-wrap">
+          <svg id="map" role="img" aria-label="Map of the alliances holding space"></svg>
+          <ol class="legend" id="map-legend"></ol>
+        </div>
+        <p class="note" id="map-hover">Scroll to zoom, drag to pan. Click a system to open its region; click an alliance to pick out its space.</p>
       </div>
     </section>
 

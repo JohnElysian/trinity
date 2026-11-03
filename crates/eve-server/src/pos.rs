@@ -107,6 +107,8 @@ pub struct Structure {
     pub sentry: crate::guard::Sentry,
     /// For a gun, missile or EW battery: what it is doing.
     pub guard: Option<crate::guard::Guard>,
+    /// A jump array's linked endpoint: (structure, system, type).
+    pub bridge: Option<(i64, i64, i64)>,
 }
 
 /// A tower's force field: a ball of its own (type Force Field), centred on
@@ -125,6 +127,7 @@ impl Field {
         Ball {
             id: self.id,
             mode: mode::FIELD,
+            warp: None,
             radius: self.radius,
             pos: tower.pos.tuple(),
             flags: flags::CELESTIAL,
@@ -245,6 +248,8 @@ impl Structure {
             ("posTimestamp", self.stamp.map_or(Value::None, Value::Long)),
             ("controlTowerID", Value::int_or_none(self.tower)),
             ("incapacitated", Value::Int(0)),
+            ("remoteStructureID", Value::int_or_none(self.bridge.map(|bridge| bridge.0))),
+            ("remoteSystemID", Value::int_or_none(self.bridge.map(|bridge| bridge.1))),
         ])
     }
 
@@ -254,6 +259,7 @@ impl Structure {
         Ball {
             id: self.id,
             mode: mode::STOP,
+            warp: None,
             radius: self.radius,
             pos: self.pos.tuple(),
             flags: if free { flags::IS_FREE | flags::IS_GLOBAL | flags::IS_INTERACTIVE } else { flags::CELESTIAL },
@@ -305,11 +311,14 @@ pub async fn load(db: &impl GenericClient, solar_system_id: i64) -> Result<Vec<S
                       p."shieldCharge", COALESCE(p."armorDamage", 0), COALESCE(p."hullDamage", 0),
                       COALESCE(p."password", ''), COALESCE(p."allowCorp", 1), COALESCE(p."allowAlliance", 0),
                       p."sentryStanding", p."sentryStatus", COALESCE(p."sentryStandingDrop", 0),
-                      COALESCE(p."sentryStatusDrop", 0), COALESCE(p."sentryAggression", 0), COALESCE(p."sentryWar", 1)
+                      COALESCE(p."sentryStatusDrop", 0), COALESCE(p."sentryAggression", 0), COALESCE(p."sentryWar", 1),
+                      remote."itemID", remote."locationID", remote."typeID"
                  FROM entity e
                  JOIN "invTypes" t ON t."typeID" = e."typeID"
                  JOIN "invGroups" g ON g."groupID" = t."groupID"
                  LEFT JOIN "posStructures" p ON p."itemID" = e."itemID"
+                 LEFT JOIN "jumpBridgeLinks" bridge ON bridge."sourceID" = e."itemID"
+                 LEFT JOIN entity remote ON remote."itemID" = bridge."destinationID"
                  LEFT JOIN "corporation" co ON co."corporationID" = e."ownerID"
                  LEFT JOIN "character_" ch ON ch."characterID" = e."ownerID"
                  LEFT JOIN "corporation" cc ON cc."corporationID" = ch."corporationID"
@@ -365,6 +374,9 @@ pub async fn load(db: &impl GenericClient, solar_system_id: i64) -> Result<Vec<S
                     war: int(r, 25) == Some(1),
                 },
                 guard: health.get(&type_id).and_then(|a| crate::guard::profile(int(r, 2).unwrap_or(0), a)),
+                bridge: match (int(r,26),int(r,27),int(r,28)) {
+                    (Some(id),Some(system),Some(type_id))=>Some((id,system,type_id)),_=>None,
+                },
             }
         })
         .collect();
@@ -544,6 +556,7 @@ mod tests {
             field: None,
             sentry: Default::default(),
             guard: None,
+            bridge: None,
         }
     }
 

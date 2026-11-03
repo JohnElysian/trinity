@@ -16,6 +16,9 @@
 //! costs, the reprocessing take, who may use each service, and the clones
 //! installed there.
 
+mod management;
+pub use management::ensure as ensure_management_schema;
+
 use eve_marshal::Value;
 use tokio_postgres::GenericClient;
 use tracing::{error, info};
@@ -29,7 +32,6 @@ const GROUP_STATION: i32 = 15;
 const BUILD_HOURS: f64 = 24.0;
 /// A platform must be this close to a planet to be built.
 const PLANET_RANGE: f64 = 1.0e10;
-const TYPE_OFFICE_FOLDER: i64 = 27;
 const ROLE_DIRECTOR: i64 = crate::session::CORP_ROLE_DIRECTOR;
 
 /// The outpost each platform becomes: (platform, station type, operation).
@@ -231,21 +233,6 @@ fn key_val(fields: Vec<(&str, Value)>) -> Value {
     }
 }
 
-/// Whether the caller's corporation owns the station and they may run it.
-async fn manager(ctx: &Ctx<'_>, station: i64) -> Refused<()> {
-    let owner = ctx
-        .query_one(r#"SELECT "corporationID" FROM "staStations" WHERE "stationID" = $1"#, &[&(station as i32)])
-        .await
-        .and_then(|r| int(&r, 0));
-    if owner.is_none() || owner != ctx.session.corp_id {
-        return Err("Your corporation does not own this station.".into());
-    }
-    if !ctx.session.has_corp_role(ROLE_DIRECTOR) {
-        return Err("Only directors may manage the station.".into());
-    }
-    Ok(())
-}
-
 /// The corpStationMgr calls of the station management window; None for others.
 pub async fn station_mgr(ctx: &Ctx<'_>, method: &str, args: &[Value], station: i64) -> Option<Result<Value, String>> {
     let arg = |i: usize| args.get(i).and_then(|v| v.as_i64());
@@ -253,221 +240,122 @@ pub async fn station_mgr(ctx: &Ctx<'_>, method: &str, args: &[Value], station: i
         "GetStationServiceIdentifiers" => {
             Ok(ctx.rowset(&["serviceID", "serviceName", "serviceNameID"], r#"SELECT "serviceID", "serviceName", 0 FROM "staServices" ORDER BY 1"#, &[]).await)
         }
-        "GetStationServiceAccessRule" => {
-            let (st, service) = (arg(0).unwrap_or(station), arg(1).unwrap_or(0));
-            let r = ctx
-                .query_one(
-                    r#"SELECT "minimumStanding", "minimumCharSecurity", "maximumCharSecurity", "minimumCorpSecurity", "maximumCorpSecurity"
-                         FROM "stationServiceRules" WHERE "stationID" = $1 AND "serviceID" = $2"#,
-                    &[&(st as i32), &(service as i32)],
-                )
-                .await;
-            let f = |i: usize, d: f64| r.as_ref().and_then(|r| float(r, i)).unwrap_or(d);
-            Ok(key_val(vec![
-                ("serviceID", Value::Int(service)),
-                ("minimumStanding", Value::Double(f(0, -10.0))),
-                ("minimumCharSecurity", Value::Double(f(1, -10.0))),
-                ("maximumCharSecurity", Value::Double(f(2, 10.0))),
-                ("minimumCorpSecurity", Value::Double(f(3, -10.0))),
-                ("maximumCorpSecurity", Value::Double(f(4, 10.0))),
-            ]))
-        }
-        "GetStationManagementServiceCostModifiers" => {
-            let st = arg(0).unwrap_or(station);
-            let rows = ctx
-                .query(
-                    r#"SELECT s."serviceID", COALESCE(m."discountPerGoodStandingPoint", 0)::float8, COALESCE(m."surchargePerBadStandingPoint", 0)::float8
-                         FROM "staServices" s LEFT JOIN "stationServiceRules" m ON m."stationID" = $1 AND m."serviceID" = s."serviceID" ORDER BY 1"#,
-                    &[&(st as i32)],
-                )
-                .await;
-            Ok(Value::List(
-                rows.iter()
-                    .map(|r| {
-                        key_val(vec![
-                            ("serviceID", Value::Int(int(r, 0).unwrap_or(0))),
-                            ("discountPerGoodStandingPoint", Value::Double(float(r, 1).unwrap_or(0.0))),
-                            ("surchargePerBadStandingPoint", Value::Double(float(r, 2).unwrap_or(0.0))),
-                        ])
-                    })
-                    .collect(),
-            ))
-        }
-        "GetStationDetails" => {
-            let st = arg(0).unwrap_or(station);
-            let r = ctx
-                .query_one(
-                    r#"SELECT "stationName", COALESCE("description", ''), "security", COALESCE("dockingCostPerVolume", 0), COALESCE("officeRentalCost", 0),
-                              COALESCE("maxShipVolumeDockable", 0), COALESCE("reprocessingStationsTake", 0.05), "reprocessingHangarFlag", "corporationID"
-                         FROM "staStations" WHERE "stationID" = $1"#,
-                    &[&(st as i32)],
-                )
-                .await;
-            let Some(r) = r else { return Some(Err("No such station.".into())) };
-            Ok(key_val(vec![
-                ("stationID", Value::Int(st)),
-                ("stationName", Value::text(text(&r, 0).unwrap_or_default())),
-                ("description", Value::text(text(&r, 1).unwrap_or_default())),
-                ("security", Value::Double(float(&r, 2).unwrap_or(0.0) / 1000.0)),
-                ("dockingCostPerVolume", Value::Double(float(&r, 3).unwrap_or(0.0))),
-                ("officeRentalCost", Value::Int(int(&r, 4).unwrap_or(0))),
-                ("factorySlotRentalCost", Value::Int(0)),
-                ("researchFacilitySlotRentalCost", Value::Int(0)),
-                ("maxShipVolumeDockable", Value::Double(float(&r, 5).unwrap_or(0.0))),
-                ("reprocessingStationsTake", Value::Double(float(&r, 6).unwrap_or(0.05))),
-                ("reprocessingHangarFlag", Value::int_or_none(int(&r, 7))),
-                ("ownerID", Value::Int(int(&r, 8).unwrap_or(0))),
-            ]))
-        }
-        "GetRentableItems" => {
-            let rows = ctx
-                .query(
-                    r#"SELECT o."itemID", o."corporationID", e."flag" FROM "crpOffices" o LEFT JOIN entity e ON e."itemID" = o."itemID" WHERE o."stationID" = $1 ORDER BY 1"#,
-                    &[&(station as i32)],
-                )
-                .await;
-            Ok(Value::List(
-                rows.iter()
-                    .enumerate()
-                    .map(|(n, r)| {
-                        key_val(vec![
-                            ("itemID", Value::Int(int(r, 0).unwrap_or(0))),
-                            ("number", Value::Int(n as i64 + 1)),
-                            ("typeID", Value::Int(TYPE_OFFICE_FOLDER)),
-                            ("flag", Value::Int(int(r, 2).unwrap_or(0))),
-                            ("rentedToID", Value::int_or_none(int(r, 1))),
-                            ("publiclyAvailable", Value::Int(1)),
-                            ("startDate", Value::Long(crate::bulkdata::filetime_now())),
-                            ("rentPeriodInDays", Value::Int(30)),
-                            ("periodCost", Value::None),
-                            ("balanceDueDate", Value::Long(crate::bulkdata::filetime_now())),
-                        ])
-                    })
-                    .collect(),
-            ))
-        }
-        "GetOwnerIDsOfClonesAtStation" => {
-            let corp = arg(0).unwrap_or(-1);
-            let sql = if corp == -1 {
-                r#"SELECT DISTINCT c."corporationID", 0 FROM "chrJumpClones" j JOIN "character_" c ON c."characterID" = j."ownerID" WHERE j."locationID" = $1 AND $2 = -1"#
-            } else {
-                r#"SELECT c."corporationID", j."ownerID" FROM "chrJumpClones" j JOIN "character_" c ON c."characterID" = j."ownerID" WHERE j."locationID" = $1 AND c."corporationID" = $2"#
-            };
-            let rows = ctx.query(sql, &[&(station as i32), &(corp as i32)]).await;
-            Ok(Value::List(rows.iter().map(|r| key_val(vec![("corporationID", Value::Int(int(r, 0).unwrap_or(0))), ("characterID", Value::Int(int(r, 1).unwrap_or(0)))])).collect()))
-        }
+        "GetStationServiceAccessRule" | "GetStationManagementServiceCostModifiers" => management::read(ctx,station,method,args).await,
+        "GetStationDetails" => management::details(ctx,station,args).await,
+        "GetRentableItems" => management::rentables(ctx,station,args).await,
+        "GetOwnerIDsOfClonesAtStation" => management::read(ctx,station,method,args).await,
         "RevokeCloneContractsAtStation" => {
-            if let Err(why) = manager(ctx, station).await {
-                return Some(Err(why));
-            }
-            let (corp, char_id) = (arg(0).unwrap_or(0), arg(1).unwrap_or(-1));
-            let gone = revoke_clones(ctx.db, station, corp, char_id).await;
-            info!("station {station}: {gone} clone(s) of {corp}/{char_id} revoked");
-            Ok(Value::None)
+            let operation=async {
+                if args.len()!=2 || !arg(0).is_some_and(|n|(1..=i32::MAX as i64).contains(&n))
+                    || !arg(1).is_some_and(|n|n==-1 || (1..=i32::MAX as i64).contains(&n)) {
+                    return Err("Choose a valid corporation and clone owner, or -1 for every owner in that corporation.".into());
+                }
+                let mut db=crate::db::connect(ctx.db_url).await.map_err(management::failed)?;
+                let tx=db.transaction().await.map_err(management::failed)?;
+                management::authorize(ctx,&tx,station).await?;
+                let (corp,char_id)=(arg(0).unwrap_or(-1),arg(1).unwrap_or(-1));
+                let gone=tx.execute(r#"DELETE FROM "chrJumpClones" j USING "character_" c WHERE c."characterID"=j."ownerID"
+                    AND j."locationID"=$1 AND c."corporationID"=$2 AND ($3=-1 OR j."ownerID"=$3)"#,
+                    &[&(station as i32),&(corp as i32),&(char_id as i32)]).await.map_err(management::failed)?;
+                tx.commit().await.map_err(management::failed)?;
+                info!(station,gone,"station clone contracts revoked");Ok(Value::None)
+            };
+            operation.await
         }
-        "UpdateStationManagementSettings" => {
-            if let Err(why) = manager(ctx, station).await {
-                return Some(Err(why));
-            }
-            update(ctx, station, args).await.map(|_| Value::None)
-        }
+        "UpdateStationManagementSettings" => update(ctx,station,args).await.map(|_|Value::None),
         _ => return None,
     })
 }
 
-/// Jump clones moved off a station: destroyed, their owners told.
-async fn revoke_clones(db: &impl GenericClient, station: i64, corp: i64, char_id: i64) -> u64 {
-    let sql = r#"DELETE FROM "chrJumpClones" j USING "character_" c
-                  WHERE c."characterID" = j."ownerID" AND j."locationID" = $1 AND c."corporationID" = $2 AND ($3 = -1 OR j."ownerID" = $3)"#;
-    db.execute(sql, &[&(station as i32), &(corp as i32), &(char_id as i32)]).await.unwrap_or(0)
-}
-
-/// UpdateStationManagementSettings(rules, costModifiers, rentables, name,
-/// description, dockingCost, factoryCost, officeCost, researchCost,
-/// reprocessingTake, reprocessingHangarFlag).
-async fn update(ctx: &Ctx<'_>, station: i64, args: &[Value]) -> Refused<()> {
-    let f = |i: usize| args.get(i).and_then(|v| v.as_f64());
-    let name = args.get(3).and_then(|v| v.as_string()).filter(|n| !n.trim().is_empty());
-    let description = args.get(4).and_then(|v| v.as_string()).unwrap_or_default();
-    let take = f(9).map(|t| if t > 1.0 { t / 100.0 } else { t }).unwrap_or(0.05).clamp(0.0, 1.0);
-    let flag = args.get(10).and_then(|v| v.as_i64());
-    ctx.db
-        .execute(
-            r#"UPDATE "staStations" SET "stationName" = COALESCE($2, "stationName"), "description" = $3, "dockingCostPerVolume" = $4,
-                      "officeRentalCost" = $5, "reprocessingStationsTake" = $6, "reprocessingHangarFlag" = COALESCE($7, "reprocessingHangarFlag")
-                WHERE "stationID" = $1"#,
-            &[&(station as i32), &name, &description, &(f(5).unwrap_or(0.0) as i32), &(f(7).unwrap_or(0.0) as i32), &take, &flag.map(|v| v as i32)],
-        )
-        .await
-        .map_err(|e| {
-            error!("updating station {station}: {}", crate::logging::chain(&e));
-            "The settings could not be saved.".to_string()
-        })?;
-    if let Some(name) = &name {
-        let _ = ctx.db.execute(r#"UPDATE "mapDenormalize" SET "itemName" = $2 WHERE "itemID" = $1"#, &[&(station as i32), name]).await;
-        let _ = ctx.db.execute(r#"UPDATE "eveNames" SET "itemName" = $2 WHERE "itemID" = $1"#, &[&(station as i32), name]).await;
-    }
-    // Service access rules and cost modifiers: {serviceID: rule}, [modifier].
-    if let Some(Value::Dict(rules)) = args.first() {
-        for (k, rule) in rules {
-            let Some(service) = k.as_i64() else { continue };
-            let field = |name: &str| rule_field(rule, name);
-            let _ = ctx
-                .db
-                .execute(
-                    r#"INSERT INTO "stationServiceRules" ("stationID","serviceID","minimumStanding","minimumCharSecurity","maximumCharSecurity","minimumCorpSecurity","maximumCorpSecurity")
-                       VALUES ($1,$2,$3,$4,$5,$6,$7)
-                       ON CONFLICT ("stationID","serviceID") DO UPDATE SET "minimumStanding" = $3, "minimumCharSecurity" = $4, "maximumCharSecurity" = $5,
-                              "minimumCorpSecurity" = $6, "maximumCorpSecurity" = $7"#,
-                    &[&(station as i32), &(service as i32), &field("minimumStanding").unwrap_or(-10.0), &field("minimumCharSecurity").unwrap_or(-10.0), &field("maximumCharSecurity").unwrap_or(10.0), &field("minimumCorpSecurity").unwrap_or(-10.0), &field("maximumCorpSecurity").unwrap_or(10.0)],
-                )
-                .await;
-        }
-    }
-    if let Some(Value::List(mods)) = args.get(1) {
-        for m in mods {
-            let (Some(service), discount, surcharge) = (rule_field(m, "serviceID").map(|v| v as i64), rule_field(m, "discountPerGoodStandingPoint").unwrap_or(0.0), rule_field(m, "surchargePerBadStandingPoint").unwrap_or(0.0)) else { continue };
-            let _ = ctx
-                .db
-                .execute(
-                    r#"INSERT INTO "stationServiceRules" ("stationID","serviceID","discountPerGoodStandingPoint","surchargePerBadStandingPoint") VALUES ($1,$2,$3,$4)
-                       ON CONFLICT ("stationID","serviceID") DO UPDATE SET "discountPerGoodStandingPoint" = $3, "surchargePerBadStandingPoint" = $4"#,
-                    &[&(station as i32), &(service as i32), &discount, &surcharge],
-                )
-                .await;
-        }
-    }
-    info!("station {station}'s management settings updated");
-    Ok(())
-}
-
-/// A field of a KeyVal (or dict) the client sent back.
-fn rule_field(v: &Value, name: &str) -> Option<f64> {
-    let dict = match v {
-        Value::Instance { state, .. } => match state.as_ref() {
-            Value::Dict(d) => d,
-            _ => return None,
-        },
-        Value::Dict(d) => d,
-        _ => return None,
-    };
-    dict.iter().find(|(k, _)| k.as_string().as_deref() == Some(name)).and_then(|(_, v)| v.as_f64())
+/// Source-shaped settings are validated and committed atomically.
+async fn update(ctx:&Ctx<'_>,station:i64,args:&[Value])->Refused<()> {
+    management::update(ctx,station,args).await
 }
 
 /// Whether a station's owners let a pilot use a service (docking included),
 /// by the rules they set: standing towards them and security status.
 pub async fn may_use(db: &impl GenericClient, station: i64, service: i64, char_id: i64) -> bool {
+    match may_use_checked(db,station,service,char_id).await {
+        Ok(allowed)=>allowed,
+        Err(error)=>{error!("checking station {station} service access: {}",crate::logging::chain(&error));false}
+    }
+}
+
+pub async fn may_use_checked(db:&impl GenericClient,station:i64,service:i64,char_id:i64)->Result<bool,tokio_postgres::Error> {
     let sql = r#"SELECT r."minimumStanding", r."minimumCharSecurity", r."maximumCharSecurity", c."securityRating",
                         COALESCE((SELECT o."standing" FROM "ownerStandings" o WHERE o."fromID" = s."corporationID" AND o."toID" IN (c."characterID", c."corporationID") ORDER BY o."standing" LIMIT 1), 0)::float8,
                         s."corporationID" = c."corporationID"
                    FROM "staStations" s JOIN "character_" c ON c."characterID" = $3
                    LEFT JOIN "stationServiceRules" r ON r."stationID" = s."stationID" AND r."serviceID" = $2
-                  WHERE s."stationID" = $1"#;
-    let Ok(Some(r)) = db.query_opt(sql, &[&(station as i32), &(service as i32), &(char_id as i32)]).await else { return true };
+                  WHERE s."stationID" = $1 AND s."corporationID" IS NOT NULL"#;
+    let Some(r) = db.query_opt(sql, &[&(station as i32), &(service as i32), &(char_id as i32)]).await? else { return Ok(false) };
     if r.get::<_, Option<bool>>(5) == Some(true) {
-        return true;
+        return Ok(true);
     }
     let (min_standing, min_sec, max_sec) = (float(&r, 0).unwrap_or(-10.0), float(&r, 1).unwrap_or(-10.0), float(&r, 2).unwrap_or(10.0));
     let (sec, standing) = (float(&r, 3).unwrap_or(0.0), float(&r, 4).unwrap_or(0.0));
-    standing >= min_standing && sec >= min_sec && sec <= max_sec
+    Ok([standing,sec,min_standing,min_sec,max_sec].into_iter().all(f64::is_finite)
+        && standing >= min_standing && sec >= min_sec && sec <= max_sec)
 }
+
+/// Guard absent standing rows as well as existing ones. The trigger covers all
+/// writers, including bot updates and administrative SQL, without depending on
+/// callers remembering a service-specific mutex. Bigint advisory locks have a
+/// separate namespace from the two-integer character lifecycle locks.
+pub async fn ensure_access_locks(db:&tokio_postgres::Client)->Result<(),tokio_postgres::Error>{
+    db.batch_execute(r#"
+        CREATE OR REPLACE FUNCTION station_standing_access_lock() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE keys bigint[]; access_key bigint;
+        BEGIN
+            IF TG_OP='INSERT' THEN
+                keys=ARRAY[hashtextextended('trinity:station-access-standing:'||NEW."fromID"::text||':'||NEW."toID"::text,0)];
+            ELSIF TG_OP='DELETE' THEN
+                keys=ARRAY[hashtextextended('trinity:station-access-standing:'||OLD."fromID"::text||':'||OLD."toID"::text,0)];
+            ELSE
+                keys=ARRAY[hashtextextended('trinity:station-access-standing:'||OLD."fromID"::text||':'||OLD."toID"::text,0),
+                           hashtextextended('trinity:station-access-standing:'||NEW."fromID"::text||':'||NEW."toID"::text,0)];
+            END IF;
+            FOR access_key IN SELECT DISTINCT value FROM unnest(keys) AS value ORDER BY value LOOP
+                PERFORM pg_advisory_xact_lock(access_key);
+            END LOOP;
+            IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+            RETURN NEW;
+        END $$;
+        DO $$ BEGIN
+            IF NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='station_standing_access_lock') THEN
+                CREATE TRIGGER station_standing_access_lock BEFORE INSERT OR UPDATE OR DELETE ON "ownerStandings"
+                    FOR EACH ROW EXECUTE FUNCTION station_standing_access_lock();
+            END IF;
+        END $$;
+    "#).await
+}
+
+/// Arrival already owns the character row. Keep the station and its rules
+/// locked through COMMIT; station management takes the same station lock before
+/// inserting even a previously absent service rule.
+pub async fn may_use_locked(tx:&tokio_postgres::Transaction<'_>,station:i64,service:i64,char_id:i64)->Result<bool,tokio_postgres::Error> {
+    let Some(character)=tx.query_opt(r#"SELECT "corporationID","securityRating" FROM "character_" WHERE "characterID"=$1 FOR SHARE"#,
+        &[&(char_id as i32)]).await? else{return Ok(false);};
+    let Some(owner)=tx.query_opt(r#"SELECT "corporationID" FROM "staStations" WHERE "stationID"=$1 FOR SHARE"#,
+        &[&(station as i32)]).await? else{return Ok(false);};
+    let corporation=character.get::<_,i32>(0);
+    let Some(owner)=owner.get::<_,Option<i32>>(0) else {return Ok(false);};
+    if corporation==owner {return Ok(true);}
+    let rule=tx.query_opt(r#"SELECT "minimumStanding","minimumCharSecurity","maximumCharSecurity" FROM "stationServiceRules"
+        WHERE "stationID"=$1 AND "serviceID"=$2 FOR SHARE"#,&[&(station as i32),&(service as i32)]).await?;
+    let keys=tx.query(r#"SELECT DISTINCT hashtextextended('trinity:station-access-standing:'||$1::int::text||':'||target::text,0) AS key
+        FROM unnest($2::int[]) AS target ORDER BY key"#,&[&owner,&vec![char_id as i32,corporation]]).await?;
+    for key in keys {tx.query_one("SELECT pg_advisory_xact_lock_shared($1)",&[&key.get::<_,i64>(0)]).await?;}
+    // Do not add row locks here: UPDATE obtains its row lock before its BEFORE
+    // trigger takes the advisory lock. Taking the reverse order would deadlock.
+    // A fresh READ COMMITTED query after the advisory waits sees the committed
+    // standing, and both existing and absent pairs stay stable through COMMIT.
+    let standings=tx.query(r#"SELECT standing FROM "ownerStandings" WHERE "fromID"=$1 AND "toID"=ANY($2) ORDER BY "toID""#,
+        &[&owner,&vec![char_id as i32,corporation]]).await?;
+    let standing=standings.iter().filter_map(|r|float(r,0)).min_by(f64::total_cmp).unwrap_or(0.0);
+    let security=float(&character,1).unwrap_or(0.0);
+    let (minimum,low,high)=rule.map_or((-10.0,-10.0,10.0),|r|(r.get::<_,f64>(0),r.get::<_,f64>(1),r.get::<_,f64>(2)));
+    Ok([standing,security,minimum,low,high].into_iter().all(f64::is_finite) && standing>=minimum && security>=low && security<=high)
+}
+
+#[cfg(test)] mod access_tests;

@@ -1,3 +1,7 @@
 tools/
 target/
 crates/eve-server/web/node_modules/
+# Dev
+compatbility/
+scripts/
+data/

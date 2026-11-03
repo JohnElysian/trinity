@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value as Json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,8 +55,10 @@ pub async fn run(server: Arc<Server>, bind: String) {
         let Ok((stream, _)) = listener.accept().await else { continue };
         let server = Arc::clone(&server);
         tokio::spawn(async move {
-            if let Err(e) = answer(stream, &server).await {
-                debug!("web: {e}");
+            match tokio::time::timeout(Duration::from_secs(15), answer(stream, &server)).await {
+                Ok(Err(e)) => debug!("web: {e}"),
+                Err(_) => debug!("web: request timed out"),
+                Ok(Ok(())) => {},
             }
         });
     }
@@ -83,7 +85,7 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
         let query = target.split_once('?').map_or("", |(_, q)| q);
         let asked = query.split('&').find_map(|kv| kv.strip_prefix("do=")).map(decode).unwrap_or_default();
         let (status, body) = if !crate::bots::controls_enabled() {
-            (403, json!({ "error": "Dashboard controls are off (bots.dashboardControls in rmr.yml)." }))
+            (403, json!({ "error": "Dashboard controls are off (bots.dashboardControls in trinity.yml)." }))
         } else {
             let words: Vec<&str> = asked.split_whitespace().collect();
             match crate::bots::request(&words) {
@@ -110,6 +112,8 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
                 "/api/alliances" => Some(alliances(server).await),
                 "/api/corporations" => Some(corporations(server).await),
                 "/api/systems" => Some(systems(server).await),
+                "/api/map" => Some(map(server).await),
+                "/api/sov" => Some(sov(server).await),
                 "/api/kills" => Some(kills(server).await),
                 "/api/killboard" => Some(killboard(server).await),
                 "/api/market" => Some(Ok(server.world.lock().bot_panels.market.clone())),
@@ -184,10 +188,11 @@ fn ms(column: &str) -> String {
     format!("({column} / 10000 - {UNIX_EPOCH_MS})::bigint")
 }
 
-type Answer = Result<Json, tokio_postgres::Error>;
+type Answer = Result<Json, crate::db::AcquireError>;
 
 async fn summary(server: &Server) -> Answer {
-    let held: i64 = server.db.query_one(r#"SELECT count(*) FROM "mapSolarSystems" WHERE "allianceID" IS NOT NULL"#, &[]).await?.get(0);
+    let db=server.db.lease().await?;
+    let held: i64 = db.query_one(r#"SELECT count(*) FROM "mapSolarSystems" WHERE "allianceID" IS NOT NULL"#, &[]).await?.get(0);
     let w = server.world.lock();
     let b = &w.bot_stats;
     Ok(json!({
@@ -227,6 +232,7 @@ fn news(server: &Server) -> Answer {
 }
 
 async fn wars(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let now = crate::bulkdata::filetime_now();
     let sql = format!(
         r#"SELECT w."warID" AS id,
@@ -246,7 +252,7 @@ async fn wars(server: &Server) -> Answer {
         declared = ms(r#"w."timeDeclared""#),
         finished = ms(r#"w."timeFinished""#),
     );
-    let found = server.db.query(sql.as_str(), &[&now]).await?;
+    let found = db.query(sql.as_str(), &[&now]).await?;
     let losses = server.world.lock().bot_stats.war_losses.clone();
     let mut list = rows(&found);
     if let Json::Array(items) = &mut list {
@@ -260,6 +266,7 @@ async fn wars(server: &Server) -> Answer {
 
 /// The people playing, not the bots: where each is and in what.
 async fn players(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let present = server.world.lock().players();
     let ids: Vec<i32> = present.iter().map(|p| p.char_id as i32).collect();
     let sql = r#"SELECT c."characterID" AS id, c."characterName" AS name, co."corporationName" AS corporation,
@@ -271,10 +278,9 @@ async fn players(server: &Server) -> Answer {
                    LEFT JOIN entity e ON e."itemID" = c."shipID"
                    LEFT JOIN "invTypes" t ON t."typeID" = e."typeID"
                   WHERE c."characterID" = ANY($1) ORDER BY c."characterName""#;
-    let found = server.db.query(sql, &[&ids]).await?;
+    let found = db.query(sql, &[&ids]).await?;
     let systems: Vec<i32> = present.iter().map(|p| p.solar_system_id as i32).collect();
-    let names: HashMap<i32, (String, f64)> = server
-        .db
+    let names: HashMap<i32, (String, f64)> = db
         .query(r#"SELECT "solarSystemID", "solarSystemName", "security" FROM "mapSolarSystems" WHERE "solarSystemID" = ANY($1)"#, &[&systems])
         .await?
         .iter()
@@ -296,6 +302,7 @@ async fn players(server: &Server) -> Answer {
 }
 
 async fn alliances(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let sql = r#"SELECT a."allianceID" AS id, a."allianceName" AS name, a."shortName" AS ticker,
                         count(co."corporationID")::int AS corporations, COALESCE(sum(co."memberCount"), 0)::int AS pilots,
                         CASE g."kind" WHEN 11 THEN 'null-sec' WHEN 12 THEN 'pirate' WHEN 13 THEN 'industrial' ELSE 'players' END AS kind,
@@ -308,10 +315,11 @@ async fn alliances(server: &Server) -> Answer {
                   WHERE a."deleted" = 0
                   GROUP BY a."allianceID", g."kind", r."regionName"
                   ORDER BY pilots DESC LIMIT 60"#;
-    Ok(rows(&server.db.query(sql, &[]).await?))
+    Ok(rows(&db.query(sql, &[]).await?))
 }
 
 async fn corporations(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let sql = r#"SELECT co."corporationID" AS id, co."corporationName" AS name, co."tickerName" AS ticker, co."memberCount" AS members,
                         a."shortName" AS alliance, EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = co."corporationID") AS bots
                    FROM "corporation" co
@@ -319,11 +327,12 @@ async fn corporations(server: &Server) -> Answer {
                   WHERE co."deleted" = 0
                     AND NOT EXISTS (SELECT 1 FROM "crpNPCCorporations" n WHERE n."corporationID" = co."corporationID")
                   ORDER BY co."memberCount" DESC LIMIT 40"#;
-    Ok(rows(&server.db.query(sql, &[]).await?))
+    Ok(rows(&db.query(sql, &[]).await?))
 }
 
 /// The busiest systems by pilots online: in space and docked, bots included.
 async fn systems(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let (space, docked) = server.world.lock().counts();
     let mut busiest: Vec<(i64, i64, i64)> = space.iter().map(|(s, n)| (*s, *n, docked.get(s).copied().unwrap_or(0))).collect();
     busiest.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then(a.0.cmp(&b.0)));
@@ -332,8 +341,7 @@ async fn systems(server: &Server) -> Answer {
     let sql = r#"SELECT s."solarSystemID", s."solarSystemName", round(s."security"::numeric, 1)::float8, r."regionName"
                    FROM "mapSolarSystems" s JOIN "mapRegions" r ON r."regionID" = s."regionID"
                   WHERE s."solarSystemID" = ANY($1)"#;
-    let names: HashMap<i32, (String, f64, String)> = server
-        .db
+    let names: HashMap<i32, (String, f64, String)> = db
         .query(sql, &[&ids])
         .await?
         .iter()
@@ -348,6 +356,90 @@ async fn systems(server: &Server) -> Answer {
             })
             .collect(),
     ))
+}
+
+/// Metres in a light year: the map's coordinates are sent in these.
+const LIGHT_YEAR: f64 = 9.4607e15;
+
+static MAP: OnceLock<Json> = OnceLock::new();
+
+/// The star map for the sovereignty map, which never changes: regions as
+/// [id, name], systems as [id, name, region, constellation, x, z, security]
+/// (x and z in light years, seen from above), and each gate link once as
+/// [from, to].
+async fn map(server: &Server) -> Answer {
+    if let Some(m) = MAP.get() {
+        return Ok(m.clone());
+    }
+    let db=server.db.lease().await?;
+    let regions: Vec<Json> = db
+        .query(r#"SELECT "regionID", "regionName" FROM "mapRegions" ORDER BY "regionName""#, &[])
+        .await?
+        .iter()
+        .map(|r| json!([r.get::<_, i32>(0), r.get::<_, Option<String>>(1).unwrap_or_default()]))
+        .collect();
+    let ly = |v: Option<f64>| (v.unwrap_or(0.0) / LIGHT_YEAR * 100.0).round() / 100.0;
+    let systems: Vec<Json> = db
+        .query(
+            r#"SELECT "solarSystemID", "solarSystemName", "regionID", "constellationID", x, z, security
+                 FROM "mapSolarSystems""#,
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            json!([
+                r.get::<_, i32>(0),
+                r.get::<_, Option<String>>(1).unwrap_or_default(),
+                r.get::<_, Option<i32>>(2).unwrap_or(0),
+                r.get::<_, Option<i32>>(3).unwrap_or(0),
+                ly(r.get(4)),
+                ly(r.get(5)),
+                (r.get::<_, Option<f64>>(6).unwrap_or(0.0) * 100.0).round() / 100.0,
+            ])
+        })
+        .collect();
+    let jumps: Vec<Json> = db
+        .query(
+            r#"SELECT "fromSolarSystemID", "toSolarSystemID" FROM "mapSolarSystemJumps"
+                WHERE "fromSolarSystemID" < "toSolarSystemID""#,
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| json!([r.get::<_, i32>(0), r.get::<_, i32>(1)]))
+        .collect();
+    let m = json!({ "regions": regions, "systems": systems, "jumps": jumps });
+    Ok(MAP.get_or_init(|| m).clone())
+}
+
+/// Who holds what: [system, alliance] for every claimed system, and the
+/// alliances holding any as [id, name, ticker].
+async fn sov(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
+    let held: Vec<Json> = db
+        .query(r#"SELECT "solarSystemID", "allianceID" FROM "mapSolarSystems" WHERE "allianceID" IS NOT NULL"#, &[])
+        .await?
+        .iter()
+        .map(|r| json!([r.get::<_, i32>(0), r.get::<_, i32>(1)]))
+        .collect();
+    let alliances: Vec<Json> = db
+        .query(
+            r#"SELECT a."allianceID", a."allianceName", a."shortName" FROM alliances a
+                WHERE EXISTS (SELECT 1 FROM "mapSolarSystems" s WHERE s."allianceID" = a."allianceID")"#,
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            json!([
+                r.get::<_, i32>(0),
+                r.get::<_, Option<String>>(1).unwrap_or_default(),
+                r.get::<_, Option<String>>(2).unwrap_or_default(),
+            ])
+        })
+        .collect();
+    Ok(json!({ "systems": held, "alliances": alliances }))
 }
 
 /// A query string's value: `+` for spaces, `%XX` for bytes.
@@ -391,6 +483,7 @@ fn pilots(server: &Server, q: &str) -> Json {
 /// The last day's kills and losses by alliance (or corporation outside
 /// one), bots' unseen fights included.
 async fn killboard(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let since = crate::bulkdata::filetime_now() - 24 * 3_600 * 10_000_000;
     let sql = r#"WITH recent AS (SELECT * FROM "killLog" WHERE "killTime" > $1),
                       k AS (SELECT COALESCE(NULLIF(p."allianceID", 0), p."corporationID") AS side, count(*)::int AS n
@@ -404,12 +497,11 @@ async fn killboard(server: &Server) -> Answer {
                    FROM sides s LEFT JOIN k ON k.side = s.side LEFT JOIN l ON l.side = s.side
                    LEFT JOIN alliances a ON a."allianceID" = s.side LEFT JOIN "corporation" c ON c."corporationID" = s.side
                   ORDER BY kills DESC, losses DESC LIMIT 30"#;
-    let sides = rows(&server.db.query(sql, &[&since]).await?);
-    let total: i64 = server.db.query_one(r#"SELECT count(*) FROM "killLog" WHERE "killTime" > $1"#, &[&since]).await?.get(0);
+    let sides = rows(&db.query(sql, &[&since]).await?);
+    let total: i64 = db.query_one(r#"SELECT count(*) FROM "killLog" WHERE "killTime" > $1"#, &[&since]).await?.get(0);
     let ships = rows(
-        &server
-            .db
-            .query(
+        &db
+        .query(
                 r#"SELECT t."typeName" AS ship, count(*)::int AS lost FROM "killLog" k JOIN "invTypes" t ON t."typeID" = k."victimShipTypeID"
                     WHERE k."killTime" > $1 GROUP BY 1 ORDER BY 2 DESC LIMIT 10"#,
                 &[&since],
@@ -420,6 +512,7 @@ async fn killboard(server: &Server) -> Answer {
 }
 
 async fn kills(server: &Server) -> Answer {
+    let db=server.db.lease().await?;
     let sql = format!(
         r#"SELECT k."killID" AS id, {time} AS time, vc."characterName" AS victim, vco."corporationName" AS "victimCorporation",
                   t."typeName" AS ship, s."solarSystemName" AS system, fc."characterName" AS "finalBlow", k."isPodKill" = 1 AS pod
@@ -432,5 +525,26 @@ async fn kills(server: &Server) -> Answer {
             ORDER BY k."killID" DESC LIMIT 30"#,
         time = ms(r#"k."killTime""#)
     );
-    Ok(rows(&server.db.query(sql.as_str(), &[]).await?))
+    Ok(rows(&db.query(sql.as_str(), &[]).await?))
+}
+
+#[cfg(test)] mod recovery_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore="requires TRINITY_TEST_DATABASE disposable database; terminates only its own backend"]
+    async fn dashboard_database_requests_recover_on_the_next_request() {
+        let f=crate::test_support::Database::load().await;
+        let admin=crate::db::connect(&f.url).await.unwrap();
+        let server=Server {table:Default::default(),db:crate::db::Shared::new(f.db,f.url.clone()),db_url:f.url,
+            node_id:1,bulk:f.bulk,dogma:f.dogma,world:f.world,services:crate::svc::registry(),
+            dump_dir:Default::default(),alliance_join_delay_secs:0,sov_claim_delay_secs:0};
+        let before=summary(&server).await.unwrap();
+        let original=server.db.snapshot();
+        let pid:i32=original.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+        admin.query_one("SELECT pg_terminate_backend($1)",&[&pid]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {while !original.is_closed(){tokio::task::yield_now().await;}}).await.unwrap();
+        let after=summary(&server).await.unwrap();
+        assert_eq!(before["systemsHeld"],after["systemsHeld"]);
+        assert!(!std::sync::Arc::ptr_eq(&original,&server.db.snapshot()));
+    }
 }

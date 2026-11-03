@@ -522,29 +522,24 @@ async fn set_standing(db: &Client, side: i32, player: i32, value: f64) -> Result
 /// A bounty from the side's leader, paid out of its executor's wallet (as
 /// much as it has, up to `amount`).
 async fn bounty(db: &Client, side: i32, player: i32, amount: f64) -> Result<(), tokio_postgres::Error> {
+    if !amount.is_finite() || amount<100_000.0 {return Ok(())}
     let Some((exec, ceo)) = leader(db, side).await else { return Ok(()) };
     let paid: f64 = db
         .query_opt(
-            r#"WITH old AS (SELECT "balance" FROM "corporation" WHERE "corporationID" = $1 FOR UPDATE)
-               UPDATE "corporation" c SET "balance" = c."balance" - LEAST(GREATEST(old."balance", 0), $2) FROM old
-                WHERE c."corporationID" = $1
-               RETURNING LEAST(GREATEST(old."balance", 0), $2)"#,
-            &[&exec, &amount],
+            r#"WITH target AS (SELECT "characterID" FROM "character_" WHERE "characterID"=$3 FOR UPDATE),
+                    old AS (SELECT "balance" FROM "corporation" WHERE "corporationID"=$1 AND "balance">=100000 AND EXISTS (SELECT 1 FROM target) FOR UPDATE),
+                    paid AS (UPDATE "corporation" c SET "balance"=c."balance"-LEAST(old."balance",$2) FROM old WHERE c."corporationID"=$1 RETURNING LEAST(old."balance",$2) AS amount),
+                    placed AS (INSERT INTO bounties ("characterID","ownerID",bounty,"placedAt") SELECT $3,$4,amount,$5 FROM paid
+                        ON CONFLICT ("characterID","ownerID") DO UPDATE SET bounty=bounties.bounty+EXCLUDED.bounty,"placedAt"=EXCLUDED."placedAt")
+               UPDATE "character_" c SET bounty=c.bounty+paid.amount FROM paid WHERE c."characterID"=$3 RETURNING paid.amount"#,
+            &[&exec, &amount, &player, &ceo, &crate::bulkdata::filetime_now()],
         )
         .await?
         .and_then(|r| float(&r, 0))
         .unwrap_or(0.0);
-    let paid = paid.min(amount);
     if paid < 100_000.0 {
         return Ok(());
     }
-    db.execute(
-        r#"WITH placed AS (INSERT INTO "bounties" ("characterID","ownerID","bounty","placedAt") VALUES ($1,$2,$3,$4)
-                           ON CONFLICT ("characterID","ownerID") DO UPDATE SET "bounty" = "bounties"."bounty" + EXCLUDED."bounty", "placedAt" = EXCLUDED."placedAt")
-           UPDATE "character_" SET "bounty" = "bounty" + $3 WHERE "characterID" = $1"#,
-        &[&player, &ceo, &paid, &crate::bulkdata::filetime_now()],
-    )
-    .await?;
     info!("bots: {side} put {paid} ISK on {player}'s head");
     Ok(())
 }
@@ -821,6 +816,23 @@ pub async fn recruit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn bounty_only_debits_when_a_valid_minimum_bounty_is_placed() {
+        let fixture=crate::test_support::Database::load().await;
+        let corp=fixture.id().await; let target=fixture.id().await; let absent=fixture.id().await;
+        fixture.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName",balance,"ceoID") VALUES ($1,$2,50000,$3)"#,&[&corp,&format!("Bounty treasury {corp}"),&target]).await.unwrap();
+        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName") VALUES ($1,$2)"#,&[&target,&format!("Bounty target {target}")]).await.unwrap();
+        bounty(&fixture.db,corp,target,1_000_000.0).await.unwrap();
+        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap().get(0);assert_eq!(balance,50_000.0);
+        fixture.db.execute(r#"UPDATE corporation SET balance=200000 WHERE "corporationID"=$1"#,&[&corp]).await.unwrap();
+        bounty(&fixture.db,corp,absent,1_000_000.0).await.unwrap();
+        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap().get(0);assert_eq!(balance,200_000.0);
+        bounty(&fixture.db,corp,target,1_000_000.0).await.unwrap();
+        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap().get(0);assert_eq!(balance,0.0);
+        let placed:f64=fixture.db.query_one(r#"SELECT bounty FROM "character_" WHERE "characterID"=$1"#,&[&target]).await.unwrap().get(0);assert_eq!(placed,200_000.0);
+    }
 
     fn kill(class: u8) -> Kill {
         Kill { victim: 3, killer: 900, pod: false, class, system: 30_000_142 }

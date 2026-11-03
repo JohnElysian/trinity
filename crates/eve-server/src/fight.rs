@@ -117,7 +117,7 @@ fn cycles(park: &mut Park, now: i64, out: &mut Out) {
         .ships
         .values()
         .filter_map(|s| s.fight.as_ref().map(|f| (s.id, f)))
-        .flat_map(|(id, f)| f.modules.iter().filter(|m| m.next_ms <= now).map(move |m| (id, m.module_id)))
+        .flat_map(|(id, f)| f.modules.iter().filter(|m| m.continuous() || m.next_ms <= now).map(move |m| (id, m.module_id)))
         .collect();
     for (ship, module) in due {
         cycle(park, ship, module, now, out);
@@ -140,18 +140,20 @@ fn cycle(park: &mut Park, ship_id: i64, module_id: i64, now: i64, out: &mut Out)
         stop(park, ship_id, module_id, now, out, why);
         return;
     }
+    if m.continuous() { return; }
 
     let Some(ship) = park.ships.get_mut(&ship_id) else { return };
     let player = ship.is_player().then_some((ship.client_id, ship.pilot.char_id));
     let Some(fight) = ship.fight.as_mut() else { return };
     if m.cap_need > 0.0 {
-        if !fight.vitals.capacitor.spend(now, m.cap_need) {
+        if !m.first_cycle_prepaid && !fight.vitals.capacitor.spend(now, m.cap_need) {
             stop(park, ship_id, module_id, now, out, Some(notify("Your capacitor is too low to run that module.")));
             return;
         }
         out.drained(ship_id);
     }
     let Some(running) = fight.module_mut(module_id) else { return };
+    running.first_cycle_prepaid = false;
     if let Some(ammo) = running.ammo.as_mut() {
         ammo.quantity -= ammo.per_cycle;
         if let Some((client_id, _)) = player {
@@ -180,6 +182,14 @@ fn cycle(park: &mut Park, ship_id: i64, module_id: i64, now: i64, out: &mut Out)
     }
 }
 
+/// A funded first cycle must run before releasing its publication reservation:
+/// otherwise movement could enter warp before the next heartbeat and cancel an
+/// already paid effect. Preserve every normal cycle notification and DB job.
+pub(crate) fn funded_first_cycle(park: &mut Park, ship_id: i64, module_id: i64, now: i64, out: &mut Out) {
+    cycle(park,ship_id,module_id,now,out);
+    report(park,now,out);
+}
+
 /// A titan's doomsday: its damage on every ship within reach but its own.
 #[allow(clippy::too_many_arguments)]
 fn doomsday(park: &mut Park, ship_id: i64, m: &Active, damage: Damage, range: f64, now: i64, out: &mut Out) {
@@ -196,11 +206,12 @@ fn doomsday(park: &mut Park, ship_id: i64, m: &Active, damage: Damage, range: f6
 fn stop_reason(park: &Park, ship_id: i64, m: &Active) -> Option<Option<(String, Value)>> {
     let ship = park.ships.get(&ship_id)?;
     let fight = ship.fight.as_ref()?;
-    // A covert ops cloak holds through a warp; nothing else does.
-    if m.stopping || (ship.in_warp() && m.action != Action::Cloak { warp_safe: true }) {
+    // Original 45017 data also marks repairs, capacitor boosters, hardeners
+    // and other self effects safe. Cloak identity alone is not this policy.
+    if m.stopping || (ship.in_warp() && !m.warp_safe) {
         return Some(None);
     }
-    if m.repeat < REPEAT_FOREVER && m.cycles > m.repeat {
+    if !m.continuous() && m.repeat < REPEAT_FOREVER && m.cycles > m.repeat {
         return Some(None);
     }
     if let Some(ammo) = &m.ammo {
@@ -391,12 +402,17 @@ pub fn stop(park: &mut Park, ship_id: i64, module_id: i64, now: i64, out: &mut O
     let Some(fight) = ship.fight.as_mut() else { return };
     let Some(at) = fight.modules.iter().position(|m| m.module_id == module_id) else { return };
     let m = fight.modules.remove(at);
+    if let Action::Cloak {targeting_delay_ms,reactivation_delay_ms,..}=m.action {
+        fight.cloak_history.prune(now);
+        fight.cloak_history.targeting_at=now.saturating_add(targeting_delay_ms);
+        fight.cloak_history.module_ready.insert(module_id,now.saturating_add(reactivation_delay_ms));
+    }
     if ship.is_player() {
         out.note(ship.client_id, "OnGodmaShipEffect", effect_event(ship.pilot.char_id, ship_id, &m, false, now));
         if let Some((key, args)) = message {
             out.note(ship.client_id, "OnRemoteMessage", Value::Tuple(vec![Value::bytes(key), args]));
         }
-        if m.action == Action::Passive {
+        if m.action == Action::Passive || matches!(m.action,Action::Cloak {..}) {
             out.jobs.push(Job::Refit { client_id: ship.client_id, char_id: ship.pilot.char_id, ship_id, system });
         }
     }
@@ -694,7 +710,7 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
     let dead: Vec<i64> = park
         .ships
         .values()
-        .filter(|s| s.fight.as_ref().is_some_and(|f| f.vitals.hull_max > 0.0 && f.vitals.hull_damage >= f.vitals.hull_max - 1e-6))
+        .filter(|s| !s.identity_reserved && s.fight.as_ref().is_some_and(|f| f.vitals.hull_max > 0.0 && f.vitals.hull_damage >= f.vitals.hull_max - 1e-6))
         .map(|s| s.id)
         .collect();
     for id in dead {
@@ -734,6 +750,7 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
             }
             out.jobs.push(Job::BotLost(Box::new(loss)));
         } else if ship.npc.is_some() {
+            out.jobs.push(Job::NpcKill { system });
             npc::killed(park, &ship, now, out);
             let bounty = ship.npc.as_ref().map_or(0.0, |b| b.bounty);
             info!("{} ({id}) destroyed by {}, bounty {bounty}", ship.pilot.name, culprit(park, killer));
@@ -756,7 +773,8 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
             }
         } else if let Some(drone) = &ship.drone {
             info!("drone {id} of {} destroyed by {}", drone.owner, culprit(park, killer));
-            out.jobs.push(Job::DroneLost { client_id: Some(drone.client_id), drone_id: id });
+            out.jobs.push(Job::DroneLost { client_id: Some(drone.client_id), drone_id: id,
+                system:park.solar_system_id,owner:drone.owner,generation:drone.generation() });
         } else {
             info!("{}'s ship {id} destroyed by {}", ship.pilot.name, culprit(park, killer));
             let capsule = ship.pilot.group_id == GROUP_CAPSULE;
@@ -926,4 +944,107 @@ fn report(park: &Park, now: i64, out: &mut Out) {
 pub fn damage_state(v: &combat::Vitals, now: i64) -> Value {
     let (shield, tau, armor, hull) = v.damage_state(now);
     Value::List(vec![Value::Tuple(vec![Value::Double(shield), Value::Double(tau)]), Value::Double(armor), Value::Double(hull)])
+}
+
+#[cfg(test)]
+mod warp_effect_tests {
+    use super::*;
+    use crate::ballpark::{Pilot, ShipStats};
+    use crate::combat::{Charged, Fighter, Vitals};
+
+    fn module(id: i64, effect: i64, action: Action, warp_safe: bool) -> Active {
+        Active {
+            module_id: id, type_id: 399, effect_id: effect, guid: "effects.ShieldBoosting".into(),
+            offensive: false, warp_safe, disallow_warp_alignment:false, action, target: None, ammo: None,
+            duration_ms: 1000, cap_need: 5.0, first_cycle_prepaid: false, started_ms: 0, next_ms: 0,
+            cycles: 0, repeat: REPEAT_FOREVER, stopping: false, name: "test module".into(),
+            reach: None, landed: true,
+        }
+    }
+
+    fn warping_ship() -> Park {
+        let mut park = Park::new(30000142, vec![], 0);
+        let mut ship = Ship::new(1, 1, ShipStats::new(30.0, 1e6, 1.0, 100.0, 1.0),
+            Pilot { type_id: 587, group_id: 25, name: "Warp fixture".into(), char_id: 1, corp_id: 1, alliance_id: None, security: 0.0, bounty: 0.0 },
+            Vec3::ZERO, Vec3::new(100.0,0.0,0.0));
+        let mut vitals = Vitals {
+            shield: Charged::full(100.0,0.0,0), capacitor: Charged::full(100.0,0.0,0),
+            armor_max: 100.0, armor_damage: 50.0, hull_max: 100.0, hull_damage: 0.0,
+            resonance: [[1.0;4];3],
+        };
+        vitals.shield.set(0,0.0);
+        ship.fight = Some(Fighter::new(vitals,30.0,100.0,10000.0,3));
+        park.ships.insert(1, ship);
+        park.command(1,Command::Warp { target: Vec3::new(5.0e12,0.0,0.0), range: 0.0 });
+        park.advance(1);
+        assert!(park.ships[&1].in_warp());
+        park
+    }
+
+    #[test]
+    fn warp_safe_repair_and_hardener_keep_cycling_while_propulsion_stops() {
+        let mut park = warping_ship();
+        park.ships.get_mut(&1).unwrap().fight.as_mut().unwrap().modules = vec![
+            module(10,4,Action::ShieldBoost(10.0),true),
+            module(11,2098,Action::Passive,true),
+            module(12,1253,Action::Passive,false),
+            module(13,27,Action::ArmorRepair(5.0),true),
+        ];
+        let mut out = Out::default();
+        cycles(&mut park,0,&mut out);
+        let f = park.ships[&1].fight.as_ref().unwrap();
+        assert!(f.module(12).is_none());
+        assert_eq!(f.vitals.shield.at(0),10.0);
+        assert_eq!(f.vitals.armor_damage,45.0);
+        assert_eq!(f.vitals.capacitor.at(0),85.0,"unsafe module spends no capacitor");
+        assert!(out.jobs.iter().any(|job| matches!(job,Job::Refit { ship_id:1,.. })));
+        cycles(&mut park,1000,&mut out);
+        let f = park.ships[&1].fight.as_ref().unwrap();
+        assert_eq!(f.modules.len(),3);
+        assert!(f.modules.iter().all(|m| m.cycles==2));
+        assert_eq!(f.vitals.shield.at(1000),20.0);
+        assert_eq!(f.vitals.armor_damage,40.0);
+        assert_eq!(f.vitals.capacitor.at(1000),70.0);
+    }
+
+    #[test]
+    fn original_warp_safe_flag_also_controls_cloak_eligibility_and_explicit_stop_wins() {
+        let mut park = warping_ship();
+        park.ships.get_mut(&1).unwrap().cloaked=true;
+        let mut cloak=module(20,980,Action::Cloak { warp_safe:true,targeting_delay_ms:0,reactivation_delay_ms:0 },true);
+        park.ships.get_mut(&1).unwrap().fight.as_mut().unwrap().modules=vec![cloak.clone()];
+        assert_eq!(crate::cloak::warp_safe(&park,1),Some(true));
+        assert!(stop_reason(&park,1,&cloak).is_none());
+        cloak.stopping=true;
+        assert!(stop_reason(&park,1,&cloak).is_some());
+        cloak.stopping=false;
+        cloak.warp_safe=false;
+        park.ships.get_mut(&1).unwrap().fight.as_mut().unwrap().modules=vec![cloak.clone()];
+        assert_eq!(crate::cloak::warp_safe(&park,1),Some(false),"the original flag, not an action-name exception, decides");
+        assert!(stop_reason(&park,1,&cloak).is_some());
+    }
+
+    #[test]
+    fn funded_reservation_defers_warp_and_a_new_cyno_blocks_entry_before_affliction_refresh() {
+        let mut park=warping_ship();
+        let ship=park.ships.get_mut(&1).unwrap();
+        ship.arrive(Vec3::ZERO);
+        ship.vel=Vec3::new(100.0,0.0,0.0);
+        ship.stats.warp_capacitor_need=1e-6;
+        park.command(1,Command::Warp {target:Vec3::new(5.0e12,0.0,0.0),range:0.0});
+        park.ships.get_mut(&1).unwrap().identity_reserved=true;
+        park.advance(2);
+        assert!(park.ships[&1].warping() && !park.ships[&1].in_warp());
+        assert_eq!(park.ships[&1].fight.as_ref().unwrap().vitals.capacitor.at(0),100.0);
+        let ship=park.ships.get_mut(&1).unwrap();
+        ship.fight.as_mut().unwrap().modules.push(module(21,1729,Action::Cyno,false));
+        assert_eq!(ship.fight.as_ref().unwrap().afflictions.scrambled,0.0);
+        ship.identity_reserved=false;
+        // The deferred tick still drifted. Make the ship eligible for entry
+        // again so this assertion exercises the direct active-cyno guard.
+        ship.vel=Vec3::new(ship.stats.max_velocity,0.0,0.0);
+        park.advance(3);
+        assert!(!park.ships[&1].warping());
+        assert_eq!(park.ships[&1].fight.as_ref().unwrap().vitals.capacitor.at(0),100.0);
+    }
 }

@@ -47,10 +47,15 @@ const SKILL_BROKER_RELATIONS: i32 = 3446;
 const SKILL_ACCOUNTING: i32 = 16622;
 const CATEGORY_SHIP: i64 = 6;
 const FIRST_PLAYER_ID: i64 = 100_000_000;
-const CORP_ROLE_TRADER: i64 = 4_398_046_511_104;
+const CORP_ROLE_TRADER: i64 = 18_014_398_509_481_984;
 /// Whose wallet an order uses: its pilot's, or for a corporation order the
 /// pilot's corporation's.
-const WALLET: &str = r#"CASE WHEN "isCorp" = 1 THEN COALESCE((SELECT c."corporationID" FROM "character_" c WHERE c."characterID" = market_orders."charID"), "charID") ELSE "charID" END"#;
+const WALLET: &str = r#"COALESCE(NULLIF("walletOwnerID",0),"charID")"#;
+
+pub async fn ensure(db:&tokio_postgres::Client)->Result<(),tokio_postgres::Error> {
+    db.batch_execute(r#"ALTER TABLE market_orders ADD COLUMN IF NOT EXISTS "walletOwnerID" integer NOT NULL DEFAULT 0;
+        UPDATE market_orders SET "walletOwnerID"=CASE WHEN "isCorp"=1 THEN COALESCE((SELECT c."corporationID" FROM "character_" c WHERE c."characterID"=market_orders."charID"),"charID") ELSE "charID" END WHERE "walletOwnerID"=0;"#).await
+}
 
 /// Why an order was not placed.
 enum Refusal {
@@ -114,13 +119,15 @@ pub async fn market_write(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         // CancelCharOrder(orderID, regionID)
         "CancelCharOrder" => {
             let order_id = call.arg_id(0);
-            transact(ctx, |txn, fx| Box::pin(cancel(txn, fx, me, order_id))).await
+            let roles=(ctx.session.corp_id,ctx.session.corp_role());
+            transact(ctx, |txn, fx| Box::pin(cancel(txn, fx, me, order_id,roles))).await
         }
         // ModifyCharOrder(orderID, newPrice, bid, stationID, solarSystemID, price, volRemaining, issued)
         "ModifyCharOrder" => {
             let order_id = call.arg_id(0);
             let price = call.args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
-            transact(ctx, |txn, fx| Box::pin(modify(txn, fx, me, order_id, price))).await
+            let roles=(ctx.session.corp_id,ctx.session.corp_role());
+            transact(ctx, |txn, fx| Box::pin(modify(txn, fx, me, order_id, price,roles))).await
         }
         _ => return None,
     };
@@ -203,6 +210,9 @@ struct Match {
     remaining: i64,
     escrow: f64,
     corp: bool,
+    minimum: i64,
+    range: i64,
+    system: i64,
 }
 
 /// Where goods bought for an owner go: a corporation's deliveries, or a
@@ -227,9 +237,10 @@ async fn place(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order: NewOrder
     } else {
         me
     };
-    if order.quantity <= 0 || !order.price.is_finite() || order.price <= 0.0 {
+    if order.quantity <= 0 || order.quantity>i32::MAX as i64 || !order.price.is_finite() || order.price <= 0.0 || !(order.price*order.quantity as f64).is_finite() {
         return refuse("Enter a quantity and a price.");
     }
+    if order.min_volume>order.quantity || ![0,1,3,7,14,30,90].contains(&order.duration) || !(-1..=32767).contains(&order.range) {return refuse("Invalid minimum volume, duration or order range.")}
     let r = txn
         .tx()
         .query_opt(
@@ -249,7 +260,7 @@ async fn place(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order: NewOrder
 async fn buy(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, who: i64, order: &NewOrder, at: &Where) -> Result<(), Refusal> {
     // Sell orders inside the buy order's range, cheapest first.
     let sql = format!(
-        r#"SELECT "orderID",{WALLET},"stationID","price","volRemaining","escrow","isCorp"
+        r#"SELECT "orderID",{WALLET},"stationID","price","volRemaining","escrow","isCorp","minVolume","range","solarSystemID"
                  FROM market_orders
                 WHERE "typeID" = $1 AND "regionID" = $2 AND "bid" = 0 AND "orderState" = 0
                   AND "volRemaining" > 0 AND "price" <= $3 AND "charID" <> $4
@@ -272,7 +283,10 @@ async fn buy(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, who: i64, order: 
             ],
         )
         .await?;
-    let fills = take(rows.iter().map(as_match), order.quantity);
+    let reachable:Option<std::collections::HashSet<i64>>=if order.range>0 && order.range<32767 {
+        Some(crate::gates::within(txn.tx(),at.solar_system,order.range).await.into_iter().map(|(id,_)|id).collect())
+    } else {None};
+    let fills = take(rows.iter().map(as_match).filter(|m|reachable.as_ref().map_or(true,|systems|systems.contains(&m.system))), order.quantity);
     let filled: i64 = fills.iter().map(|(_, n)| n).sum();
     if order.duration == 0 && filled < order.quantity {
         return refuse("There is not enough for sale at that price within that range.");
@@ -299,7 +313,7 @@ async fn buy(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, who: i64, order: 
         broker_fee(txn, fx, me, who, escrow).await?;
         let entry = Entry { ref_type: REF_MARKET_ESCROW, payer: who, payee: 0, arg_id1: "", reason: "" };
         fx.balances.insert(who, post(txn.tx(), who, -escrow, &entry).await?);
-        let id = list(txn, me, order, at, left, escrow).await?;
+        let id = list(txn, me, who, order, at, left, escrow).await?;
         fx.orders.push((id, "Add"));
     }
     info!("bought {filled} of type {} (listed {left})", order.type_id);
@@ -333,11 +347,11 @@ async fn sell(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, who: i64, order:
 
     // Buy orders whose range reaches this station, best price first.
     let sql = format!(
-        r#"SELECT "orderID",{WALLET},"stationID","price","volRemaining","escrow","isCorp"
+        r#"SELECT "orderID",{WALLET},"stationID","price","volRemaining","escrow","isCorp","minVolume","range","solarSystemID"
                  FROM market_orders
                 WHERE "typeID" = $1 AND "regionID" = $2 AND "bid" = 1 AND "orderState" = 0
                   AND "volRemaining" > 0 AND "price" >= $3 AND "charID" <> $4
-                  AND "minVolume" <= $5
+                  AND LEAST("minVolume","volRemaining") <= $5
                   AND ("range" > 0 OR ("range" = -1 AND "stationID" = $6)
                        OR ("range" = 0 AND "solarSystemID" = $7))
                 ORDER BY "price" DESC, "issued"
@@ -358,7 +372,12 @@ async fn sell(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, who: i64, order:
             ],
         )
         .await?;
-    let fills = take(rows.iter().map(as_match), order.quantity);
+    let mut eligible=Vec::new();
+    for m in rows.iter().map(as_match) {
+        if m.range>0 && m.range<32767 && crate::gates::jumps(txn.tx(),at.solar_system,m.system,m.range).await.is_none() {continue}
+        eligible.push(m);
+    }
+    let fills = take(eligible.into_iter(), order.quantity);
     let sold: i64 = fills.iter().map(|(_, n)| n).sum();
     if order.duration == 0 && sold < order.quantity {
         return refuse("Nobody is buying that many at that price within reach.");
@@ -382,7 +401,7 @@ async fn sell(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, who: i64, order:
     let left = order.quantity - sold;
     if left > 0 {
         broker_fee(txn, fx, me, who, order.price * left as f64).await?;
-        let id = list(txn, me, order, at, left, 0.0).await?;
+        let id = list(txn, me, who, order, at, left, 0.0).await?;
         fx.orders.push((id, "Add"));
     }
     txn.set_quantity(item.id, item.quantity - order.quantity).await?;
@@ -399,6 +418,9 @@ fn as_match(r: &Row) -> Match {
         remaining: r.get::<_, i32>(4) as i64,
         escrow: r.get(5),
         corp: r.try_get::<_, i16>(6).is_ok_and(|c| c != 0),
+        minimum:r.try_get::<_,i32>("minVolume").unwrap_or(1) as i64,
+        range:r.try_get::<_,i32>("range").unwrap_or(-1) as i64,
+        system:r.try_get::<_,i32>("solarSystemID").unwrap_or(0) as i64,
     }
 }
 
@@ -411,6 +433,7 @@ fn take(orders: impl Iterator<Item = Match>, wanted: i64) -> Vec<(Match, i64)> {
             break;
         }
         let n = left.min(m.remaining);
+        if n<m.minimum.min(m.remaining) {continue}
         left -= n;
         out.push((m, n));
     }
@@ -419,6 +442,7 @@ fn take(orders: impl Iterator<Item = Match>, wanted: i64) -> Vec<(Match, i64)> {
 
 /// Take `n` units off an order; a buy order also gives up `spent` escrow.
 async fn fill(txn: &ItemTxn<'_>, fx: &mut Effects, m: &Match, n: i64, spent: Option<f64>) -> Result<(), Refusal> {
+    if m.owner>=FIRST_PLAYER_ID && spent.is_some_and(|s|s>m.escrow+0.005) {return refuse("That buy order no longer has enough money in escrow.")}
     let remaining = m.remaining - n;
     let escrow = spent.map_or(m.escrow, |s| (m.escrow - s).max(0.0));
     let state = if remaining == 0 { ORDER_DONE } else { ORDER_OPEN };
@@ -435,7 +459,7 @@ async fn fill(txn: &ItemTxn<'_>, fx: &mut Effects, m: &Match, n: i64, spent: Opt
     Ok(())
 }
 
-async fn list(txn: &ItemTxn<'_>, me: i64, order: &NewOrder, at: &Where, quantity: i64, escrow: f64) -> Result<i64, Refusal> {
+async fn list(txn: &ItemTxn<'_>, me: i64, who:i64, order: &NewOrder, at: &Where, quantity: i64, escrow: f64) -> Result<i64, Refusal> {
     let range = if order.bid { order.range } else { RANGE_STATION };
     let r = txn
         .tx()
@@ -443,8 +467,8 @@ async fn list(txn: &ItemTxn<'_>, me: i64, order: &NewOrder, at: &Where, quantity
             r#"INSERT INTO market_orders
                    ("typeID","charID","regionID","stationID","range","bid","price","volEntered",
                     "volRemaining","issued","orderState","minVolume","contraband","accountID",
-                    "duration","isCorp","solarSystemID","escrow","jumps")
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,0,$10,0,1000,$11,$14,$12,$13,1)
+                    "duration","isCorp","solarSystemID","escrow","jumps","walletOwnerID")
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,0,$10,0,1000,$11,$14,$12,$13,1,$15)
                RETURNING "orderID""#,
             &[
                 &(order.type_id as i32),
@@ -461,6 +485,7 @@ async fn list(txn: &ItemTxn<'_>, me: i64, order: &NewOrder, at: &Where, quantity
                 &(at.solar_system as i32),
                 &escrow,
                 &i16::from(order.corp),
+                &(who as i32),
             ],
         )
         .await?;
@@ -524,21 +549,22 @@ async fn record(
 }
 
 /// An open order of the caller's, locked.
-async fn own_order(txn: &ItemTxn<'_>, me: i64, order_id: i64) -> Result<(Match, bool, i64), Refusal> {
+async fn own_order(txn: &ItemTxn<'_>, me: i64, order_id: i64,corp:Option<i64>) -> Result<(Match, bool, i64), Refusal> {
     let sql = format!(
         r#"SELECT "orderID",{WALLET},"stationID","price","volRemaining","escrow","isCorp","bid","typeID"
-             FROM market_orders WHERE "orderID" = $1 AND "charID" = $2 AND "orderState" = 0
+             FROM market_orders WHERE "orderID" = $1 AND ("charID" = $2 OR ("isCorp"=1 AND "walletOwnerID"=$3)) AND "orderState" = 0
               FOR UPDATE"#
     );
-    let r = txn.tx().query_opt(sql.as_str(), &[&(order_id as i32), &(me as i32)]).await?;
+    let r = txn.tx().query_opt(sql.as_str(), &[&(order_id as i32), &(me as i32),&corp.map(|id|id as i32)]).await?;
     let Some(r) = r else { return refuse("That order is no longer open.") };
     Ok((as_match(&r), r.get::<_, i16>(7) != 0, r.get::<_, i32>(8) as i64))
 }
 
 /// Cancel: a buy order's escrow comes back, a sell order's goods go back to
 /// the hangar where it was listed.
-async fn cancel(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order_id: i64) -> Result<(), Refusal> {
-    let (order, bid, type_id) = own_order(txn, me, order_id).await?;
+async fn cancel(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order_id: i64,roles:(Option<i64>,i64)) -> Result<(), Refusal> {
+    let (order, bid, type_id) = own_order(txn, me, order_id,roles.0).await?;
+    authorize_order(&order,roles)?;
     let who = order.owner;
     if bid {
         if order.escrow > 0.0 {
@@ -561,11 +587,13 @@ async fn cancel(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order_id: i64)
 }
 
 /// Reprice: a buy order's escrow follows its price.
-async fn modify(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order_id: i64, price: f64) -> Result<(), Refusal> {
+async fn modify(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order_id: i64, price: f64,roles:(Option<i64>,i64)) -> Result<(), Refusal> {
     if !price.is_finite() || price <= 0.0 {
         return refuse("Enter a price.");
     }
-    let (order, bid, _) = own_order(txn, me, order_id).await?;
+    let (order, bid, _) = own_order(txn, me, order_id,roles.0).await?;
+    authorize_order(&order,roles)?;
+    if !(price*order.remaining as f64).is_finite() {return refuse("The total value is too large.")}
     let who = order.owner;
     let mut escrow = order.escrow;
     if bid {
@@ -586,4 +614,39 @@ async fn modify(txn: &mut ItemTxn<'_>, fx: &mut Effects, me: i64, order_id: i64,
     fx.orders.push((order_id, "Modify"));
     info!("repriced order {order_id} to {price}");
     Ok(())
+}
+
+fn authorize_order(order:&Match,roles:(Option<i64>,i64))->Result<(),Refusal> {
+    if order.corp && (roles.0!=Some(order.owner) || roles.1 & (crate::session::CORP_ROLE_DIRECTOR | crate::session::CORP_ROLE_ACCOUNTANT | CORP_ROLE_TRADER)==0) {return refuse("You no longer have permission to manage that corporation's order.")}
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn matching_honours_each_orders_minimum_after_prior_fills() {
+        let order=|id,remaining,minimum|Match {id,owner:1,station:1,price:1.0,remaining,escrow:100.0,corp:false,minimum,range:-1,system:1};
+        let filled=take(vec![order(1,8,1),order(2,100,5),order(3,1,5)].into_iter(),10);
+        assert_eq!(filled.iter().map(|(m,n)|(m.id,*n)).collect::<Vec<_>>(),vec![(1,8),(3,1)]);
+    }
+    #[tokio::test]
+    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn corporation_escrow_stays_with_original_corporation_after_member_leaves() {
+        let fixture=crate::test_support::Database::load().await;
+        let me=fixture.id().await as i64; let corp=fixture.id().await as i64; let next=fixture.id().await as i64;
+        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","corporationID",balance) VALUES ($1,$2,$3,10000000)"#,&[&(me as i32),&format!("Market issuer {me}"),&(corp as i32)]).await.unwrap();
+        for id in [corp,next] {fixture.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName",balance) VALUES ($1,$2,10000000)"#,&[&(id as i32),&format!("Market corp {id}")]).await.unwrap();}
+        let mut client=crate::db::connect(&fixture.url).await.unwrap();
+        let mut tx=ItemTxn::begin(&mut client).await.unwrap(); let mut fx=Effects::default();
+        let order=NewOrder {station:60000004,type_id:34,price:0.0001,quantity:10,bid:true,range:-1,item_id:None,min_volume:1,duration:1,corp:true};
+        assert!(place(&mut tx,&mut fx,me,order,(Some(corp),1)).await.is_ok());
+        let id=fx.orders[0].0; tx.commit().await.unwrap();
+        fixture.db.execute(r#"UPDATE "character_" SET "corporationID"=$2 WHERE "characterID"=$1"#,&[&(me as i32),&(next as i32)]).await.unwrap();
+        let mut tx=ItemTxn::begin(&mut client).await.unwrap(); let (read,_,_)=own_order(&tx,me,id,Some(next)).await.ok().unwrap(); assert_eq!(read.owner,corp);
+        assert!(cancel(&mut tx,&mut Effects::default(),me,id,(Some(next),1)).await.is_err());
+        drop(tx);
+        let mut tx=ItemTxn::begin(&mut client).await.unwrap(); assert!(cancel(&mut tx,&mut Effects::default(),me+1,id,(Some(corp),1)).await.is_ok()); tx.commit().await.unwrap();
+        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&(next as i32)]).await.unwrap().get(0); assert_eq!(balance,10_000_000.0);
+    }
 }

@@ -89,6 +89,10 @@ pub async fn alliance_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             Ok(ctx.rowset(ALLIANCE_HEADER, &sql, &[]).await)
         }
         "GetMembers" => Ok(keyed(ctx, MEMBER_HEADER, MEMBER_SELECT, "allianceID", subject.unwrap_or(0), 1).await),
+        "GetAllianceMembers" => {
+            let id = call.arg_i64(0).or(subject).unwrap_or(0) as i32;
+            Ok(ctx.rowset(MEMBER_HEADER,&format!(r#"{MEMBER_SELECT} WHERE "allianceID"=$1 ORDER BY "corporationID""#),&[&id]).await)
+        }
         "GetApplications" => {
             let sql = format!(r#"{APPLICATION_SELECT} WHERE "deleted" = 0 AND "allianceID" = $1"#);
             Ok(keyed_rows(ctx, APPLICATION_HEADER, &sql, subject.unwrap_or(0), 1).await)

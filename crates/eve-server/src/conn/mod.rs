@@ -6,6 +6,7 @@
 
 mod auth;
 mod location;
+pub(crate) mod logout;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,13 +27,13 @@ use crate::bulkdata::BulkData;
 use crate::exceptions::{custom_error, service_not_found, user_error};
 use crate::services::{self, Call, Ctx, Outcome};
 use crate::session::Session;
-use crate::svc::{bound, chat, inflight, space};
+use crate::svc::{bound, chat, space};
 use crate::world::{Notification, Presence, Push, World};
 
 /// State shared by every connection.
 pub struct Server {
     pub table: StringTable,
-    pub db: tokio_postgres::Client,
+    pub db: crate::db::Shared,
     pub db_url: String,
     pub node_id: i64,
     pub bulk: BulkData,
@@ -56,6 +57,8 @@ pub enum ConnError {
     Marshal(#[from] eve_marshal::Error),
     #[error("database: {0}")]
     Db(#[from] tokio_postgres::Error),
+    #[error("database recovery: {0}")]
+    DbRecovery(#[from] crate::db::AcquireError),
     #[error("{0}")]
     Protocol(String),
     /// We sent the client a close reason and are hanging up.
@@ -69,12 +72,16 @@ pub struct Conn {
     stream: TcpStream,
     reader: FrameReader,
     server: Arc<Server>,
+    /// Pinned for a complete handshake, RPC, or forced move. Never replaced
+    /// underneath an in-flight operation, including one awaiting COMMIT.
+    db: Arc<tokio_postgres::Client>,
     peer: SocketAddr,
     span: Span,
     client_id: i64,
     session: Session,
     authenticated: bool,
     pending_session_change: Option<MachoPacket>,
+    pending_dock: Option<location::DockingApproach>,
     /// Calls made on the client, by call ID, waiting for its answer.
     client_calls: std::collections::HashMap<i64, tokio::sync::oneshot::Sender<Option<Value>>>,
     next_call_id: i64,
@@ -93,6 +100,7 @@ impl Conn {
         Conn {
             stream,
             reader: FrameReader::new(),
+            db: server.db.snapshot(),
             server,
             peer,
             span,
@@ -100,6 +108,7 @@ impl Conn {
             session: Session::new(seq),
             authenticated: false,
             pending_session_change: None,
+            pending_dock: None,
             client_calls: std::collections::HashMap::new(),
             next_call_id: 0,
         }
@@ -111,7 +120,7 @@ impl Conn {
             info!("connected");
             let notifications = self.server.world.lock().connect(self.client_id);
             let result = self.serve(notifications).await;
-            self.leave_world();
+            self.leave_world().await;
             match result {
                 Ok(()) => info!("disconnected"),
                 Err(ConnError::Closed(reason)) => warn!("closed by the server: {reason}"),
@@ -125,9 +134,12 @@ impl Conn {
 
     async fn serve(&mut self, mut notifications: UnboundedReceiver<Push>) -> Result {
         self.handshake().await?;
+        let mut docking_tick=tokio::time::interval(std::time::Duration::from_millis(500));
+        docking_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             // Both branches are cancellation-safe: a read that loses the race has
             // not consumed any bytes, and recv() loses nothing.
+            let docking=self.pending_dock.is_some();
             let frame = tokio::select! {
                 frame = self.read_frame() => match frame? {
                     Some(frame) => frame,
@@ -139,6 +151,16 @@ impl Conn {
                         Push::Move(m) => self.forced_move(m).await?,
                         Push::Call(c) => self.call_client(c).await?,
                     }
+                    continue;
+                }
+                _ = docking_tick.tick(), if docking => {
+                    // An approach is not a dispatched transaction. Keep it
+                    // pending while the database is unavailable.
+                    if let Err(error)=self.refresh_database().await {
+                        warn!("docking database unavailable: {error}");
+                        continue;
+                    }
+                    self.poll_docking().await?;
                     continue;
                 }
             };
@@ -172,26 +194,36 @@ impl Conn {
 
     /// The character leaves the shared world: its ship leaves space and its chat
     /// channels hear it go.
-    fn leave_world(&mut self) {
+    async fn leave_world(&mut self) {
+        self.pending_dock=None;
+        let retained = {
         let mut world = self.server.world.lock();
-        let channels = world.disconnect(self.client_id);
-        if let (Some(system), Some(ship_id), None) =
-            (self.session.solar_system_id, self.session.ship_id, self.session.station_id)
-        {
-            // The pilot comes back docked, so the ship keeps only its damage.
-            if let Some(fight) = space::remove_ship(&mut world, system, ship_id).and_then(|s| s.fight) {
-                let server = Arc::clone(&self.server);
-                tokio::spawn(async move { inflight::save_vitals(&server.db, ship_id, &fight, true).await });
-            }
-        }
+        // A committed clone jump may enqueue its session change immediately
+        // before a failed socket write. Find actual controlled hulls, including
+        // that new capsule, rather than relying on the old session location.
+        let owned: Vec<_> = world.parks.values().flat_map(|park|park.ships.values()
+            .filter(|s|s.client_id==self.client_id && s.is_player()).map(|s|(s.id,(s.pilot.char_id,s.client_id)))).collect();
+        for (id,identity) in &owned {world.retained_logouts.insert(*id,*identity);}
         // Trades end when a trader goes.
         if let Some(char_id) = self.session.char_id {
             let server = Arc::clone(&self.server);
             tokio::spawn(async move { crate::svc::pvptrade::left_station(&server.db_url, &server.world, char_id).await });
         }
-        let who = chat::who(&self.session);
-        for (channel, members) in channels {
-            chat::announce(&world, &members, &channel, "LeaveChannel", &who, Vec::new());
+        let channels=world.disconnect(self.client_id);
+        let who=chat::who(&self.session);
+        for (channel,members) in channels {chat::announce(&world,&members,&channel,"LeaveChannel",&who,Vec::new());}
+        owned.into_iter().map(|(id,_)|id).collect::<Vec<_>>()
+        };
+        // Until the marker commits, reconnect can reclaim the authoritative
+        // live hull. Afterwards it waits for the exact final snapshot. The
+        // heartbeat keeps either obligation if this connection task is lost.
+        for id in retained {
+            let saved:std::result::Result<(),tokio_postgres::Error> = async {
+                let mut db = crate::db::connect(&self.server.db_url).await?;
+                logout::retry_one(&self.server.world,&mut db,id).await?;
+                logout::retry_one(&self.server.world,&mut db,id).await
+            }.await;
+            if let Err(e) = saved { error!("saving disconnected ship {id}: {}",crate::logging::chain(&e)); }
         }
     }
 
@@ -245,7 +277,33 @@ impl Conn {
 
     async fn handle_call(&mut self, req: &MachoPacket, call: &Call) -> Result {
         let started = Instant::now();
+        if let Err(error)=self.refresh_database().await {
+            warn!("request database unavailable: {error}");
+            return self.send_error(req,custom_error("The database is temporarily unavailable. Please try again shortly.")).await;
+        }
         let arg = |i: usize| call.arg_id(i);
+        if call.service == "authentication" && call.method == "SetLanguageID" {
+            return self.set_language_id(req, call).await;
+        }
+        if let Some(pilot)=self.session.char_id {
+            if crate::losses::journal::blocked_character_in_memory(&self.server.world,pilot)
+                || crate::travel::blocked_character_in_memory(&self.server.world,pilot)
+                || crate::svc::jumps::portal::blocked_character_in_memory(&self.server.world,pilot)
+                || logout::blocked_character_in_memory(&self.server.world,pilot) {
+                return self.send_error(req,custom_error("Your ship's destruction is being recovered. Please try again shortly.")).await;
+            }
+            match crate::losses::pending::blocked_character(&*self.db,pilot).await {
+                Ok(false)=>{},
+                Ok(true)=>return self.send_error(req,custom_error("Your station arrival is still being recovered. Reconnect after recovery completes.")).await,
+                Err(error)=>{
+                    error!("checking pending station arrival for {pilot}: {}",crate::logging::chain(&error));
+                    return self.send_error(req,custom_error("Your current ship could not be verified. Please try again shortly.")).await;
+                }
+            }
+        }
+        if bound::owns(&call.service,"beyonce") && (space::is_movement(&call.method) || matches!(call.method.as_str(),"StargateJump"|"BeaconJump"|"BeaconJumpAlliance"|"JumpThrough"|"JumpThroughGang"|"JumpThroughAlliance"|"JumpThroughCorporationStructure")) {
+            self.cancel_docking("A new flight command cancelled the docking approach.").await?;
+        }
 
         // Calls that move the session are handled here, not by a service, because
         // they change connection state.
@@ -259,21 +317,43 @@ impl Conn {
                 "TurboDock" => return self.dock(req, arg(0), true).await,
                 "StargateJump" => return self.stargate_jump(req, arg(0), arg(1)).await,
                 "BeaconJump" => return self.beacon_jump(req, arg(0), arg(1), arg(2)).await,
-                "JumpThrough" => return self.jump_through(req, arg(0), arg(1)).await,
+                "BeaconJumpAlliance" => return self.beacon_jump_alliance(req, arg(0), arg(1)).await,
+                "JumpThrough" | "JumpThroughGang" => return self.jump_through(req, arg(0), arg(1)).await,
+                "JumpThroughAlliance" => return self.jump_through_alliance(req, arg(0)).await,
+                "JumpThroughCorporationStructure" => return self.jump_through_structure(req, arg(0), arg(1), arg(2)).await,
                 _ => {}
             }
         }
         if bound::owns(&call.service, "ship") {
             match call.method.as_str() {
                 "Undock" => return self.undock(req, None).await,
-                "Board" => return self.board(req, arg(0), None).await,
+                "Board" => {
+                    if arg(1) != 0 {
+                        return self.send_error(req, custom_error("Passenger boarding is not supported by this server.")).await;
+                    }
+                    return self.board(req, arg(0), None).await;
+                }
+                "Eject" | "Evacuate" => return self.change_space_ship(req, None, None).await,
+                "StoreVessel" => return self.maintenance_ship(req,arg(0),None,None).await,
+                "BoardStoredShip" => return self.maintenance_ship(req,arg(0),Some(arg(1)),None).await,
                 "MachoBindObject" => match bound::piggyback(call) {
                     Some((m, _)) if m == "Undock" => {
                         return self.undock(req, Some(bound::params_of(call))).await;
                     }
                     Some((m, args)) if m == "Board" => {
+                        if args.get(1).and_then(Value::as_i64).unwrap_or(0) != 0 {
+                            return self.send_error(req, custom_error("Passenger boarding is not supported by this server.")).await;
+                        }
                         let ship = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
                         return self.board(req, ship, Some(bound::params_of(call))).await;
+                    }
+                    Some((m, _)) if m == "Eject" || m == "Evacuate" => {
+                        return self.change_space_ship(req, None, Some(bound::params_of(call))).await;
+                    }
+                    Some((m,args)) if m == "StoreVessel" || m == "BoardStoredShip" => {
+                        let host=args.first().and_then(Value::as_i64).unwrap_or(0);
+                        let hull=(m=="BoardStoredShip").then(||args.get(1).and_then(Value::as_i64).unwrap_or(0));
+                        return self.maintenance_ship(req,host,hull,Some(bound::params_of(call))).await;
                     }
                     _ => {}
                 },
@@ -391,12 +471,17 @@ impl Conn {
 
     // ---- helpers -----------------------------------------------------------
 
+    async fn refresh_database(&mut self)->Result {
+        self.db=self.server.db.lease().await?;
+        Ok(())
+    }
+
     fn ctx(&self) -> Ctx<'_> {
         Ctx {
             bulk: &self.server.bulk,
             dogma: &self.server.dogma,
             session: &self.session,
-            db: &self.server.db,
+            db: &self.db,
             db_url: &self.server.db_url,
             node_id: self.server.node_id,
             world: &self.server.world,
@@ -422,6 +507,14 @@ impl Conn {
 
     /// Tell the client how its session differs from `before`.
     async fn send_session_change_from(&mut self, before: &Session) -> Result {
+        if before.char_id != self.session.char_id || before.solar_system_id2 != self.session.solar_system_id2 {
+            if let (Some(character),Some(system)) = (self.session.char_id,self.session.solar_system_id2) {
+                let arrived = before.char_id == self.session.char_id && before.solar_system_id2.is_some();
+                if let Err(e) = crate::svc::map::record_visit(&self.db,character,system,arrived).await {
+                    warn!("recording system visit: {}",crate::logging::chain(&e));
+                }
+            }
+        }
         let change = self.session_change(self.session.change_body_from(before));
         self.server.world.lock().set_presence(self.client_id, self.presence());
         self.send_packet(&change).await

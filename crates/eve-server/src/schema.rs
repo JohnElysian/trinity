@@ -5,6 +5,9 @@
 use tokio_postgres::Client;
 
 const STATEMENTS: &[&str] = &[
+    // authentication.SetLanguageID persists the account preference; the
+    // original wwwroot/language.py updates autUsers.languageID and the session.
+    r#"ALTER TABLE "account" ADD COLUMN IF NOT EXISTS "languageID" text"#,
     // Jump clones (svc::clones): a body waiting in a station or a ship's
     // clone vat bay; its implants are items located on it.
     r#"CREATE TABLE IF NOT EXISTS "chrJumpClones" (
@@ -127,5 +130,28 @@ pub async fn ensure(db: &Client) -> Result<(), tokio_postgres::Error> {
     for sql in STATEMENTS {
         db.execute(*sql, &[]).await?;
     }
+    crate::svc::recruitment::ensure(db).await?;
+    crate::svc::contracts::ensure(db).await?;
+    crate::svc::trade::ensure(db).await?;
+    crate::svc::petition::ensure(db).await?;
+    crate::svc::bridges::ensure(db).await?;
+    crate::svc::chat::ensure(db).await?;
+    crate::losses::ensure(db).await?;
+    crate::travel::ensure(db).await?;
+    crate::svc::jumps::portal::ensure(db).await?;
+    crate::losses::pending::ensure(db).await?;
+    crate::losses::journal::ensure(db).await?;
+    crate::static_entities::ensure(db).await?;
+    crate::svc::map::ensure(db).await?;
+    crate::svc::tutorial::ensure(db).await?;
+    crate::drones::ensure(db).await?;
+    crate::space_state::ensure(db).await?;
+    crate::cloak::durability::ensure(db).await?;
+    crate::svc::maintenance::ensure(db).await?;
+    crate::svc::boosters::ensure(db).await?;
+    crate::svc::outposts::ensure_access_locks(db).await?;
+    crate::svc::outposts::ensure_management_schema(db).await?;
+    crate::svc::corp::ensure_office_schema(db).await?;
+    crate::conn::logout::ensure(db).await?;
     Ok(())
 }

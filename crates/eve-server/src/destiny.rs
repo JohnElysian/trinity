@@ -1,24 +1,25 @@
 //! The destiny ball stream that SetState and AddBalls carry: a little-endian
 //! binary format read by destiny.dll's ReadFullStateFromStream.
 //!
-//! Record layout (sizes and order from the disassembly of ReadBallFromStream):
+//! Record layout verified against the original Trinity 45017 native reader
+//! (RVA 0x31640) and writer (RVA 0x31c80). Reproducible listings, binary hash,
+//! and the bounded audit are in compatibility/destiny-45017.
 //!
 //! ```text
 //! i32 ballID  u8 mode  f64 radius  f64 x,y,z  u8 flags
 //! if mode != RIGID:  f64 mass  u8 cloak  i64 harmonic  i32 corporationID  i32 allianceID
 //! if flags & FREE:   f64 maxVelocity  f64 vx,vy,vz  f64 agility  f64 speedFraction
 //! u8 formationID     (0xFF = none)
-//! <per-mode payload> (empty for STOP, FIELD and RIGID, the only modes written here)
+//! <per-mode payload> (44 bytes for WARP; empty for STOP, FIELD and RIGID)
 //! u8 nameLength  u16[nameLength] name (UTF-16LE)
 //! ```
 //!
-//! The field *names* in the two conditional blocks follow the later, documented
-//! form of this record; the reader's defaults agree (mass 1e34 = immovable,
-//! agility 1.0, speedFraction 0.0, harmonic -1).
+//! Native Python attribute registrations confirm the conditional field names;
+//! cloak is its own non-rigid byte, separate from the packed flag bits.
 //!
-//! Moving ships are written in STOP mode with their current velocity; the
-//! command they are executing is sent as an ordinary opcode right after, which
-//! avoids the per-mode payloads.
+//! Ordinary moving ships carry STOP plus an immediate course opcode. Warping
+//! ships carry the native WARP payload: replaying WarpTo on a midflight reset
+//! would discard the original start time and restart the warp curve.
 
 #[allow(dead_code)]
 pub mod mode {
@@ -27,8 +28,7 @@ pub mod mode {
     pub const STOP: u8 = 2;
     pub const WARP: u8 = 3;
     pub const ORBIT: u8 = 4;
-    /// A force field: solid to every ball without its harmonic, corporation
-    /// or alliance (Partition.cpp's harmonics test; destiny 2.10 0x10028d40).
+    /// A force field's native stream mode.
     pub const FIELD: u8 = 10;
     pub const RIGID: u8 = 11;
 }
@@ -39,11 +39,13 @@ pub mod flags {
     pub const IS_GLOBAL: u8 = 0x02;
     pub const IS_MASSIVE: u8 = 0x04;
     pub const IS_INTERACTIVE: u8 = 0x08;
-    pub const IS_CLOAKED: u8 = 0x10;
+    /// Native ball+0x39, packed by WriteBall at RVA 0x31cb5. This is not
+    /// isCloaked (ball+0x3a), which has its own non-rigid stream byte.
+    pub const NATIVE_FLAG_0X10: u8 = 0x10;
     pub const HAS_MINIBALLS: u8 = 0x40;
 
     pub const SHIP: u8 = IS_FREE | IS_GLOBAL | IS_MASSIVE | IS_INTERACTIVE;
-    /// A ship in warp: destiny drops IS_MASSIVE for the warp (0x100186b0).
+    /// A ship in warp: native Trinity entry clears its massive flag (RVA 0x183f0).
     pub const SHIP_IN_WARP: u8 = SHIP & !IS_MASSIVE;
     pub const CELESTIAL: u8 = IS_GLOBAL | IS_MASSIVE | IS_INTERACTIVE;
     /// Fixed, but ships pass through it: stations, cans.
@@ -57,6 +59,8 @@ pub const NO_HARMONIC: i64 = -1;
 pub struct Ball {
     pub id: i64,
     pub mode: u8,
+    /// Native WARP payload, including the original entry time and distance.
+    pub warp: Option<crate::ballpark::WarpSnapshot>,
     pub radius: f64,
     pub pos: (f64, f64, f64),
     pub flags: u8,
@@ -82,6 +86,7 @@ impl Ball {
         Ball {
             id,
             mode: mode::RIGID,
+            warp: None,
             radius,
             pos,
             flags: if massive { flags::CELESTIAL } else { flags::CELESTIAL_PASSABLE },
@@ -111,9 +116,10 @@ pub fn encode(state_stamp: u32, balls: &[Ball]) -> Vec<u8> {
 
 fn write_ball(out: &mut Vec<u8>, b: &Ball) {
     debug_assert!(
-        matches!(b.mode, mode::STOP | mode::FIELD | mode::RIGID),
-        "only STOP, FIELD and RIGID balls carry no per-mode payload (ReadBallFromStream)"
+        matches!(b.mode, mode::STOP | mode::FIELD | mode::RIGID | mode::WARP),
+        "unsupported native ball mode"
     );
+    debug_assert_eq!(b.mode == mode::WARP, b.warp.is_some(), "WARP requires its native payload");
     let f64s = |out: &mut Vec<u8>, vals: &[f64]| {
         for v in vals {
             out.extend_from_slice(&v.to_le_bytes());
@@ -136,7 +142,20 @@ fn write_ball(out: &mut Vec<u8>, b: &Ball) {
     }
     out.push(NO_FORMATION);
 
-    let utf16: Vec<u16> = b.name.encode_utf16().take(255).collect();
+    if let Some(warp) = &b.warp {
+        // ReadBall 0x31b54 and WriteBall 0x3209c: +c8, +c4, +b8, +b4, +c0.
+        // +b4 is copied as four raw bytes, but WarpTo stores a float32 range.
+        f64s(out, &[warp.target.x, warp.target.y, warp.target.z]);
+        out.extend_from_slice(&warp.start.to_le_bytes());
+        f64s(out, &[warp.distance]);
+        out.extend_from_slice(&warp.range.to_le_bytes());
+        out.extend_from_slice(&warp.factor.to_le_bytes());
+    }
+
+    let mut utf16: Vec<u16> = b.name.encode_utf16().take(255).collect();
+    // The length byte counts code units. Never truncate between the two
+    // halves of a supplementary character, which would emit invalid UTF-16.
+    if utf16.last().is_some_and(|unit|(0xD800..=0xDBFF).contains(unit)) { utf16.pop(); }
     out.push(utf16.len() as u8);
     for unit in utf16 {
         out.extend_from_slice(&unit.to_le_bytes());
@@ -161,6 +180,7 @@ mod tests {
         Ball {
             id: 140_000_016,
             mode: mode::STOP,
+            warp: None,
             radius: 40.0,
             pos: (1.0, 2.0, 3.0),
             flags: flags::SHIP,
@@ -217,6 +237,32 @@ mod tests {
     }
 
     #[test]
+    fn warp_payload_matches_native_reader_and_preserves_next_record_boundary() {
+        let mut b = ship();
+        b.mode = mode::WARP;
+        b.warp = Some(crate::ballpark::WarpSnapshot {
+            target: crate::ballpark::Vec3::new(1.25e12, -2.5e10, 3.75e11),
+            start: -123456789, distance: 9.5e11, range: 1234.5, factor: 60,
+        });
+        let warp = b.warp.unwrap();
+        let next = Ball::celestial(60_014_689, 1.0, (0.0,0.0,0.0), "next", true);
+        let blob = encode(42, &[b, next]);
+        // Independent offsets from native ReadBallFromStream 0x31b54.
+        let at = 5 + 38 + 25 + 48 + 1;
+        let f64_at = |p| f64::from_le_bytes(blob[p..p+8].try_into().unwrap());
+        let i32_at = |p| i32::from_le_bytes(blob[p..p+4].try_into().unwrap());
+        assert_eq!(blob[9], mode::WARP);
+        assert_eq!((f64_at(at),f64_at(at+8),f64_at(at+16)),warp.target.tuple());
+        assert_eq!(i32_at(at+24),warp.start);
+        assert_eq!(f64_at(at+28),warp.distance);
+        assert_eq!(f32::from_le_bytes(blob[at+36..at+40].try_into().unwrap()),warp.range);
+        assert_eq!(i32_at(at+40),warp.factor);
+        assert_eq!(&blob[at+44..at+47], &[1,b'x',0]);
+        assert_eq!(i32_at(at+47),60_014_689,"the following ball stays aligned");
+        assert_eq!(blob[at+51],mode::RIGID);
+    }
+
+    #[test]
     fn the_name_is_utf16_counted_in_characters() {
         let b = Ball::celestial(1, 0.0, (0.0, 0.0, 0.0), "Ab", true);
         let blob = encode(0, &[b]);
@@ -230,5 +276,18 @@ mod tests {
         let b = Ball::celestial(1, 0.0, (0.0, 0.0, 0.0), &name, true);
         let blob = encode(0, &[b]);
         assert_eq!(blob[blob.len() - 1 - 255 * 2], 255);
+    }
+
+    #[test]
+    fn name_truncation_preserves_surrogate_pairs() {
+        for (ascii,units) in [(254,254),(253,255)] {
+            let b=Ball::celestial(1,0.0,(0.0,0.0,0.0),&format!("{}🚀tail","z".repeat(ascii)),true);
+            let blob=encode(0,&[b]);
+            let length=5+38+1;
+            assert_eq!(usize::from(blob[length]),units);
+            let text:Vec<u16>=blob[length+1..].chunks_exact(2).map(|b|u16::from_le_bytes([b[0],b[1]])).collect();
+            let name=String::from_utf16(&text).expect("a complete UTF-16 name");
+            assert_eq!(name,if ascii==254 {"z".repeat(254)} else {format!("{}🚀","z".repeat(253))});
+        }
     }
 }

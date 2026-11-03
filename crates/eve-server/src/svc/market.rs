@@ -225,8 +225,8 @@ async fn char_orders(ctx: &Ctx<'_>) -> Value {
 async fn corporation_orders(ctx: &Ctx<'_>) -> Value {
     let Some(corp_id) = ctx.session.corp_id else { return rowset_with_columns(ORDER_HEADER, Vec::new()) };
     let sql = format!(
-        r#"{sel} JOIN "character_" c ON c."characterID" = o."charID"
-                 WHERE o."isCorp" = 1 AND o."orderState" = 0 AND c."corporationID" = $1
+        r#"{sel}
+                 WHERE o."isCorp" = 1 AND o."orderState" = 0 AND o."walletOwnerID" = $1
                  ORDER BY o."issued" DESC"#,
         sel = ORDER_SELECT
     );

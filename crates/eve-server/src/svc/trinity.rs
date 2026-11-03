@@ -7,44 +7,12 @@
 use eve_marshal::Value;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::key_val;
-
-/// Contracts (Revelations II) are not implemented; these are the neocom's
-/// counters, which it reads at login (contracts.py NeocomBlink: `n.n + n.ncorp`;
-/// GetNumOutstanding: `.myCharTotal` and friends).
-pub async fn contract_mgr(call: &Call, _ctx: &Ctx<'_>) -> Option<Outcome> {
-    let value = match call.method.as_str() {
-        "NumRequiringAttention" => key_val(vec![("n", Value::Int(0)), ("ncorp", Value::Int(0))]),
-        "NumOutstandingContracts" => key_val(vec![
-            ("myCharTotal", Value::Int(0)),
-            ("myCorpTotal", Value::Int(0)),
-            ("nonCorpForMyChar", Value::Int(0)),
-            ("nonCorpForMyCorp", Value::Int(0)),
-        ]),
-        _ => return None,
-    };
-    Some(Outcome::Value(value))
-}
 
 /// In-game voice (Vivox) is not available: audioService.Subscriber asks
 /// whether this account may use it.
 pub async fn voice_mgr(call: &Call, _ctx: &Ctx<'_>) -> Option<Outcome> {
     match call.method.as_str() {
         "VoiceEnabled" => Some(Outcome::Value(Value::Bool(false))),
-        _ => None,
-    }
-}
-
-/// Trinity's fleet service. Only the status the client polls in space is
-/// answered: the same "no active fleet" gang.py builds itself when the pilot
-/// has no gang.
-pub async fn gang_svc(call: &Call, _ctx: &Ctx<'_>) -> Option<Outcome> {
-    match call.method.as_str() {
-        "GetActiveStatus" => Some(Outcome::Value(key_val(vec![
-            ("fleet", Value::Bool(false)),
-            ("wings", Value::Dict(Vec::new())),
-            ("squads", Value::Dict(Vec::new())),
-        ]))),
         _ => None,
     }
 }
@@ -124,24 +92,6 @@ pub async fn lsc(call: &Call, _ctx: &Ctx<'_>) -> Option<Outcome> {
         "GetRookieHelpChannel" => Some(Outcome::Value(Value::Int(1))),
         _ => None,
     }
-}
-
-/// Corporation recruitment adverts (Trinity's recruitment tab): no advert
-/// types and no adverts.
-pub async fn corporation_svc(call: &Call, _ctx: &Ctx<'_>) -> Option<Outcome> {
-    use crate::svc::rows::rowset;
-    let value = match call.method.as_str() {
-        "GetRecruitmentAdTypes" => {
-            rowset(&["typeID", "typeMask", "typeName", "description", "groupID", "groupName"], Vec::new())
-        }
-        "GetRecruitmentAdsByCriteria" | "GetRecruitmentAdsForCorporation" => rowset(
-            &["adID", "corporationID", "allianceID", "typeMask", "description", "stationID", "regionID",
-              "createDateTime", "expiryDateTime", "minimumSkillPoints", "channelID"],
-            Vec::new(),
-        ),
-        _ => return None,
-    };
-    Some(Outcome::Value(value))
 }
 
 /// `character.GetFactions`: rows read as `faction.factionID` (factionsvc.py

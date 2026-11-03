@@ -530,7 +530,7 @@ async fn install(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     let authorized = call.kwarg("authorizedCost").and_then(|v| v.as_f64());
     let latest_start = call.kwarg("maxJobStartTime").and_then(|v| v.as_i64());
     // A corporation job: its wallet and its hangars.
-    let roles = ctx.session.roles_at_all | ctx.session.roles_at_hq | ctx.session.roles_at_base | ctx.session.roles_at_other;
+    let roles = ctx.session.corp_role();
     let who = if for_corp {
         let Some(corp) = ctx.session.corp_id else { return Err(Outcome::custom("You are not in a corporation.")) };
         if roles & (crate::session::CORP_ROLE_DIRECTOR | CORP_ROLE_FACTORY_MANAGER) == 0 {
@@ -546,6 +546,12 @@ async fn install(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
 
     let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
     let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| db_failed("BEGIN", e))?;
+    // The installer owns its job slots across every assembly line. Lock before
+    // items and wallet rows, matching character travel/checkpoint ordering.
+    if !crate::svc::login::lock_character_lifecycle(txn.tx(), me as i32).await.map_err(|e| db_failed("locking the installer", e))? {
+        return Err(Outcome::custom("That character no longer exists."));
+    }
+    txn.tx().query_one(r#"SELECT "characterID" FROM "character_" WHERE "characterID"=$1 FOR UPDATE"#, &[&(me as i32)]).await.map_err(|e| db_failed("locking the installer", e))?;
     txn.tx()
         .execute(r#"SELECT 1 FROM "ramAssemblyLines" WHERE "assemblyLineID" = $1 FOR UPDATE"#, &[&(line_id as i32)])
         .await
@@ -564,6 +570,11 @@ async fn install(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     }
 
     let mut bp = blueprint(&mut txn, item_id).await?;
+    if bp.item.flag == i64::from(FLAG_FACTORY_BLUEPRINT)
+        || txn.tx().query_opt(r#"SELECT 1 FROM "ramJobs" WHERE "installedItemID"=$1 AND completed=0 LIMIT 1"#, &[&(item_id as i32)]).await.map_err(|e|db_failed("checking blueprint custody",e))?.is_some()
+    {
+        return Err(Outcome::custom("That blueprint is already installed in an industry job."));
+    }
     if bp.item.owner_id != who {
         return Err(message("RamCannotInstallItemForAnother"));
     }
@@ -577,7 +588,7 @@ async fn install(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     } else {
         None
     };
-    let in_office = office.is_some_and(|o| bp.item.location_id == o && crate::svc::corphangar::may_take(ctx, bp.item.flag));
+    let in_office = office.is_some_and(|o| bp.item.location_id == o && crate::svc::corphangar::may_take_at(ctx, bp.item.flag, Some(line.station)));
     if !in_office && !at_station(ctx, &mut txn, &bp.item, line.station).await? {
         return Err(message_with("RamInstalledItemWrongLocation", &[("location", Value::text(station_name(txn.tx(), line.station).await))]));
     }
@@ -655,7 +666,7 @@ async fn install(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     let source = match bom_flag {
         _ if line.structure => Some((line.station, bom_flag.unwrap_or(0))),
         Some(f) if office.is_some() && crate::svc::corphangar::division(f).is_some() => {
-            if !crate::svc::corphangar::may_take(ctx, f) {
+            if !crate::svc::corphangar::may_take_at(ctx, f, Some(line.station)) {
                 return Err(Outcome::custom("You may not take materials from that division."));
             }
             office.map(|o| (o, f))
@@ -949,7 +960,7 @@ async fn complete(ctx: &Ctx<'_>, job_id: i64, cancel: bool) -> Refused<Value> {
     let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
     let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| db_failed("BEGIN", e))?;
     let sql = r#"SELECT "installedItemOwnerID", "installedItemID", "activityID", "outputTypeID", "outputLocationID",
-                        "runs", "licensedProductionRuns", "endProductionTime", "completed", "outputFlag"
+                        "runs", "licensedProductionRuns", "endProductionTime", "completed", "outputFlag", "containerID"
                    FROM "ramJobs" WHERE "jobID" = $1 FOR UPDATE"#;
     let r = txn
         .tx()
@@ -960,7 +971,7 @@ async fn complete(ctx: &Ctx<'_>, job_id: i64, cancel: bool) -> Refused<Value> {
     let i = |n| int(&r, n).unwrap_or(0);
     let (owner, item_id, activity, output, station, runs, licensed_runs, end) = (i(0), i(1), i(2), i(3), i(4), i(5), i(6), i(7));
     let out_flag = i(9);
-    let roles = ctx.session.roles_at_all | ctx.session.roles_at_hq | ctx.session.roles_at_base | ctx.session.roles_at_other;
+    let roles = ctx.session.corp_role();
     let corp_job = Some(owner) == ctx.session.corp_id && roles & (crate::session::CORP_ROLE_DIRECTOR | CORP_ROLE_FACTORY_MANAGER) != 0;
     if owner != me && !corp_job {
         return Err(message("RamCompletionAccessDenied"));
@@ -972,6 +983,9 @@ async fn complete(ctx: &Ctx<'_>, job_id: i64, cancel: bool) -> Refused<Value> {
         return Err(message("RamCompletionInProduction"));
     }
     let bp = blueprint(&mut txn, item_id).await?;
+    if bp.item.owner_id != owner || bp.item.location_id != i(10) || bp.item.flag != i64::from(FLAG_FACTORY_BLUEPRINT) {
+        return Err(Outcome::custom("The installed blueprint is no longer held by this job."));
+    }
     txn.move_to(item_id, station, out_flag).await.map_err(|e| db_failed("returning the blueprint", e))?;
 
     let research = |column: &str| {
@@ -1073,6 +1087,56 @@ fn message_with(key: &str, args: &[(&str, Value)]) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn industry_job_slots_and_blueprint_custody_survive_races_and_failed_delivery() {
+        let db=crate::test_support::Database::load().await;
+        let me=db.id().await;let ship=db.id().await;let first=db.id().await;let second=db.id().await;
+        let first_line=db.id().await;let second_line=db.id().await;
+        let original=db.db.query_one(r#"SELECT l."containerID",l."assemblyLineTypeID",s."solarSystemID" FROM "ramAssemblyLines" l JOIN "ramAssemblyLineTypes" t ON t."assemblyLineTypeID"=l."assemblyLineTypeID" JOIN "staStations" s ON s."stationID"=l."containerID" WHERE t."activityID"=$1 ORDER BY l."assemblyLineID" LIMIT 1"#,&[&(ACTIVITY_MATERIAL as i32)]).await.unwrap();
+        let station:i32=original.get(0);let line_type:i32=original.get(1);let system:i32=original.get(2);
+        db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","stationID","solarSystemID",balance) VALUES($1,$2,$3,$4,$5,1000000)"#,&[&me,&format!("Industry custody {me}"),&ship,&station,&system]).await.unwrap();
+        for id in [first,second] {
+            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES($1,691,$2,$3,4,1,1)"#,&[&id,&me,&station]).await.unwrap();
+        }
+        for id in [first_line,second_line] {
+            db.db.execute(r#"INSERT INTO "ramAssemblyLines" ("assemblyLineID","assemblyLineTypeID","containerID","ownerID","costInstall","costPerHour","nextFreeTime") VALUES($1,$2,$3,$4,0,0,'1970-01-01')"#,&[&id,&line_type,&station,&me]).await.unwrap();
+        }
+        for need in needs(&db.db,691,ACTIVITY_MATERIAL).await.ok().unwrap().into_iter().filter(|n|n.skill) {
+            let skill=db.id().await;
+            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES($1,$2,$3,$3,7,1,1)"#,&[&skill,&(need.type_id as i32),&me]).await.unwrap();
+            db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES($1,280,$2)"#,&[&skill,&need.quantity]).await.unwrap();
+        }
+        let session=crate::session::Session {char_id:Some(me as i64),ship_id:Some(ship as i64),station_id:Some(station as i64),solar_system_id2:Some(system as i64),..Default::default()};
+        let ctx=db.ctx(&session);
+        let call=|line:i32,bp:i32|Call {service:"ramProxy".into(),method:"InstallJob".into(),args:vec![
+            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![Value::Int(station as i64),Value::Int(line as i64)])]),
+            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![Value::Int(bp as i64)])]),
+            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![])]),
+            Value::Int(4),Value::Int(1),Value::Int(ACTIVITY_MATERIAL),Value::Int(0),Value::Bool(false)],kwargs:vec![(Value::bytes("quoteOnly"),Value::Int(0))]};
+        let a=call(first_line,first);let b=call(second_line,second);
+        let (one,two)=tokio::join!(install(&ctx,&a),install(&ctx,&b));
+        let describe=|result:&Refused<Value>| match result {Err(Outcome::UserError{msg,args})=>format!("{msg}: {args:?}"),Err(_)=>"other refusal".into(),Ok(_)=>"installed".into()};
+        assert_eq!(usize::from(one.is_ok())+usize::from(two.is_ok()),1,"two different lines must not bypass the installer's one research slot: {}, {}",describe(&one),describe(&two));
+        let row=db.db.query_one(r#"SELECT "jobID","installedItemID" FROM "ramJobs" WHERE "installerID"=$1 AND completed=0"#,&[&me]).await.unwrap();
+        let job:i32=row.get(0);let bp:i32=row.get(1);
+        assert!(install(&ctx,&call(second_line,bp)).await.is_err(),"installed blueprint cannot start another job");
+        db.db.execute(r#"UPDATE "ramJobs" SET "endProductionTime"=0 WHERE "jobID"=$1"#,&[&job]).await.unwrap();
+        db.db.execute(r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,&[&bp,&(me+1000)]).await.unwrap();
+        assert!(complete(&ctx,job as i64,false).await.is_err(),"job cannot reclaim a blueprint whose custody changed");
+        db.db.execute(r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,&[&bp,&me]).await.unwrap();
+        let constraint=format!("job_delivery_failure_{me}");
+        db.db.batch_execute(&format!(r#"ALTER TABLE entity ADD CONSTRAINT {constraint} CHECK ("itemID"<>{bp} OR flag<>4) NOT VALID"#)).await.unwrap();
+        let failed=complete(&ctx,job as i64,false).await;
+        db.db.batch_execute(&format!("ALTER TABLE entity DROP CONSTRAINT {constraint}")).await.unwrap();
+        assert!(failed.is_err());
+        assert_eq!(db.db.query_one(r#"SELECT flag FROM entity WHERE "itemID"=$1"#,&[&bp]).await.unwrap().get::<_,i32>(0),36);
+        assert_eq!(db.db.query_one(r#"SELECT completed::integer FROM "ramJobs" WHERE "jobID"=$1"#,&[&job]).await.unwrap().get::<_,i32>(0),0);
+        assert!(complete(&ctx,job as i64,false).await.is_ok());
+        assert!(complete(&ctx,job as i64,false).await.is_err());
+        assert_eq!(db.db.query_one(r#"SELECT "materialLevel" FROM "invBlueprints" WHERE "itemID"=$1"#,&[&bp]).await.unwrap().get::<_,i32>(0),1);
+    }
 
     #[test]
     fn material_research_shrinks_the_waste() {

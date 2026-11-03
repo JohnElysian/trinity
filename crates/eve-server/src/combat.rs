@@ -154,6 +154,7 @@ impl Charged {
 
     /// Takes `amount` if there is that much; false (and nothing taken) if not.
     pub fn spend(&mut self, now: i64, amount: f64) -> bool {
+        if !amount.is_finite() || amount < 0.0 { return false; }
         let have = self.at(now);
         if have + 1e-6 < amount {
             return false;
@@ -443,7 +444,7 @@ pub enum Action {
     /// A titan's doomsday: this damage to every ship within `range` of it.
     Doomsday { damage: Damage, range: f64 },
     /// The ship is cloaked while it runs; a covert ops cloak lets it warp.
-    Cloak { warp_safe: bool },
+    Cloak { warp_safe: bool, targeting_delay_ms: i64, reactivation_delay_ms: i64 },
     /// A probe launcher's scan of the system, its results due when the cycle ends.
     Scan,
 }
@@ -539,11 +540,17 @@ pub struct Active {
     pub effect_id: i64,
     pub guid: String,
     pub offensive: bool,
+    /// Original dgmEffects.isWarpSafe: this effect may run during warp.
+    pub warp_safe: bool,
+    /// Original attribute 1245 also forbids activation while aligning.
+    pub disallow_warp_alignment: bool,
     pub action: Action,
     pub target: Option<i64>,
     pub ammo: Option<Ammo>,
     pub duration_ms: i64,
     pub cap_need: f64,
+    /// A funded activation reserved this first cycle's capacitor before commit.
+    pub first_cycle_prepaid: bool,
     pub started_ms: i64,
     /// When the next cycle starts.
     pub next_ms: i64,
@@ -557,6 +564,12 @@ pub struct Active {
     pub reach: Option<(f64, f64)>,
     /// Whether this cycle's projected effect took hold.
     pub landed: bool,
+}
+
+impl Active {
+    /// Original null-duration activation effects remain active until stopped;
+    /// they do not manufacture repeated capacitor or ammunition cycles.
+    pub fn continuous(&self) -> bool { self.duration_ms <= 0 }
 }
 
 pub const REPEAT_FOREVER: i64 = 1000;
@@ -583,6 +596,7 @@ pub struct Fighter {
     pub afflictions: Afflictions,
     /// Damage done to it, by attacking character: (ship type, weapon type, damage).
     pub damage_log: BTreeMap<i64, (i64, i64, f64)>,
+    pub cloak_history: crate::cloak::History,
 }
 
 impl Fighter {
@@ -601,6 +615,7 @@ impl Fighter {
             sensors: [0.0; 4],
             afflictions: Afflictions::default(),
             damage_log: BTreeMap::new(),
+            cloak_history: Default::default(),
         }
     }
 
@@ -667,6 +682,15 @@ mod tests {
         assert!((cap.at(0) - 10.0).abs() < 1e-9);
         assert!(cap.spend(0, 4.0));
         assert!((cap.at(0) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn invalid_capacitor_debits_cannot_create_or_corrupt_charge() {
+        let mut cap=Charged::full(10.0,0.0,0);
+        for amount in [-1.0,f64::NAN,f64::INFINITY,f64::NEG_INFINITY] {
+            assert!(!cap.spend(0,amount));
+            assert_eq!(cap.at(0),10.0);
+        }
     }
 
     #[test]

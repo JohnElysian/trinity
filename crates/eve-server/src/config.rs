@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub const GM_ROLES: i64 = 8 | 16 | 256 | 262_144;
 
 /// Server settings: from the YAML config file (`RMR_CONFIG`, else
-/// `rmr.yml` in the working directory), with any `RMR_*` environment
+/// `trinity.yml` in the working directory), with any `RMR_*` environment
 /// variable taking precedence over the file.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -183,7 +183,7 @@ impl Config {
     /// none, then lets the environment override it. Returns the config and
     /// what happened to the file, for the log.
     pub fn load() -> Result<(Self, String), String> {
-        let path = PathBuf::from(var("RMR_CONFIG").unwrap_or_else(|| "rmr.yml".into()));
+        let path = PathBuf::from(var("RMR_CONFIG").unwrap_or_else(|| "trinity.yml".into()));
         let (file, note) = read(&path)?;
         let mut c = Config {
             bind: file.server.bind,

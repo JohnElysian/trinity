@@ -76,45 +76,25 @@ async fn pay_bill(ctx: &Ctx<'_>, bill_id: i64, corp: bool) -> Outcome {
 /// Pays `debtor`'s open bill `bill_id` to its creditor out of `payer`'s
 /// wallet (the debtor's own, or an alliance's executor corporation's).
 pub async fn settle_bill(ctx: &Ctx<'_>, bill_id: i64, debtor: i64, payer: i64) -> Outcome {
-    // Claim the bill first so it cannot be paid twice; released below on failure.
-    let claim = r#"UPDATE "billsReceivable" SET "paid" = 1
-                    WHERE "billID" = $1 AND "debtorID" = $2 AND "paid" = 0
-                RETURNING "creditorID", "amount", "billTypeID""#;
-    let Some(bill) = ctx.query_one(claim, &[&(bill_id as i32), &(debtor as i32)]).await else {
-        return Outcome::Value(Value::None);
-    };
-    let creditor = int(&bill, 0).unwrap_or(0);
-    let amount = float(&bill, 1).unwrap_or(0.0);
-    let ref_type = match int(&bill, 2) {
-        Some(BILL_TYPE_RENTAL) => REF_OFFICE_RENTAL_FEE,
-        Some(BILL_TYPE_WAR) => REF_WAR_FEE,
-        Some(BILL_TYPE_ALLIANCE_MAINTENANCE) => REF_ALLIANCE_MAINTENANCE_FEE,
-        _ => REF_CORPORATION_PAYMENT,
-    };
-    let bill_ref = bill_id.to_string();
-    let payment = Payment {
-        payer,
-        payee: Some(creditor),
-        amount,
-        ref_type,
-        arg_id1: &bill_ref,
-        reason: "",
-    };
-    let outcome = match move_cash(ctx.db_url, payment).await {
-        Ok(()) => {
-            info!("bill {bill_id}: {payer} paid {amount} ISK of {debtor}'s to {creditor}");
-            return Outcome::Value(Value::None);
-        }
-        Err(Transfer::NotEnough { need, have }) => Outcome::not_enough_money(need, have),
-        Err(Transfer::NoSuchOwner) => Outcome::Unknown(format!("billMgr: bill {bill_id} has no valid creditor")),
-        Err(Transfer::Db(e)) => {
-            error!("bill {bill_id} payment: {}", crate::logging::chain(&e));
-            Outcome::Unknown("billMgr payment failed".into())
-        }
-    };
-    let release = r#"UPDATE "billsReceivable" SET "paid" = 0 WHERE "billID" = $1"#;
-    ctx.execute(release, &[&(bill_id as i32)]).await;
-    outcome
+    let result: Result<(), Outcome> = async {
+        let mut client=crate::db::connect(ctx.db_url).await.map_err(|e|crate::svc::membership::db_failed("connecting to pay the bill",e))?;
+        let tx=client.transaction().await.map_err(|e|crate::svc::membership::db_failed("starting the payment",e))?;
+        let bill=tx.query_opt(r#"SELECT "creditorID",amount,"billTypeID" FROM "billsReceivable" WHERE "billID"=$1 AND "debtorID"=$2 AND paid=0 FOR UPDATE"#,&[&(bill_id as i32),&(debtor as i32)]).await.map_err(|e|crate::svc::membership::db_failed("reading the bill",e))?;
+        let Some(bill)=bill else {return Ok(())};
+        let creditor=int(&bill,0).unwrap_or(0); let amount=float(&bill,1).unwrap_or(f64::NAN);
+        if !amount.is_finite() || amount<0.0 {return Err(Outcome::custom("This bill has an invalid amount."))}
+        let ref_type=match int(&bill,2) {Some(BILL_TYPE_RENTAL)=>REF_OFFICE_RENTAL_FEE,Some(BILL_TYPE_WAR)=>REF_WAR_FEE,Some(BILL_TYPE_ALLIANCE_MAINTENANCE)=>REF_ALLIANCE_MAINTENANCE_FEE,_=>REF_CORPORATION_PAYMENT};
+        let bill_ref=bill_id.to_string();
+        let entry=Entry {ref_type,payer,payee:creditor,arg_id1:&bill_ref,reason:""};
+        let mut sides=vec![(payer,-amount),(creditor,amount)]; sides.sort_unstable_by_key(|(owner,_)|*owner);
+        for (owner,delta) in sides {post(&tx,owner,delta,&entry).await.map_err(crate::svc::membership::transfer_refused)?;}
+        tx.execute(r#"UPDATE "billsReceivable" SET paid=1 WHERE "billID"=$1"#,&[&(bill_id as i32)]).await.map_err(|e|crate::svc::membership::db_failed("marking the bill paid",e))?;
+        tx.commit().await.map_err(|e|crate::svc::membership::db_failed("committing the bill payment",e))?;
+        info!("bill {bill_id}: {payer} paid {amount} ISK of {debtor}'s to {creditor}");
+        notify_balance(ctx,payer).await; if creditor!=payer {notify_balance(ctx,creditor).await;}
+        Ok(())
+    }.await;
+    result.map_or_else(|refusal|refusal,|()|Outcome::Value(Value::None))
 }
 
 /// The wallet-transaction part of the `marketProxy` service.
@@ -439,6 +419,8 @@ async fn give_cash(call: &Call, ctx: &Ctx<'_>, from_corp: bool) -> Outcome {
                 "GiveCash{}: {payer} -> {to_owner}, {amount} ISK ({reason:?})",
                 if from_corp { "FromCorpAccount" } else { "" }
             );
+            notify_balance(ctx,payer).await;
+            if to_owner!=payer {notify_balance(ctx,to_owner).await;}
             Outcome::Value(Value::None)
         }
         Err(Transfer::NotEnough { need, have }) => Outcome::not_enough_money(need, have),
@@ -457,6 +439,32 @@ pub enum Transfer {
     NotEnough { need: f64, have: f64 },
     NoSuchOwner,
     Db(tokio_postgres::Error),
+}
+
+pub(crate) async fn notify_balance(ctx:&Ctx<'_>,owner:i64) {
+    let value=ctx.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1 UNION ALL SELECT balance FROM corporation WHERE "corporationID"=$1 LIMIT 1"#,&[&(owner as i32)]).await.and_then(|r|float(&r,0));
+    if let Some(balance)=value {let w=ctx.world.lock();let mut clients=w.clients_of(owner);clients.extend(w.corp_members(owner));w.notify(&clients,"OnAccountChange",Value::Tuple(vec![Value::bytes("cash"),Value::Int(owner),Value::Double(balance)]));}
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn bill_payment_rolls_back_when_recipient_is_missing_and_cannot_be_paid_twice() {
+        let fixture=crate::test_support::Database::load().await;
+        let payer=fixture.id().await; let payee=fixture.id().await;
+        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,1000)"#,&[&payer,&format!("Bill payer {payer}")]).await.unwrap();
+        let bill=fixture.db.query_one(r#"INSERT INTO "billsReceivable" ("debtorID","creditorID",amount,"billTypeID",paid) VALUES ($1,$2,100,2,0) RETURNING "billID""#,&[&payer,&payee]).await.unwrap().get::<_,i32>(0);
+        let session=crate::session::Session {char_id:Some(payer as i64),..Default::default()}; let ctx=fixture.ctx(&session);
+        assert!(!matches!(settle_bill(&ctx,bill as i64,payer as i64,payer as i64).await,Outcome::Value(_)));
+        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&payer]).await.unwrap().get(0);assert_eq!(balance,1000.0);
+        let paid=fixture.db.query_one(r#"SELECT paid FROM "billsReceivable" WHERE "billID"=$1"#,&[&bill]).await.unwrap();assert_eq!(int(&paid,0),Some(0));
+        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,0)"#,&[&payee,&format!("Bill payee {payee}")]).await.unwrap();
+        let (a,b)=tokio::join!(settle_bill(&ctx,bill as i64,payer as i64,payer as i64),settle_bill(&ctx,bill as i64,payer as i64,payer as i64));
+        assert!(matches!(a,Outcome::Value(_)));assert!(matches!(b,Outcome::Value(_)));
+        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&payer]).await.unwrap().get(0);assert_eq!(balance,900.0);
+    }
 }
 
 /// One movement of ISK, journalled for both sides. `payee` None means the money

@@ -600,6 +600,15 @@ async fn insert_character(req: &CreateRequest<'_>, db_url: &str) -> Result<i32, 
         return Err(Refusal::Message(msg));
     }
 
+    // Keep the three-character limit and case-insensitive name check true
+    // when separate connections submit creation at the same time.
+    if tx.query_opt(r#"SELECT "accountID" FROM account WHERE "accountID"=$1 FOR UPDATE"#,
+        &[&req.account_id]).await.map_err(|e|db_failed("account lock",e))?.is_none() {
+        return Err(Refusal::Custom("That account no longer exists.".into()));
+    }
+    tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended(lower($1::text),0))",&[name]).await
+        .map_err(|e|db_failed("character name lock",e))?;
+
     let taken = tx
         .query_opt(
             r#"SELECT 1 FROM "character_" WHERE lower("characterName") = lower($1) LIMIT 1"#,
@@ -1360,6 +1369,46 @@ fn dict_get<'a>(d: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
+    async fn concurrent_creation_respects_account_slots_and_character_cleanup() {
+        let f=crate::test_support::Database::load().await;
+        let tag=f.id().await;
+        let account:i32=f.db.query_one(r#"INSERT INTO account ("accountName",password) VALUES ($1,'test') RETURNING "accountID""#,
+            &[&format!("creation-{tag}")]).await.unwrap().get(0);
+        let bloodline=1i32; let gender=0i32;
+        let ancestry:i32=f.db.query_one(r#"SELECT min("ancestryID") FROM "chrAncestries" WHERE "bloodlineID"=$1"#,&[&bloodline]).await.unwrap().get(0);
+        let mut appearance=Vec::new();
+        for slot in SLOTS.iter().filter(|s|s.required) {
+            let field=format!("{}ID",slot.stem);
+            let query=slot.sql.replace("SELECT 1",&format!("SELECT \"{field}\""))
+                .replace(&format!("\"{field}\"=$1 AND "),"")
+                .replace(&format!(" WHERE \"{field}\"=$1"),"")
+                .replace("$2","$1").replace("$3","$2");
+            let query=format!("{query} ORDER BY \"{field}\" LIMIT 1");
+            let rows=if slot.keyed{f.db.query(&query,&[&bloodline,&gender]).await}else{f.db.query(&query,&[]).await}.unwrap();
+            appearance.push((Value::bytes(field),Value::Int(rows[0].get::<_,i32>(0) as i64)));
+        }
+        for key in ROTATIONS {appearance.push((Value::bytes(*key),Value::Double(0.0)));}
+        let req=|suffix|CreateRequest{name:format!("Pilot{tag}{suffix}"),bloodline_id:bloodline,gender,ancestry_id:ancestry,
+            path:Path::Career(Career{career_id:11,speciality_id:11}),
+            spent:Spent{intelligence:1,charisma:1,perception:1,memory:1,willpower:1},appearance:&appearance,account_id:account};
+        let requests=[req("A"),req("B"),req("C"),req("D")];
+        let (a,b,c,d)=tokio::join!(insert_character(&requests[0],&f.url),insert_character(&requests[1],&f.url),insert_character(&requests[2],&f.url),insert_character(&requests[3],&f.url));
+        let ids=[a,b,c,d].into_iter().filter_map(Result::ok).collect::<Vec<_>>();
+        assert_eq!(ids.len(),3,"three successful character creations, fourth refused");
+        let session=crate::session::Session{user_id:Some(account as i64),..Default::default()};
+        for id in ids {
+            let ship:i32=f.db.query_one(r#"SELECT "shipID" FROM "character_" WHERE "characterID"=$1"#,&[&id]).await.unwrap().get(0);
+            assert!(f.db.query_one(r#"SELECT count(*) FROM entity WHERE "itemID"=$1"#,&[&ship]).await.unwrap().get::<_,i64>(0)>0);
+            f.db.execute(r#"UPDATE "character_" SET "deletePrepareDateTime"=0 WHERE "characterID"=$1"#,&[&id]).await.unwrap();
+            let call=Call{service:"character".into(),method:"DeleteCharacter".into(),args:vec![Value::Int(id as i64)],kwargs:vec![]};
+            assert!(matches!(super::super::login::character(&call,&f.ctx(&session)).await,Some(Outcome::Value(Value::None))));
+            assert_eq!(f.db.query_one(r#"SELECT count(*) FROM "eveNames" WHERE "itemID"=$1"#,&[&id]).await.unwrap().get::<_,i64>(0),0);
+        }
+        f.db.execute(r#"DELETE FROM account WHERE "accountID"=$1"#,&[&account]).await.unwrap();
+    }
 
     #[test]
     fn name_shape_matches_the_client_rules() {

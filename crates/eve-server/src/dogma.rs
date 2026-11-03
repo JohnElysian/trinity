@@ -15,7 +15,8 @@
 //! penalised: the n-th strongest counts for exp(-(n/2.67)^2) of itself.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::RwLock;
 
 use tokio_postgres::GenericClient;
 
@@ -33,7 +34,11 @@ pub mod attr {
     pub const LAUNCHER_SLOTS_LEFT: i32 = 101;
     pub const TURRET_SLOTS_LEFT: i32 = 102;
     pub const RIG_SLOTS: i32 = 1137;
-    pub const REQUIRED_SKILLS: [i32; 3] = [182, 183, 184];
+    pub const UPGRADE_CAPACITY: i32 = 1132;
+    pub const UPGRADE_LOAD: i32 = 1152;
+    pub const UPGRADE_COST: i32 = 1153;
+    pub const UPGRADE_SLOTS_LEFT: i32 = 1154;
+    pub const REQUIRED_SKILLS: [i32; 6] = [182, 183, 184, 1285, 1289, 1290];
 }
 
 pub mod effect {
@@ -169,6 +174,7 @@ struct AttributeType {
 /// What dogma needs from the database, loaded once and shared.
 pub struct Catalog {
     attributes: HashMap<i32, AttributeType>,
+    fleet_bonuses: RwLock<HashMap<i64, BTreeMap<i32, f64>>>,
 }
 
 impl Catalog {
@@ -180,7 +186,33 @@ impl Catalog {
             .iter()
             .map(|r| (r.get::<_, i32>(0), AttributeType { default: r.get(1), stackable: r.get::<_, i32>(2) != 0 }))
             .collect();
-        Ok(Catalog { attributes })
+        Ok(Catalog { attributes, fleet_bonuses: RwLock::new(HashMap::new()) })
+    }
+
+    pub fn fleet_bonuses(&self, char_id: i64) -> BTreeMap<i32, f64> {
+        self.fleet_bonuses.read().expect("fleet bonuses lock").get(&char_id).cloned().unwrap_or_default()
+    }
+
+    /// Replace the current fleet state atomically, returning each changed
+    /// pilot's previous bonuses so live ships can be refitted and notified.
+    pub fn replace_fleet_bonuses(&self, next: HashMap<i64, BTreeMap<i32, f64>>) -> Vec<(i64, BTreeMap<i32, f64>)> {
+        let mut current = self.fleet_bonuses.write().expect("fleet bonuses lock");
+        let ids = current.keys().chain(next.keys()).copied().collect::<HashSet<_>>();
+        let changed = ids.into_iter().filter_map(|id| {
+            let before = current.get(&id).cloned().unwrap_or_default();
+            let after = next.get(&id).cloned().unwrap_or_default();
+            (before != after).then_some((id, before))
+        }).collect();
+        *current = next;
+        changed
+    }
+
+    /// Keep the live ship and catalog consistent if a refit failed. The next
+    /// fleet pulse compares against this state and retries the pending change.
+    pub fn restore_fleet_bonuses(&self, char_id: i64, previous: BTreeMap<i32, f64>) {
+        let mut current = self.fleet_bonuses.write().expect("fleet bonuses lock");
+        if previous.is_empty() { current.remove(&char_id); }
+        else { current.insert(char_id, previous); }
     }
 }
 
@@ -223,10 +255,14 @@ impl<'c> Loadout<'c> {
                      FROM entity e
                      JOIN "invTypes" t ON t."typeID" = e."typeID"
                      JOIN "invGroups" g ON g."groupID" = t."groupID"
-                    WHERE e."itemID" = $1 OR e."itemID" = $2
+                    WHERE (e."itemID" = $1 OR e."itemID" = $2
                        OR (e."locationID" = $1 AND e."flag" IN ($3, $4, $5, $6))
                        OR (e."locationID" = $2 AND (e."flag" BETWEEN $7 AND $8 OR e."flag" BETWEEN $9 AND $10))
-                       OR e."itemID" = ANY($11)
+                       OR e."itemID" = ANY($11))
+                      AND (e.flag <> 88 OR EXISTS (SELECT 1 FROM character_boosters b
+                           WHERE b.item=e."itemID" AND b.character=$1 AND b.type_id=e."typeID"
+                             AND e."ownerID"=$1 AND e."locationID"=$1 AND e.quantity=1 AND e.singleton=1
+                             AND b.expires>$12))
                     ORDER BY e."itemID""#,
                 &[
                     &(char_id as i32),
@@ -240,6 +276,7 @@ impl<'c> Loadout<'c> {
                     &(FLAG_RIG_FIRST as i32),
                     &(FLAG_RIG_LAST as i32),
                     &drone_ids,
+                    &crate::bulkdata::filetime_now(),
                 ],
             )
             .await?;
@@ -340,10 +377,25 @@ impl<'c> Loadout<'c> {
             .query(
                 r#"SELECT "typeID","effectCategory",func,domain,"modifiedAttributeID","modifyingAttributeID",
                           operation,"groupID","skillTypeID","offWhileActive"
-                     FROM "dgmTypeModifiers" WHERE "typeID" = ANY($1)"#,
+                     FROM "dgmTypeModifiers" WHERE "typeID" = ANY($1)
+                   UNION ALL
+                   SELECT DISTINCT te."typeID", e."effectCategory"::smallint, m.func, m.domain,
+                          m."modifiedAttributeID", m."modifyingAttributeID", m.operation,
+                          m."groupID", m."skillTypeID", m."offWhileActive"
+                     FROM "dgmTypeEffects" te
+                     JOIN "dgmEffects" e ON e."effectID" = te."effectID"
+                     JOIN "dgmTypeModifiers" m ON m."effectName" = e."effectName"
+                    WHERE te."typeID" = ANY($1) AND e."effectID" IN (234,235,494)
+                      AND NOT EXISTS (SELECT 1 FROM "dgmTypeModifiers" own
+                          WHERE own."typeID" = te."typeID" AND own."effectName" = e."effectName")"#,
                 &[&type_ids],
             )
             .await?;
+        // Original effects 234/235/494 supply the Warp Drive Operation level
+        // multiplier and ship warp-capacitor percentage. The imported modifier
+        // table maps them for skill3455/implant13241, but omits rig26066 despite
+        // its identical original effect494. Reuse only these effect templates
+        // when absent; existing mappings win, and no persistent rows are added.
         let modifiers = rows
             .iter()
             .filter_map(|r| {
@@ -386,8 +438,26 @@ impl<'c> Loadout<'c> {
             memo: RefCell::new(HashMap::new()),
             busy: RefCell::new(HashSet::new()),
         };
-        loadout.wire();
+        loadout.apply_fleet_bonuses(&catalog.fleet_bonuses(char_id));
         Ok(loadout)
+    }
+
+    /// Fleet skills are external skill modifiers, exempt from module stacking
+    /// penalties. Rewiring permits callers to reconstruct the previous state.
+    pub fn apply_fleet_bonuses(&mut self, bonuses: &BTreeMap<i32, f64>) {
+        self.wire();
+        self.memo.borrow_mut().clear();
+        self.busy.borrow_mut().clear();
+        let Some(source) = self.character().or_else(|| self.ship()) else { return };
+        for (i, piece) in self.pieces.iter().enumerate() {
+            for (&attribute, &percent) in bonuses {
+                let applies = if attribute == 77 { piece.role == Role::Module && piece.base.contains_key(&attribute) }
+                    else { piece.role == Role::Ship };
+                if applies {
+                    self.incoming.entry((i, attribute)).or_default().push(Incoming { source, modifying: 0, operation: 6, fixed: Some(percent) });
+                }
+            }
+        }
     }
 
     fn index_of(&self, role: Role) -> Option<usize> {
@@ -462,6 +532,23 @@ impl<'c> Loadout<'c> {
             .collect();
 
         for (i, p) in self.pieces.iter().enumerate() {
+            if p.group_id == 303 {
+                // Type IDs changed meaning across releases. The imported
+                // later modifier table contains unrelated learning/ROF
+                // effects and duplicate bonuses for original boosters.
+                if let Some((effect,target,modified,modifying))=crate::svc::boosters::modifier(p.type_id).filter(|_|p.flag==88 && p.role==Role::Implant) {
+                    if p.has_effect(effect) {
+                        use crate::svc::boosters::Target;
+                        let targets=match target {
+                            Target::Ship=>ship.into_iter().collect::<Vec<_>>(),
+                            Target::Gunnery=>on_ship.iter().copied().filter(|&t|self.pieces[t].required_skills().any(|s|s==3300)).collect(),
+                            Target::Missile=>owned.iter().copied().filter(|&t|self.pieces[t].required_skills().any(|s|s==3319)).collect(),
+                        };
+                        for t in targets {incoming.entry((t,modified)).or_default().push(Incoming {source:i,modifying,operation:6,fixed:None});}
+                    }
+                }
+                continue;
+            }
             for m in self.modifiers.iter().filter(|m| m.type_id == p.type_id) {
                 if !self.applies(i, m) {
                     continue;
@@ -500,6 +587,17 @@ impl<'c> Loadout<'c> {
                     });
                 }
             }
+            // Original 45017 skill effect848 applies effective attribute619
+            // (effect850 already scales it by trained level) as a percentage
+            // to cloak modules' sensor recalibration time. The imported later
+            // modifier table omits848; do not duplicate an explicit mapping.
+            if p.has_effect(848) && !self.modifiers.iter().any(|m|m.type_id==p.type_id && m.modified==560 && m.modifying==619) {
+                for &t in &on_ship {
+                    if self.pieces[t].required_skills().any(|skill|skill==11579) {
+                        incoming.entry((t,560)).or_default().push(Incoming {source:i,modifying:619,operation:6,fixed:None});
+                    }
+                }
+            }
         }
 
         // What 2.10 hard-coded: fitting load and hardpoints.
@@ -514,6 +612,12 @@ impl<'c> Loadout<'c> {
                     if p.has_effect(fitted) {
                         incoming.entry((ship, left)).or_default().push(Incoming { source: i, modifying: 0, operation: 3, fixed: Some(1.0) });
                     }
+                }
+                if p.has_effect(effect::RIG_SLOT) {
+                    incoming.entry((ship, attr::UPGRADE_LOAD)).or_default()
+                        .push(Incoming { source: i, modifying: attr::UPGRADE_COST, operation: 2, fixed: None });
+                    incoming.entry((ship, attr::UPGRADE_SLOTS_LEFT)).or_default()
+                        .push(Incoming { source: i, modifying: 0, operation: 3, fixed: Some(1.0) });
                 }
             }
         }
@@ -627,5 +731,49 @@ mod tests {
     fn bonuses_and_penalties_are_penalised_separately() {
         let v = stacking_penalised(&[1.2, 0.8]);
         assert!((v - 1.2 * 0.8).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE with original imported static data"]
+    async fn original_warp_cost_skill_implant_and_rig_effects_reach_ship() {
+        let database=crate::test_support::Database::load().await;
+        let owner=database.id().await;
+        let ship=database.id().await;
+        let skill=database.id().await;
+        let implant=database.id().await;
+        let rig=database.id().await;
+        let ids=vec![owner,ship,skill,implant,rig];
+        for (id,kind,location,flag) in [(owner,1373,ship,57),(ship,587,60014689,4),(skill,3455,owner,7)] {
+            database.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
+                VALUES($1,$2,$3,$4,$5,1,1)"#,&[&id,&kind,&owner,&location,&flag]).await.unwrap();
+        }
+        database.db.execute(r#"INSERT INTO entity_attributes("itemID","attributeID","valueInt") VALUES($1,280,0)"#,&[&skill]).await.unwrap();
+        let mut base=0.0;
+        for level in [0,1,5] {
+            database.db.execute(r#"UPDATE entity_attributes SET "valueInt"=$2 WHERE "itemID"=$1 AND "attributeID"=280"#,&[&skill,&i64::from(level)]).await.unwrap();
+            let loadout=Loadout::load(&database.db,&database.dogma,owner as i64,Some(ship as i64),&HashSet::new()).await.unwrap();
+            let actual=loadout.value(loadout.ship().unwrap(),153);
+            if level==0 { base=actual; assert!(base>0.0,"original Rifter warp cost"); }
+            let expected=base*(1.0-f64::from(level)*0.1);
+            assert!((actual-expected).abs()<base*1e-10,"level {level}: {actual} vs {expected}");
+            assert_eq!(loadout.value(loadout.find(skill as i64).unwrap(),319),-10.0*f64::from(level));
+        }
+        for (id,kind,location,flag,coefficient) in [
+            (implant,13241,owner,89,0.5*0.94),
+            (rig,26066,ship,92,0.5*0.94*0.8),
+        ] {
+            database.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
+                VALUES($1,$2,$3,$4,$5,1,1)"#,&[&id,&kind,&owner,&location,&flag]).await.unwrap();
+            let loadout=Loadout::load(&database.db,&database.dogma,owner as i64,Some(ship as i64),&HashSet::new()).await.unwrap();
+            let actual=loadout.value(loadout.ship().unwrap(),153);
+            assert!((actual-base*coefficient).abs()<base*1e-10,"type {kind}: {actual} vs {}",base*coefficient);
+        }
+        // A rig outside the fitting and an unplugged implant no longer apply.
+        database.db.execute(r#"UPDATE entity SET "locationID"=60014689,flag=4 WHERE "itemID"=ANY($1)"#,&[&vec![implant,rig]]).await.unwrap();
+        let loadout=Loadout::load(&database.db,&database.dogma,owner as i64,Some(ship as i64),&HashSet::new()).await.unwrap();
+        assert!((loadout.value(loadout.ship().unwrap(),153)-base*0.5).abs()<base*1e-10);
+        drop(loadout);
+        database.db.execute(r#"DELETE FROM entity_attributes WHERE "itemID"=ANY($1)"#,&[&ids]).await.unwrap();
+        database.db.execute(r#"DELETE FROM entity WHERE "itemID"=ANY($1)"#,&[&ids]).await.unwrap();
     }
 }

@@ -11,6 +11,7 @@ use crate::destiny::{self, Ball};
 use crate::svc::space::{self, entry};
 
 pub const TYPE_CYNOSURAL_FIELD: i64 = 21094;
+pub const TYPE_COVERT_CYNOSURAL_FIELD: i64 = 28650;
 const OWNER_SYSTEM: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq)]

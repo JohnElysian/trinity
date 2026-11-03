@@ -11,7 +11,7 @@
 //! ship's and modules' attributes goes out as OnModuleAttributeChanges, and a
 //! module going on- or offline as OnGodmaShipEffect (godma.py:777, :800).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use eve_marshal::Value;
 use tracing::{error, info};
@@ -60,11 +60,44 @@ pub async fn fit(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, item: &Item,
     if Some(ship.id) != ctx.session.ship_id {
         return refuse("You can only fit your active ship.");
     }
+    if (92..=99).contains(&item.flag) {
+        return refuse("Installed rigs cannot be moved. Destroy the rig to remove it.");
+    }
+    check_skills(txn.tx(), ctx.session.char_id.unwrap_or(0), item.type_id).await?;
     match item.category_id {
         category::CHARGE => load_charge(ctx, txn, ship, item, flag, quantity.unwrap_or(item.quantity)).await,
         category::MODULE => fit_module(ctx, txn, ship, item, flag).await,
         _ => refuse("Only modules and charges can be fitted."),
     }
+}
+
+/// Trinity has six prerequisite slots (the last three were added after RMR).
+pub(crate) async fn check_skills(db: &impl tokio_postgres::GenericClient, char_id: i64, type_id: i64) -> Result<(), MoveError> {
+    let required = required_skill_levels(db, type_id).await?;
+    let types: Vec<i32> = required.keys().copied().collect();
+    let trained = crate::svc::skills::levels(db, char_id, &types).await?;
+    for (skill, level) in required {
+        if trained.get(&skill).copied().unwrap_or(0) < level {
+            return refuse(format!("You need skill {skill} trained to level {level} to fit this item."));
+        }
+    }
+    Ok(())
+}
+
+pub async fn required_skill_levels(db: &impl tokio_postgres::GenericClient, type_id: i64) -> Result<BTreeMap<i32, i64>, tokio_postgres::Error> {
+    let Ok(type_id) = i32::try_from(type_id) else { return Ok(BTreeMap::new()) };
+    let rows = db.query(r#"SELECT skill.value::float8::integer, COALESCE(level.value::float8::integer,1)
+        FROM (VALUES (182,277),(183,278),(184,279),(1285,1286),(1289,1287),(1290,1288)) AS prerequisite(skill,level)
+        JOIN "dgmTypeAttribs" skill ON skill."typeID" = $1 AND skill."attributeID" = prerequisite.skill
+        LEFT JOIN "dgmTypeAttribs" level ON level."typeID" = $1 AND level."attributeID" = prerequisite.level
+        WHERE skill.value::float8 > 0"#, &[&type_id]).await?;
+    let mut required: BTreeMap<i32, i64> = BTreeMap::new();
+    for row in rows {
+        let skill = row.get::<_, i32>(0);
+        let level = i64::from(row.get::<_, i32>(1));
+        required.entry(skill).and_modify(|old| *old = (*old).max(level)).or_insert(level);
+    }
+    Ok(required)
 }
 
 async fn fit_module(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, module: &Item, wanted: i64) -> Result<(), MoveError> {
@@ -102,6 +135,16 @@ async fn fit_module(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, module: &
     };
     // Dropped on a fitted slot: the module there goes back to the hangar.
     let occupant = loadout.pieces.iter().find(|p| p.category_id == category::MODULE && p.flag == flag);
+    if effects.contains(&effect::RIG_SLOT) {
+        if occupant.is_some() {
+            return refuse("Destroy the installed rig before fitting a replacement.");
+        }
+        let cost = type_attribute(txn, module.type_id, attr::UPGRADE_COST).await?;
+        let room = loadout.value(ship_index, attr::UPGRADE_CAPACITY) - loadout.value(ship_index, attr::UPGRADE_LOAD);
+        if cost > room + 1e-6 {
+            return refuse("Your ship does not have enough calibration for that rig.");
+        }
+    }
     let loadout = match occupant.map(|p| p.item_id) {
         Some(occupant) => {
             let station = ctx.session.station_id.unwrap_or(0);
@@ -117,7 +160,7 @@ async fn fit_module(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, module: &
         (effect::TURRET_FITTED, attr::TURRET_SLOTS_LEFT, "turret"),
         (effect::LAUNCHER_FITTED, attr::LAUNCHER_SLOTS_LEFT, "launcher"),
     ] {
-        if effects.contains(&fitted) && loadout.value(ship_index, left) < 1.0 {
+        if effects.contains(&fitted) && loadout.find(module.id).is_none() && loadout.value(ship_index, left) < 1.0 {
             return refuse(format!("There is no free {what} hardpoint."));
         }
     }
@@ -156,6 +199,10 @@ fn ship_index_of(loadout: &Loadout<'_>, ship_id: i64) -> usize {
 
 /// Whether module `i` fits in the CPU and power grid the ship has left.
 fn can_online(loadout: &Loadout<'_>, ship: usize, i: usize) -> bool {
+    let hp = loadout.value(i, crate::combat::attr::HP);
+    if hp > 0.0 && loadout.value(i, crate::combat::attr::DAMAGE) >= hp {
+        return false;
+    }
     let cpu_left = loadout.value(ship, attr::CPU_OUTPUT) - loadout.value(ship, attr::CPU_LOAD);
     let power_left = loadout.value(ship, attr::POWER_OUTPUT) - loadout.value(ship, attr::POWER_LOAD);
     let (cpu, power) = (loadout.value(i, attr::CPU), loadout.value(i, attr::POWER));
@@ -187,11 +234,20 @@ async fn set_online_attr(txn: &ItemTxn<'_>, item_id: i64, on: bool) -> Result<()
 /// Load up to `wanted` of a charge into the module at `flag`, as far as the
 /// module holds.
 async fn load_charge(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, charge: &Item, flag: i64, wanted: i64) -> Result<(), MoveError> {
+    if wanted <= 0 || charge.quantity <= 0 {
+        return refuse("Load a positive quantity of charges.");
+    }
     let char_id = ctx.session.char_id.unwrap_or(0);
     let loadout = Loadout::load(txn.tx(), ctx.dogma, char_id, Some(ship.id), &HashSet::new()).await?;
     let Some(module) = loadout.pieces.iter().position(|p| p.category_id == category::MODULE && p.flag == flag) else {
         return refuse("There is no module in that slot to load.");
     };
+    if let Some(system) = ctx.session.solar_system_id {
+        let world = ctx.world.lock();
+        let running = world.parks.get(&system).and_then(|park| park.ships.get(&ship.id))
+            .and_then(|ship| ship.fight.as_ref()).is_some_and(|fight| fight.module(loadout.pieces[module].item_id).is_some());
+        if running { return refuse("Deactivate the module before loading charges."); }
+    }
     let groups: Vec<i64> = CHARGE_GROUPS
         .iter()
         .map(|a| loadout.value(module, *a) as i64)
@@ -261,6 +317,9 @@ async fn type_attribute(txn: &ItemTxn<'_>, type_id: i64, attribute: i32) -> Resu
 
 /// A module leaving its slot goes offline and takes its charge with it.
 pub async fn unfit(txn: &mut ItemTxn<'_>, module: &Item, location: i64, flag: i64) -> Result<(), MoveError> {
+    if (92..=99).contains(&module.flag) {
+        return refuse("Installed rigs cannot be removed intact. Destroy the rig to remove it.");
+    }
     set_online_attr(txn, module.id, false).await?;
     unload(txn, module.location_id, module.flag, location, flag).await
 }
@@ -336,6 +395,16 @@ pub async fn set_online(ctx: &Ctx<'_>, item_id: i64, on: bool) -> Outcome {
     let (Some(char_id), Some(ship_id)) = (ctx.session.char_id, ctx.session.ship_id) else {
         return Outcome::custom("You have no ship.");
     };
+    if !on {
+        if let Some(system) = ctx.session.solar_system_id {
+            let world = ctx.world.lock();
+            if world.parks.get(&system).and_then(|park| park.ships.get(&ship_id))
+                .and_then(|ship| ship.fight.as_ref()).is_some_and(|fight| fight.module(item_id).is_some())
+            {
+                return Outcome::custom("Deactivate the module before putting it offline.");
+            }
+        }
+    }
     let result: Result<Option<Snapshot>, MoveError> = async {
         let mut client = crate::db::connect(ctx.db_url).await?;
         let txn = ItemTxn::begin(&mut client).await?;
@@ -346,6 +415,9 @@ pub async fn set_online(ctx: &Ctx<'_>, item_id: i64, on: bool) -> Outcome {
         let online = loadout.pieces[i].state != State::Offline;
         if online == on {
             return Ok(None);
+        }
+        if on {
+            check_skills(txn.tx(), char_id, loadout.pieces[i].type_id).await?;
         }
         if on && !can_online(&loadout, ship_index_of(&loadout, ship_id), i) {
             return refuse("Your ship does not have the CPU or power grid left to online that module.");
@@ -365,6 +437,7 @@ pub async fn set_online(ctx: &Ctx<'_>, item_id: i64, on: bool) -> Outcome {
         }
         Ok(None) => Outcome::Value(Value::None),
         Err(MoveError::Refused(why)) => Outcome::custom(why),
+        Err(MoveError::Reactivation{item,delay})=>super::moves::reactivation_error(item,delay),
         Err(MoveError::Db(e)) => {
             error!("online toggle for {item_id}: {}", crate::logging::chain(&e));
             Outcome::custom("The module could not be changed.")
@@ -398,4 +471,65 @@ fn online_effect(item_id: i64, char_id: i64, ship_id: i64, on: bool) -> Value {
         Value::None,
         Value::None,
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
+    async fn rigs_require_skills_and_calibration_and_are_destroyed_on_removal() {
+        let database = crate::test_support::Database::load().await;
+        let owner = database.id().await;
+        let ship = database.id().await;
+        let rig = database.id().await;
+        let skill = database.id().await;
+        database.db.execute(r#"INSERT INTO "character_"("characterID","characterName","shipID","stationID","solarSystemID","constellationID","regionID")
+            SELECT $1,$2,$3,"stationID","solarSystemID","constellationID","regionID" FROM "staStations" WHERE "stationID"=60014689"#,
+            &[&owner,&format!("Rig fitting fixture {owner}"),&ship]).await.unwrap();
+        for (id, type_id, location, flag, singleton) in [
+            (owner, 1373, ship, 57, 1), (ship, 587, 60014689, 4, 1),
+            (rig, 26286, 60014689, 4, 0),
+        ] {
+            database.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
+                VALUES ($1,$2,$3,$4,$5,1,$6)"#, &[&id, &type_id, &owner, &location, &flag, &singleton]).await.unwrap();
+        }
+        let session = crate::session::Session { char_id: Some(i64::from(owner)), ship_id: Some(i64::from(ship)),
+            station_id: Some(60014689), ..Default::default() };
+        let ctx = database.ctx(&session);
+        let add = crate::services::Call { service: "invcontainer".into(), method: "Add".into(),
+            args: vec![Value::Int(i64::from(rig)), Value::None, Value::Int(92)], kwargs: vec![] };
+        let container = crate::svc::inventory::Container::Item(i64::from(ship));
+        let refused_for=|outcome:Option<Outcome>,reason:&str|matches!(outcome,
+            Some(Outcome::UserError{msg,args}) if msg=="CustomError" && args.iter().any(|(_,value)|value.as_string().is_some_and(|text|text.contains(reason))));
+        assert!(refused_for(crate::svc::moves::container_write(&ctx, container, &add).await,"You need skill"), "untrained rig fitting reaches the skill guard");
+        database.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
+            VALUES ($1,26253,$2,$2,7,1,1)"#, &[&skill, &owner]).await.unwrap();
+        database.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,280,4)"#, &[&skill]).await.unwrap();
+        database.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueFloat") VALUES ($1,1132,50)"#, &[&ship]).await.unwrap();
+        assert!(refused_for(crate::svc::moves::container_write(&ctx, container, &add).await,"enough calibration"), "75 point rig reaches the 50 calibration guard");
+        database.db.execute(r#"UPDATE entity_attributes SET "valueFloat" = 400 WHERE "itemID" = $1 AND "attributeID" = 1132"#, &[&ship]).await.unwrap();
+        let outcome = crate::svc::moves::container_write(&ctx, container, &add).await;
+        assert!(matches!(outcome, Some(Outcome::Value(Value::None))), "trained rig fits within calibration");
+        let loadout = Loadout::load(&database.db, &database.dogma, i64::from(owner), Some(i64::from(ship)), &HashSet::new()).await.unwrap();
+        assert_eq!(loadout.value(loadout.ship().unwrap(), attr::UPGRADE_LOAD), 75.0);
+        assert_eq!(loadout.value(loadout.ship().unwrap(), attr::UPGRADE_SLOTS_LEFT), 2.0);
+        drop(loadout);
+        let unfit = crate::services::Call { args: vec![Value::Int(i64::from(rig))], ..add };
+        let hangar = crate::svc::inventory::Container::Special { container_id: crate::svc::inventory::CONTAINER_HANGAR, owner_id: None };
+        assert!(matches!(crate::svc::moves::container_write(&ctx, hangar, &unfit).await,
+            Some(Outcome::UserError { .. })), "rigs cannot be removed intact");
+        let destroy = crate::services::Call { method: "DestroyFitting".into(), ..unfit };
+        assert!(matches!(crate::svc::moves::container_write(&ctx, container, &destroy).await,
+            Some(Outcome::Value(Value::None))));
+        assert!(database.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID" = $1"#, &[&rig]).await.unwrap().is_none());
+        let loadout = Loadout::load(&database.db, &database.dogma, i64::from(owner), Some(i64::from(ship)), &HashSet::new()).await.unwrap();
+        assert_eq!(loadout.value(loadout.ship().unwrap(), attr::UPGRADE_LOAD), 0.0);
+        assert_eq!(loadout.value(loadout.ship().unwrap(), attr::UPGRADE_SLOTS_LEFT), 3.0);
+        drop(loadout);
+        database.db.execute(r#"DELETE FROM entity_attributes WHERE "itemID"=ANY($1)"#,&[&vec![owner,ship,rig,skill]]).await.unwrap();
+        database.db.execute(r#"DELETE FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![owner,ship,rig,skill]]).await.unwrap();
+        database.db.execute(r#"DELETE FROM "character_" WHERE "characterID"=$1"#,&[&owner]).await.unwrap();
+    }
 }

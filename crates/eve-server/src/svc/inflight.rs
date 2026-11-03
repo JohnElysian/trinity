@@ -20,6 +20,10 @@ use crate::fight;
 use crate::services::{Call, Ctx, Outcome};
 use crate::svc::space::{self, entry};
 
+mod activation;
+#[cfg(test)]
+mod cloak_tests;
+
 /// Effect categories (dgmEffects.effectCategory).
 const TARGETED: i16 = 2;
 /// Effects whose cycle is hard-coded here; any other active effect is
@@ -62,6 +66,7 @@ mod effect {
     pub const CLOAKING_WARP_SAFE: i64 = 980;
     pub const SYSTEM_SCAN: i64 = 1150;
     pub const CYNOSURAL_GENERATION: i64 = 1729;
+    pub const CYNOSURAL_GENERATION_45017: i64 = 2857;
     pub const EMP_WAVE_GRID: i64 = 2071;
     pub const JUMP_PORTAL_GENERATION: i64 = 2152;
 
@@ -140,7 +145,8 @@ pub async fn profile(
         }
         signature *= 1.0 + loadout.value(i, attr::SIGNATURE_RADIUS_BONUS) / 100.0;
     }
-    let stats = ShipStats::new(r.get::<_, f64>(3), mass, v(attr::AGILITY), max_velocity, v(600));
+    let mut stats = ShipStats::new(r.get::<_, f64>(3), mass, v(attr::AGILITY), max_velocity, v(600));
+    stats.warp_capacitor_need = v(crate::warp_energy::WARP_CAPACITOR_NEED);
     let pilot = Pilot {
         type_id: r.get::<_, i32>(0) as i64,
         group_id: r.get::<_, i32>(1) as i64,
@@ -191,8 +197,17 @@ pub async fn ship_for_space(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Option
     let now = combat::now_ms();
     match profile(ctx.db, ctx.dogma, char_id, ship_id, &BTreeSet::new(), now).await {
         Ok(Some(p)) => {
-            let mut ship = Ship::new(ship_id, ctx.client_id, p.stats, p.pilot, Default::default(), Default::default());
+            let position = match ctx.db.query_opt(r#"SELECT x,y,z FROM entity WHERE "itemID"=$1 AND "ownerID"=$2"#, &[&(ship_id as i32),&(char_id as i32)]).await {
+                Ok(Some(row)) => crate::ballpark::Vec3::new(row.get(0),row.get(1),row.get(2)),
+                Ok(None) => return None,
+                Err(e) => { error!("loading ship {ship_id} position: {}",crate::logging::chain(&e)); return None; }
+            };
+            let mut ship = Ship::new(ship_id, ctx.client_id, p.stats, p.pilot, position, Default::default());
             ship.fight = Some(p.fighter);
+            match crate::cloak::durability::load_history(ctx.db,char_id,ship_id,now).await {
+                Ok(history)=>ship.fight.as_mut().unwrap().cloak_history=history,
+                Err(error)=>{error!("loading ship {ship_id} cooldowns: {}",crate::logging::chain(&error));return None;}
+            }
             Some(ship)
         }
         Ok(None) => None,
@@ -201,6 +216,43 @@ pub async fn ship_for_space(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Option
             None
         }
     }
+}
+
+/// Restore a saved continuous cloak only while the same fitted, online item
+/// still supports its original effect. No activation charge or FX is replayed;
+/// native SetState and ItemGetInfo carry the restored state to the client.
+pub async fn restore_cloak(ctx:&Ctx<'_>,ship:&mut Ship,mut saved:crate::cloak::SavedState)->Result<(),tokio_postgres::Error> {
+    saved.history.prune(combat::now_ms());
+    if !saved.history.module_ready.is_empty() {
+        let fitted:HashSet<i64>=ctx.db.query(r#"SELECT "itemID" FROM entity WHERE "ownerID"=$1 AND "locationID"=$2 AND flag BETWEEN 11 AND 35 AND singleton<>0 AND quantity>0"#,
+            &[&(ship.pilot.char_id as i32),&(ship.id as i32)]).await?.iter().map(|row|i64::from(row.get::<_,i32>(0))).collect();
+        saved.history.module_ready.retain(|id,_|fitted.contains(id));
+    }
+    if let Some(fight)=&mut ship.fight {fight.cloak_history.merge(saved.history,combat::now_ms());}
+    let Some(saved)=saved.active else{return Ok(());};
+    if saved.module_id<=0 || saved.module_id>i32::MAX as i64 || saved.type_id<=0 || saved.type_id>i32::MAX as i64
+        || saved.started_ms<0 || saved.started_ms>combat::now_ms() {return Ok(());}
+    let fitted=ctx.db.query_opt(r#"SELECT e."typeID" FROM entity e JOIN entity_attributes a ON a."itemID"=e."itemID" AND a."attributeID"=2
+        WHERE e."itemID"=$1 AND e."ownerID"=$2 AND e."locationID"=$3 AND e.flag BETWEEN 11 AND 35
+        AND e.singleton<>0 AND e.quantity>0 AND COALESCE(a."valueFloat",a."valueInt"::float8,0)<>0"#,
+        &[&(saved.module_id as i32),&(ship.pilot.char_id as i32),&(ship.id as i32)]).await?;
+    if fitted.is_none_or(|row|i64::from(row.get::<_,i32>(0))!=saved.type_id) {return Ok(());}
+    let name=match saved.effect_id {effect::CLOAKING=>"cloaking",effect::CLOAKING_WARP_SAFE=>"cloakingWarpSafe",_=>return Ok(())};
+    let Some(effect)=effect_by_name(ctx,name).await else{return Ok(());};
+    if effect.id!=saved.effect_id || (ship.in_warp() && !effect.warp_safe) {return Ok(());}
+    let planned={
+        let loadout=Loadout::load(ctx.db,ctx.dogma,ship.pilot.char_id,Some(ship.id),&HashSet::new()).await?;
+        plan(&loadout,saved.module_id,&effect,None,0)
+    };
+    let Ok(planned)=planned else{return Ok(());};
+    let Ok(mut module)=finish(ctx,planned).await else{return Ok(());};
+    if !module.continuous() || !matches!(module.action,Action::Cloak {..}) {return Ok(());}
+    module.started_ms=saved.started_ms;module.next_ms=i64::MAX;
+    let active=BTreeSet::from([module.module_id]);
+    let Some(updated)=profile(ctx.db,ctx.dogma,ship.pilot.char_id,ship.id,&active,combat::now_ms()).await? else{return Ok(());};
+    apply_profile(ship,updated,combat::now_ms());
+    if let Some(fight)=&mut ship.fight {fight.modules.push(module);ship.cloaked=true;}
+    Ok(())
 }
 
 /// Moves a profile's numbers onto a ship already in space, keeping its hit
@@ -231,8 +283,12 @@ pub fn apply_profile(ship: &mut Ship, p: Profile, now: i64) {
 
 /// Stores what a ship leaving space has left: damage always; the shield and
 /// capacitor only while it stays out there (docked, they refill).
-pub async fn save_vitals(db: &impl GenericClient, ship_id: i64, fighter: &Fighter, docked: bool) {
-    let now = combat::now_ms();
+/// Fallible form for callers that commit vitals with a location transition.
+pub async fn write_vitals(db: &impl GenericClient, ship_id: i64, fighter: &Fighter, docked: bool) -> Result<(), tokio_postgres::Error> {
+    write_vitals_at(db,ship_id,fighter,docked,combat::now_ms()).await
+}
+
+pub(crate) async fn write_vitals_at(db: &impl GenericClient, ship_id: i64, fighter: &Fighter, docked: bool, now: i64) -> Result<(), tokio_postgres::Error> {
     let v = &fighter.vitals;
     let mut set = vec![(attr::ARMOR_DAMAGE, v.armor_damage), (attr::DAMAGE, v.hull_damage)];
     let mut clear = Vec::new();
@@ -253,17 +309,64 @@ pub async fn save_vitals(db: &impl GenericClient, ship_id: i64, fighter: &Fighte
             )
             .await
         };
-        if let Err(e) = result {
-            error!("saving attribute {a} of ship {ship_id}: {}", crate::logging::chain(&e));
-        }
+        result?;
     }
     if !clear.is_empty() {
-        if let Err(e) = db
+        db
             .execute(r#"DELETE FROM entity_attributes WHERE "itemID" = $1 AND "attributeID" = ANY($2)"#, &[&(ship_id as i32), &clear])
-            .await
-        {
-            error!("clearing charges of ship {ship_id}: {}", crate::logging::chain(&e));
-        }
+            .await?;
+    }
+    Ok(())
+}
+
+/// Save only the still-current ship in its still-current system. A delayed
+/// checkpoint must never overwrite a completed jump, dock, boarding or loss.
+#[cfg(test)]
+pub async fn save_space_state(db: &mut tokio_postgres::Client, system: i64, ship: &Ship) -> Result<bool, tokio_postgres::Error> {
+    crate::space_state::save_detached(db,system,ship,crate::destiny::tick_now()).await
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn space_state_preserves_position_and_charges_without_overwriting_later_travel() {
+        let fixture = crate::test_support::Database::load().await;
+        let pilot = fixture.id().await;
+        let ship_id = fixture.id().await;
+        let system = 30000142i32;
+        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","solarSystemID","stationID") VALUES ($1,$2,$3,$4,0)"#,
+            &[&pilot,&format!("Space save {pilot}"),&ship_id,&system]).await.unwrap();
+        fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,singleton) VALUES ($1,587,$2,$3,1,1)"#,&[&ship_id,&pilot,&system]).await.unwrap();
+        let session = crate::session::Session { char_id:Some(pilot as i64), ship_id:Some(ship_id as i64), solar_system_id:Some(system as i64), ..Default::default() };
+        let mut ship = ship_for_space(&fixture.ctx(&session),pilot as i64,ship_id as i64).await.unwrap();
+        ship.pos = crate::ballpark::Vec3::new(12.0,34.0,56.0);
+        let now = combat::now_ms();
+        let vitals = &mut ship.fight.as_mut().unwrap().vitals;
+        vitals.armor_damage = 7.0;
+        vitals.hull_damage = 3.0;
+        vitals.shield = Charged::full(1000.0,0.0,now);
+        vitals.shield.set(now,25.0);
+        vitals.capacitor = Charged::full(1000.0,0.0,now);
+        vitals.capacitor.set(now,15.0);
+        let mut db = crate::db::connect(&fixture.url).await.unwrap();
+        assert!(save_space_state(&mut db,system as i64,&ship).await.unwrap());
+        let restored = ship_for_space(&fixture.ctx(&session),pilot as i64,ship_id as i64).await.unwrap();
+        assert_eq!(restored.pos,ship.pos);
+        assert_eq!(restored.fight.as_ref().unwrap().vitals.armor_damage,7.0);
+        assert_eq!(restored.fight.as_ref().unwrap().vitals.hull_damage,3.0);
+        let charges = fixture.db.query(r#"SELECT "attributeID","valueFloat" FROM entity_attributes WHERE "itemID"=$1 AND "attributeID"=ANY($2) ORDER BY "attributeID""#,&[&ship_id,&vec![attr::CHARGE,attr::SHIELD_CHARGE]]).await.unwrap();
+        assert_eq!(charges.len(),2);
+        assert!(charges.iter().any(|r|r.get::<_,i32>(0)==attr::CHARGE && r.get::<_,f64>(1)==15.0));
+        assert!(charges.iter().any(|r|r.get::<_,i32>(0)==attr::SHIELD_CHARGE && r.get::<_,f64>(1)==25.0));
+        fixture.db.execute(r#"UPDATE "character_" SET "solarSystemID"=$2 WHERE "characterID"=$1"#,&[&pilot,&(system+1)]).await.unwrap();
+        ship.pos = crate::ballpark::Vec3::ZERO;
+        assert!(!save_space_state(&mut db,system as i64,&ship).await.unwrap());
+        assert_eq!(ship_for_space(&fixture.ctx(&session),pilot as i64,ship_id as i64).await.unwrap().pos,restored.pos);
+        fixture.db.execute(r#"UPDATE "character_" SET "solarSystemID"=$2,"stationID"=60000001 WHERE "characterID"=$1"#,&[&pilot,&system]).await.unwrap();
+        assert!(!save_space_state(&mut db,system as i64,&ship).await.unwrap());
     }
 }
 
@@ -311,7 +414,10 @@ fn add_target(ctx: &Ctx<'_>, target: i64) -> Outcome {
             return Err(Outcome::custom("You cannot target yourself."));
         }
         if park.ships.get(&me).is_some_and(|s| s.cloaked) {
-            return Err(Outcome::custom("You cannot lock targets while cloaked."));
+            return Err(user_error("DeniedTargetingCloaked",vec![]));
+        }
+        if now < fight.cloak_history.targeting_at {
+            return Err(user_error("DeniedTargetAfterCloak",vec![]));
         }
         let name = park
             .ships
@@ -408,6 +514,7 @@ struct EffectRow {
     category: i16,
     guid: String,
     offensive: bool,
+    warp_safe: bool,
     duration_attr: Option<i32>,
     discharge_attr: Option<i32>,
     range_attr: Option<i32>,
@@ -417,7 +524,7 @@ struct EffectRow {
 async fn effect_by_name(ctx: &Ctx<'_>, name: &str) -> Option<EffectRow> {
     let sql = r#"SELECT "effectID", "effectName", COALESCE("effectCategory", 0)::int2, COALESCE(guid, ''),
                         COALESCE("isOffensive", 0)::int, "durationAttributeID", "dischargeAttributeID",
-                        "rangeAttributeID", "falloffAttributeID"
+                        "rangeAttributeID", "falloffAttributeID", COALESCE("isWarpSafe", 0)::int
                    FROM "dgmEffects" WHERE "effectName" = $1"#;
     let r = ctx.query_one(sql, &[&name]).await?;
     Some(EffectRow {
@@ -430,6 +537,7 @@ async fn effect_by_name(ctx: &Ctx<'_>, name: &str) -> Option<EffectRow> {
         discharge_attr: r.get::<_, Option<i32>>(6),
         range_attr: r.get::<_, Option<i32>>(7),
         falloff_attr: r.get::<_, Option<i32>>(8),
+        warp_safe: r.get::<_, i32>(9) != 0,
     })
 }
 
@@ -459,6 +567,11 @@ async fn activate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let running: HashSet<i64> = {
         let world = ctx.world.lock();
         let ship = world.parks.get(&system).and_then(|p| p.ships.get(&ship_id));
+        if let Some(ship) = ship {
+            if let Err(error) = check_warp_activation(ship, effect.warp_safe) {
+                return Outcome::custom(error);
+            }
+        }
         if ship.is_some_and(|s| s.cloaked) && effect.id != effect::CLOAKING && effect.id != effect::CLOAKING_WARP_SAFE {
             return Outcome::custom("You cannot activate modules while cloaked.");
         }
@@ -482,6 +595,7 @@ async fn activate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         Ok(p) => special_start(ctx, system, ship_id, p).await,
         Err(why) => Err(why),
     };
+    let fuel = planned.as_ref().ok().and_then(|plan| plan.fuel);
     let module = match planned {
         Ok(p) => finish(ctx, p).await,
         Err(why) => Err(why),
@@ -494,49 +608,87 @@ async fn activate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         }
     };
 
-    // Into the fight, if the target is still good.
-    let now = combat::now_ms();
-    let passive = module.action == Action::Passive;
-    let started = {
+    let refits = module.action == Action::Passive || matches!(module.action,Action::Cloak {..});
+    let started = if let Some((fuel_type, quantity)) = fuel {
+        match activation::funded(ctx, system, ship_id, char_id, module, fuel_type, quantity).await {
+            Ok(started) => started,
+            Err(error) => return Outcome::custom(error),
+        }
+    } else {
         let mut world = ctx.world.lock();
-        let Some(park) = world.parks.get_mut(&system) else { return Outcome::custom("Your ship is not in space.") };
-        let tick = park.tick;
-        let check = check_target(park, ship_id, &module);
-        let Some(fight) = park.ships.get_mut(&ship_id).and_then(|s| s.fight.as_mut()) else {
-            return Outcome::custom("Your ship is not in space.");
-        };
-        if let Err(why) = check {
-            return Outcome::custom(why);
-        }
-        if let Some(t) = module.target {
-            if !fight.is_locked(t) {
-                return user_error("TargetNotLocked", vec![("modulename", Value::text(module.name.clone())), ("targetname", Value::Int(t))]);
-            }
-        }
-        let mut module = module;
-        module.started_ms = now;
-        module.next_ms = now;
-        let event = fight::effect_event(char_id, ship_id, &module, true, now);
-        let fx = fight::module_fx(tick, ship_id, &module, true);
-        fight.modules.push(module.clone());
-        world.notify(&[ctx.client_id], "OnGodmaShipEffect", event);
-        space::broadcast(&world, system, None, vec![fx]);
-        module
+        if let Err(error) = validate_activation(&world, system, ship_id, char_id, ctx.client_id, &module, false) { return error; }
+        publish_activation(&mut world, system, ship_id, char_id, ctx.client_id, module)
     };
     info!(
         "activated {} ({item_id}) {} on {:?}, {} ms cycle",
         started.name, effect.name, started.target, started.duration_ms
     );
     match started.action {
-        Action::Cyno => crate::svc::jumps::cyno_lit(&mut ctx.world.lock(), system, char_id, ship_id),
-        Action::Cloak { .. } => crate::cloak::cloaked(&mut ctx.world.lock(), system, ship_id),
         Action::Scan => crate::svc::scan::scan_started(ctx, system, ship_id, item_id, started.duration_ms).await,
         _ => {}
     }
-    if passive {
+    if refits {
         refit(ctx.db, ctx.dogma, ctx.world, ctx.client_id, char_id, ship_id, system).await;
     }
     Outcome::Value(Value::None)
+}
+
+fn validate_activation(world: &crate::world::WorldState, system: i64, ship_id: i64, char_id: i64, client_id: i64, module: &Active, reserved: bool) -> Result<(), Outcome> {
+    let Some(park) = world.parks.get(&system) else { return Err(Outcome::custom("Your ship is not in space.")); };
+    let Some(ship) = park.ships.get(&ship_id) else { return Err(Outcome::custom("Your ship is not in space.")); };
+    if ship.pilot.char_id != char_id || ship.client_id != client_id || ship.unpiloted || ship.identity_reserved != reserved {
+        return Err(Outcome::custom("Your ship is changing pilots or is no longer under your control."));
+    }
+    check_warp_activation(ship, module.warp_safe).map_err(Outcome::custom)?;
+    if module.disallow_warp_alignment && ship.warping() {
+        return Err(Outcome::custom("That module cannot be activated while aligning to warp."));
+    }
+    if ship.cloaked && !matches!(module.action,Action::Cloak {..}) {
+        return Err(Outcome::custom("You cannot activate modules while cloaked."));
+    }
+    let Some(fighter) = &ship.fight else { return Err(Outcome::custom("Your ship is not in space.")); };
+    if matches!(module.action,Action::Cloak {..}) {
+        crate::cloak::may_cloak(world,system,ship_id).map_err(Outcome::custom)?;
+        if fighter.cloak_history.module_ready.get(&module.module_id).is_some_and(|ready| *ready>combat::now_ms()) {
+            return Err(user_error("ModuleReactivationDelayed",vec![
+                ("item",Value::Int(module.type_id)),("delay",Value::Double((fighter.cloak_history.module_ready[&module.module_id]-combat::now_ms()).max(0) as f64/1000.0))]));
+        }
+    }
+    if fighter.vitals.hull_damage >= fighter.vitals.hull_max || fighter.module(module.module_id).is_some() {
+        return Err(Outcome::custom("That module cannot be started on this ship now."));
+    }
+    check_target(park,ship_id,module).map_err(Outcome::custom)?;
+    if let Some(target) = module.target {
+        if !fighter.is_locked(target) {
+            return Err(user_error("TargetNotLocked",vec![("modulename",Value::text(module.name.clone())),("targetname",Value::Int(target))]));
+        }
+    }
+    Ok(())
+}
+
+/// Caller either validates under this lock or holds a live identity reservation
+/// across its fuel transaction. No fallible work follows a committed debit.
+fn publish_activation(world: &mut crate::world::WorldState, system: i64, ship_id: i64, char_id: i64, client_id: i64, mut module: Active) -> Active {
+    let now = combat::now_ms();
+    let park = world.parks.get_mut(&system).expect("validated activation park");
+    let tick = park.tick;
+    let ship = park.ships.get_mut(&ship_id).expect("validated activation ship");
+    module.started_ms = now;
+    module.next_ms = if module.continuous() {i64::MAX} else {now};
+    ship.fight.as_mut().expect("validated activation fighter").modules.push(module.clone());
+    world.notify(&[client_id],"OnGodmaShipEffect",fight::effect_event(char_id,ship_id,&module,true,now));
+    space::broadcast(world,system,None,vec![fight::module_fx(tick,ship_id,&module,true)]);
+    if module.action == Action::Cyno { crate::svc::jumps::cyno_lit(world,system,char_id,ship_id,module.type_id); }
+    if matches!(module.action,Action::Cloak {..}) { crate::cloak::cloaked(world,system,ship_id); }
+    module
+}
+
+fn check_warp_activation(ship: &Ship, warp_safe: bool) -> Result<(), &'static str> {
+    if ship.in_warp() && !warp_safe {
+        Err("That module cannot be activated while in warp.")
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether the module's target makes sense for what it does.
@@ -595,13 +747,26 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
     if piece.state == State::Offline {
         return Err("That module is offline.".into());
     }
+    let hp = loadout.value(i, attr::HP);
+    if hp > 0.0 && loadout.value(i, attr::DAMAGE) >= hp {
+        return Err("That module is burned out. Repair it before activating it.".into());
+    }
     if !piece.has_effect(effect.id as i32) {
         return Err("That module cannot do that.".into());
     }
     let v = |a: i32| loadout.value(i, a);
-    let duration = effect.duration_attr.map_or(0.0, v);
-    if duration <= 0.0 {
+    let continuous_cloak = effect.duration_attr.is_none() && matches!(effect.id,effect::CLOAKING|effect::CLOAKING_WARP_SAFE);
+    let duration = effect.duration_attr.map_or(-1.0, v);
+    if duration <= 0.0 && !continuous_cloak {
         return Err("That module has no cycle to run.".into());
+    }
+    if continuous_cloak {
+        if loadout.pieces.iter().filter(|p|p.role==crate::dogma::Role::Module && p.group_id==330).count()>1 {
+            return Err("You cannot cloak with more than one cloaking device fitted.".into());
+        }
+        if loadout.ship().is_some_and(|ship|loadout.value(ship,1163)==0.0) {
+            return Err("An active module is preventing your ship from cloaking.".into());
+        }
     }
     let charge = loadout.charge_of(i);
     let burns = |per_cycle: i64| {
@@ -686,11 +851,14 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
             tracking: multiplier_or_one(v(attr::TRACKING_SPEED_MULTIPLIER)),
         },
         effect::TARGET_PAINT | effect::TARGET_PAINT_2 => Action::Paint(1.0 + v(attr::SIGNATURE_RADIUS_BONUS) / 100.0),
-        effect::CYNOSURAL_GENERATION => Action::Cyno,
+        effect::CYNOSURAL_GENERATION | effect::CYNOSURAL_GENERATION_45017 => Action::Cyno,
         effect::JUMP_PORTAL_GENERATION => Action::Portal,
         effect::EMP_WAVE_GRID => Action::Doomsday { damage: attr::DAMAGE_TYPES.map(v), range: DOOMSDAY_RANGE },
-        effect::CLOAKING => Action::Cloak { warp_safe: false },
-        effect::CLOAKING_WARP_SAFE => Action::Cloak { warp_safe: true },
+        effect::CLOAKING | effect::CLOAKING_WARP_SAFE => Action::Cloak {
+            warp_safe: effect.warp_safe,
+            targeting_delay_ms: v(560).max(0.0) as i64,
+            reactivation_delay_ms: v(669).max(0.0) as i64,
+        },
         _ => Action::Passive,
     };
     // Generators and superweapons burn fuel from the hold to start.
@@ -698,7 +866,7 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
         .then(|| (v(crate::svc::jumps::ATTR_CONSUMPTION_TYPE) as i64, v(crate::svc::jumps::ATTR_CONSUMPTION_QUANTITY) as i64))
         .filter(|(t, q)| *t > 0 && *q > 0);
     // They run one cycle at a time.
-    let repeat = if matches!(action, Action::Cyno | Action::Portal | Action::Doomsday { .. } | Action::Scan) { 0 } else { repeat };
+    let repeat = if continuous_cloak || matches!(action, Action::Cyno | Action::Portal | Action::Doomsday { .. } | Action::Scan) { 0 } else { repeat };
     // A launcher's useMissiles is an activation effect: the target belongs to
     // its charge's missileLaunching, and the client sends it for that
     // (shipmodulebutton.ActivateEffect).
@@ -721,11 +889,14 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
         effect_id: effect.id,
         guid,
         offensive: effect.offensive,
+        warp_safe: effect.warp_safe,
+        disallow_warp_alignment: v(1245) != 0.0,
         action,
         target: if targeted { target } else { None },
         ammo: None,
         duration_ms: duration as i64,
         cap_need: effect.discharge_attr.map_or(0.0, v).max(0.0),
+        first_cycle_prepaid: false,
         started_ms: 0,
         next_ms: 0,
         cycles: 0,
@@ -754,9 +925,6 @@ async fn special_start(ctx: &Ctx<'_>, system: i64, ship_id: i64, plan: Plan) -> 
         Action::Cloak { .. } => crate::cloak::may_cloak(&ctx.world.lock(), system, ship_id)?,
         Action::Scan => crate::svc::scan::may_scan(ctx, ship_id).await?,
         _ => {}
-    }
-    if let Some((type_id, quantity)) = plan.fuel {
-        crate::svc::jumps::burn_fuel(ctx, ship_id, type_id, quantity, &[ctx.client_id]).await?;
     }
     Ok(plan)
 }
@@ -810,11 +978,28 @@ async fn type_damage(ctx: &Ctx<'_>, type_id: i64) -> combat::Damage {
     damage
 }
 
-/// Deactivate(itemID, effectName): the module stops when its cycle ends.
+/// Timed effects stop at their cycle boundary; continuous effects stop now.
 async fn deactivate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let item_id = call.arg_id(0);
     if effect_name(call.args.get(1)).as_deref() == Some("online") {
         return crate::svc::fitting::set_online(ctx, item_id, false).await;
+    }
+    if let (Some(system),Some(ship_id),Some(pilot))=(ctx.session.solar_system_id,ctx.session.ship_id,ctx.session.char_id) {
+        let continuous={let mut world=ctx.world.lock();
+        let continuous=world.parks.get(&system).and_then(|p|p.ships.get(&ship_id))
+            .filter(|s|s.pilot.char_id==pilot && s.client_id==ctx.client_id && !s.identity_reserved)
+            .and_then(|s|s.fight.as_ref()).and_then(|f|f.module(item_id)).is_some_and(Active::continuous);
+        if continuous {
+            let mut out=crate::heartbeat::Out::default();
+            fight::stop(world.parks.get_mut(&system).unwrap(),ship_id,item_id,combat::now_ms(),&mut out,None);
+            let jobs=out.deliver(&world);world.pending_jobs.extend(jobs);
+            crate::cloak::uncloaked(&mut world,system,ship_id);
+        }
+        continuous};
+        if continuous {
+            refit(ctx.db,ctx.dogma,ctx.world,ctx.client_id,pilot,ship_id,system).await;
+            return Outcome::Value(Value::None);
+        }
     }
     let found = with_fight(ctx, |_, fight, _| match fight.module_mut(item_id) {
         Some(m) => {
@@ -831,6 +1016,52 @@ async fn deactivate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
 
 /// Recomputes a ship's attributes for the modules now running, moves the new
 /// numbers into the park, and tells the pilot what changed.
+/// A fleet booster or command chain changed. Rebuild the same loadout with the
+/// old external bonuses to send attribute deltas, then update the live fighter.
+pub async fn fleet_refit(
+    db: &tokio_postgres::Client,
+    catalog: &Catalog,
+    world: &crate::world::World,
+    char_id: i64,
+    previous: &std::collections::BTreeMap<i32, f64>,
+) -> Result<(), tokio_postgres::Error> {
+    let ship = {
+        let w = world.lock();
+        w.parks.iter().find_map(|(system, park)| park.ships.values().find(|s| s.pilot.char_id == char_id && s.is_player())
+            .map(|s| (*system, s.id, s.client_id, s.fight.as_ref().map(|f| f.applied.clone()).unwrap_or_default())))
+    };
+    let Some((system, ship_id, client_id, active)) = ship else { return Ok(()) };
+    let active_hash = active.iter().copied().collect();
+    let mut before = Loadout::load(db, catalog, char_id, Some(ship_id), &active_hash).await?;
+    let after = before.snapshot();
+    before.apply_fleet_bonuses(previous);
+    let before = before.snapshot();
+    let Some(profile) = profile(db, catalog, char_id, ship_id, &active, combat::now_ms()).await? else { return Ok(()) };
+    let mut w = world.lock();
+    let Some(park) = w.parks.get_mut(&system) else { return Ok(()) };
+    let tick = park.tick;
+    let Some(ship) = park.ships.get_mut(&ship_id).filter(|s| s.pilot.char_id == char_id) else { return Ok(()) };
+    let old_speed = ship.stats.max_velocity;
+    apply_profile(ship, profile, combat::now_ms());
+    // Running mining cycles already hold a computed yield. Keep it in sync
+    // with the loadout without resetting their cycle clocks.
+    let now_bonus = catalog.fleet_bonuses(char_id);
+    let yield_ratio = (1.0 + now_bonus.get(&77).copied().unwrap_or(0.0) / 100.0)
+        / (1.0 + previous.get(&77).copied().unwrap_or(0.0) / 100.0);
+    if let Some(fight) = &mut ship.fight {
+        for module in &mut fight.modules {
+            if let Action::Mining { amount, .. } = &mut module.action { *amount *= yield_ratio; }
+        }
+    }
+    let speed = ship.stats.max_velocity;
+    if (speed - old_speed).abs() > 1e-6 {
+        space::broadcast(&w, system, None, vec![entry(tick, "SetMaxSpeed", vec![Value::Int(ship_id), Value::Double(speed)])]);
+    }
+    let changes = super::fitting::attribute_changes(char_id, &before, &after);
+    if !changes.is_empty() { w.notify(&[client_id], "OnModuleAttributeChanges", Value::Tuple(vec![Value::List(changes)])); }
+    Ok(())
+}
+
 pub async fn refit(
     db: &tokio_postgres::Client,
     catalog: &Catalog,
@@ -843,7 +1074,7 @@ pub async fn refit(
     let (before_set, now_set): (BTreeSet<i64>, BTreeSet<i64>) = {
         let w = world.lock();
         let Some(fight) = w.parks.get(&system).and_then(|p| p.ships.get(&ship_id)).and_then(|s| s.fight.as_ref()) else { return };
-        let passive = fight.modules.iter().filter(|m| m.action == Action::Passive).map(|m| m.module_id).collect();
+        let passive = fight.modules.iter().filter(|m| m.action == Action::Passive || matches!(m.action,Action::Cloak {..})).map(|m| m.module_id).collect();
         (fight.applied.clone(), passive)
     };
     if before_set == now_set {

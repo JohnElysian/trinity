@@ -3,8 +3,10 @@
 //! The client runs destiny.dll on the commands we send it, and it never hears
 //! a position from us again until the next SetState or AddBalls: those, the
 //! other players who see a ship, and every range check (docking, jumping,
-//! locking, looting) read this simulation. So it is a port of destiny's
-//! Ballpark::Evolve, not an approximation: wherever it drifts from the client,
+//! locking, looting) read this simulation. The original 2.10 port now has a
+//! bounded Trinity 45017 instruction comparison for ordinary steering,
+//! collision, warp and orbit-target release (compatibility/destiny-45017).
+//! Full native parity still requires client validation. Wherever it drifts,
 //! two players see a ship in two places.
 //!
 //! One tick per second (const.simulationTimeStep). Each tick, as Evolve does it:
@@ -24,6 +26,12 @@ use std::sync::Arc;
 
 use crate::combat::{Fighter, Rng};
 use crate::npc::{Belt, Brain, Missile, Rock, Wildlife};
+
+mod persistence;
+mod candidates;
+mod partition;
+#[cfg(test)] mod native_vectors;
+pub use persistence::Motion;
 
 /// Ticks a park evolves at most per request; a park left alone longer than this
 /// skips ahead instead (its ships have long since stopped).
@@ -46,6 +54,8 @@ const ORBIT_TURN: f64 = 0.01;
 const ORBIT_WOBBLE: f64 = 0.7;
 /// Orbit: how sharply the circle pulls, exp((R - d)^2 / -40000).
 const ORBIT_PULL: f64 = -40_000.0;
+/// Native 45017 orbit stores position + thrust * 10 AU as its GOTO goal.
+const ORBIT_GOAL_SCALE: f64 = 1_495_978_707_000.0;
 /// Collision thrust is scaled down by this (0x1005a268).
 const BOUNCE: f64 = 0.85;
 /// WarpTo closer than this (squared, 100 km) is a GotoPoint (0x10059548).
@@ -61,7 +71,7 @@ const WARP_DISTANCE_SPEED: f64 = 1.5;
 /// Warp factor of a warpSpeedMultiplier-1 ship: 3 AU/s.
 const BASE_WARP_FACTOR: f64 = 30.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Vec3 {
     pub x: f64,
     pub y: f64,
@@ -79,6 +89,11 @@ impl Vec3 {
     }
     pub fn len_sq(self) -> f64 {
         self.dot(self)
+    }
+    /// Coordinates must also leave room for the squared distances used by
+    /// steering and collisions. Finite components alone can still overflow.
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite() && self.len_sq().is_finite()
     }
     pub fn dot(self, o: Vec3) -> f64 {
         self.x * o.x + self.y * o.y + self.z * o.z
@@ -148,6 +163,8 @@ pub struct ShipStats {
     pub max_velocity: f64,
     /// WarpTo's warp factor: tenths of an AU per second.
     pub warp_factor: i64,
+    /// Effective dogma attribute 153: capacitor cost per kg per AU.
+    pub warp_capacitor_need: f64,
 }
 
 impl ShipStats {
@@ -159,6 +176,7 @@ impl ShipStats {
             agility,
             max_velocity,
             warp_factor: ((BASE_WARP_FACTOR * multiplier).round() as i64).max(1),
+            warp_capacitor_need: 0.0,
         }
     }
 
@@ -188,7 +206,7 @@ pub struct Pilot {
 }
 
 /// The movement command a ship is executing, as the client was told it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     Stop,
     Direction(Vec3),
@@ -199,19 +217,57 @@ pub enum Command {
     Warp { target: Vec3, range: f64 },
 }
 
-#[derive(Debug, Clone, Copy)]
+pub fn valid_command(ship_id: i64, pos: Vec3, command: &Command) -> bool {
+    match command {
+        Command::Stop => true,
+        Command::Direction(v) => v.is_finite(),
+        Command::Point(v) => v.is_finite() && (*v - pos).is_finite(),
+        Command::Follow { target, range } | Command::Orbit { target, range } =>
+            *target != ship_id && range.is_finite() && *range >= 0.0 && range * range < f64::MAX,
+        Command::Warp { target, range } => target.is_finite() && (*target - pos).is_finite()
+            && range.is_finite() && *range >= 0.0 && (*range as f32).is_finite()
+            && (*range == 0.0 || *range < (*target - pos).len()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum WarpState {
     /// Turning and speeding up towards the warp point.
     Aligning,
     /// On the way: `start` is the tick the warp began, `distance` from where
     /// it began to `exit`.
-    InWarp { exit: Vec3, distance: f64, start: i64 },
+    InWarp { exit: Vec3, distance: f64, start: i32 },
+}
+
+/// Native Trinity WARP mode payload (ReadBallFromStream 0x10031b54).
+/// During alignment `target` is the destination and `start` is -1; after
+/// entry it is the exit point and the original distance/time must survive
+/// a client ballpark reset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WarpSnapshot {
+    pub target: Vec3,
+    pub start: i32,
+    pub distance: f64,
+    pub range: f32,
+    pub factor: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WarpChange {
+    Entered { cost: f64, limited: bool },
+    Stopped { scrambled: bool },
 }
 
 #[derive(Debug, Clone)]
 pub struct Ship {
     pub id: i64,
     pub client_id: i64,
+    /// A hull left in space without a pilot. Pilot metadata still records
+    /// its property owner for inventory and loss reporting.
+    pub unpiloted: bool,
+    /// A transactional cockpit transfer is preparing to commit. Combat still
+    /// changes the hull, but its identity and removal wait for that decision.
+    pub identity_reserved: bool,
     pub stats: ShipStats,
     pub pilot: Pilot,
     pub pos: Vec3,
@@ -249,6 +305,8 @@ impl Ship {
         Ship {
             id,
             client_id,
+            unpiloted: false,
+            identity_reserved: false,
             stats,
             pilot,
             pos,
@@ -279,6 +337,27 @@ impl Ship {
         self.warp.is_some()
     }
 
+    /// Relocation changes ballparks rather than issuing a Destiny course.
+    /// Discard private motion state so an old warp cannot resume after a
+    /// jump or a GM teleport into another system.
+    pub fn arrive(&mut self, at: Vec3) {
+        self.pos = at;
+        self.vel = Vec3::ZERO;
+        self.prev_vel = Vec3::ZERO;
+        self.goal = at;
+        self.warp = None;
+        self.command = Command::Stop;
+    }
+
+    pub fn warp_snapshot(&self) -> Option<WarpSnapshot> {
+        let Command::Warp { range, .. } = self.command else { return None; };
+        let (target, start, distance) = match self.warp? {
+            WarpState::Aligning => (self.goal, -1, 0.0),
+            WarpState::InWarp { exit, distance, start } => (exit, start, distance),
+        };
+        Some(WarpSnapshot { target, start, distance, range: range as f32, factor: self.stats.warp_factor as i32 })
+    }
+
     /// A ship a connected player flies.
     pub fn is_player(&self) -> bool {
         self.is_pilot() && !self.bot
@@ -287,7 +366,7 @@ impl Ship {
     /// A ship with a character at the helm: a player's or a bot's (a bot's
     /// fights with an NPC's brain, but is flown by a character all the same).
     pub fn is_pilot(&self) -> bool {
-        (self.npc.is_none() || self.bot) && self.drone.is_none()
+        !self.unpiloted && (self.npc.is_none() || self.bot) && self.drone.is_none()
     }
 
     /// An NPC: a rat, CONCORD, a mission's enemies.
@@ -295,9 +374,9 @@ impl Ship {
         self.npc.is_some() && !self.bot
     }
 
-    /// Whether others bounce off it: always, but not in warp.
+    /// Native massive flag. Collision queries separately exclude cloaked targets.
     pub fn massive(&self) -> bool {
-        !self.in_warp()
+        !self.in_warp() && !self.cloaked
     }
 
     fn cruise(&self) -> f64 {
@@ -339,6 +418,11 @@ pub struct Park {
     /// What lives in this system's belts.
     pub wildlife: Arc<Wildlife>,
     pub rng: Rng,
+    /// Physics can advance from an RPC as well as the heartbeat. Retain
+    /// capacitor changes and corrected courses until the heartbeat reports them.
+    pub warp_events: Vec<(i64, WarpChange)>,
+    /// Persistent native-shaped collision neighborhood and hash-table history.
+    partition: partition::Index,
 }
 
 /// A bot ship or capsule destroyed in space.
@@ -373,6 +457,8 @@ impl Park {
             missiles: Vec::new(),
             wildlife: Arc::new(Wildlife::default()),
             rng: Rng::seeded(solar_system_id as u64 ^ tick as u64),
+            warp_events: Vec::new(),
+            partition: Default::default(),
         }
     }
 
@@ -430,6 +516,11 @@ impl Park {
     /// FollowBall, Orbit, GotoPoint, GotoDirection, WarpTo and Stop take it.
     pub fn command(&mut self, ship_id: i64, command: Command) {
         let Some(ship) = self.ships.get_mut(&ship_id) else { return };
+        // Destiny does not accept another course after entering warp. Keep
+        // internal callers subject to the same rule as beyonce RPCs.
+        if ship.identity_reserved || ship.in_warp() || !valid_command(ship_id, ship.pos, &command) {
+            return;
+        }
         let command = match command {
             // Stop on a stopped ship changes nothing (0x10017800).
             Command::Stop if ship.command == Command::Stop && ship.warp.is_none() => return,
@@ -455,7 +546,9 @@ impl Park {
     }
 
     pub fn set_speed_fraction(&mut self, ship_id: i64, fraction: f64) {
+        if !fraction.is_finite() { return; }
         if let Some(ship) = self.ships.get_mut(&ship_id) {
+            if ship.identity_reserved || ship.in_warp() { return; }
             ship.speed_fraction = fraction.clamp(0.0, 1.0);
         }
     }
@@ -477,22 +570,49 @@ impl Park {
     fn step(&mut self) {
         // The clock destiny reads during the tick: the stamp, as a C int.
         let now = crate::destiny::stamp(self.tick) as i32;
+        self.sync_partitions();
         let thrust = self.thrusts(now);
         let bounce = self.bounces(&thrust);
         for ship in self.ships.values_mut() {
             let push = thrust.get(&ship.id).copied().unwrap_or(Vec3::ZERO) + bounce.get(&ship.id).copied().unwrap_or(Vec3::ZERO);
             move_ship(ship, push, now);
         }
+        self.sync_partitions();
         self.tick += 1;
+    }
+
+    fn sync_partitions(&mut self) {
+        let fixed=|id,pos,radius|partition::Ball {id,pos,vel:Vec3::ZERO,radius};
+        // Nonmassive and cloaked occupants still affect native cell occupancy
+        // and pointer-set growth; collision eligibility is checked by query.
+        let mut balls:Vec<_>=self.ships.values().map(|s|partition::Ball {
+            id:s.id,pos:s.pos,vel:s.vel,radius:s.stats.radius}).collect();
+        balls.extend(self.rocks.values().map(|s|fixed(s.id,s.pos,s.radius)));
+        balls.extend(self.celestials.iter().map(|s|fixed(s.id,s.pos,s.radius)));
+        balls.extend(self.cans.values().map(|s|fixed(s.id,s.pos,s.radius)));
+        balls.extend(self.structures.values().map(|s|fixed(s.id,s.pos,s.radius)));
+        balls.extend(self.sites.values().map(|s|fixed(s.id,s.pos,s.radius())));
+        balls.extend(self.beacons.values().map(|s|fixed(s.id,s.pos,s.radius)));
+        for s in self.structures.values() {
+            if let Some(f)=&s.field {balls.push(fixed(f.id,s.pos,f.radius));}
+        }
+        // Stable allocation order across storage categories; candidate order
+        // itself remains the native hash/list traversal, not this ID order.
+        balls.sort_unstable_by_key(|ball|ball.id);
+        self.partition.sync(balls);
     }
 
     /// Step 1: each ship's thrust from its mode. Modes can change on the way:
     /// a lost target stops a follower, an aligned ship enters warp (and its
     /// followers let go of it).
     fn thrusts(&mut self, now: i32) -> BTreeMap<i64, Vec3> {
+        // This step advances the park to tick+1. Use that time for capacitor
+        // state, after module cycles run between the two Destiny ticks.
+        let capacitor_ms = (self.tick + 1 - crate::combat::filetime(0) / 10_000_000) * 1_000;
         let targets: BTreeMap<i64, (Vec3, f64)> = self
             .ships
             .values()
+            .filter(|s| !s.cloaked)
             .map(|s| (s.id, (s.pos, s.stats.radius)))
             .chain(self.rocks.values().map(|r| (r.id, (r.pos, r.radius))))
             .chain(self.cans.values().map(|c| (c.id, (c.pos, c.radius))))
@@ -502,8 +622,9 @@ impl Park {
             .chain(self.celestials.iter().map(|c| (c.id, (c.pos, c.radius))))
             .collect();
         let mut thrust = BTreeMap::new();
-        // destiny walks its balls in ID order, and a warp that starts changes
-        // its followers on the spot, so later ones see it the same tick.
+        // Server mode updates use stable ID order. Native active-ball table
+        // ordering is a separate remaining Evolve comparison. A warp changes
+        // its followers immediately, so later updates see it in this tick.
         let ids: Vec<i64> = self.ships.keys().copied().collect();
         for id in ids {
             let Some(ship) = self.ships.get_mut(&id) else { continue };
@@ -523,12 +644,17 @@ impl Park {
                 },
                 Command::Orbit { target, range } => match targets.get(&target) {
                     Some(&(at, radius)) => orbit(ship, at, radius + ship.stats.radius + range, now),
-                    None => lose_target(ship),
+                    None => {
+                        release_orbit(ship);
+                        steer(ship, ship.goal)
+                    }
                 },
                 Command::Warp { range, .. } => match ship.warp {
                     Some(WarpState::Aligning) if aligned(ship) => {
-                        enter_warp(ship, range, now);
-                        warped = true;
+                        if let Some(change) = enter_warp(ship, range, now, capacitor_ms) {
+                            self.warp_events.push((id, change));
+                        }
+                        warped = ship.in_warp();
                         Vec3::ZERO
                     }
                     Some(WarpState::Aligning) => steer(ship, ship.goal),
@@ -549,9 +675,7 @@ impl Park {
         for ship in self.ships.values_mut() {
             match ship.command {
                 Command::Orbit { target, .. } if target == warped => {
-                    let heading = ship.vel;
-                    ship.goal = ship.pos + heading.unit() * GOTO_DIRECTION_REACH;
-                    ship.command = Command::Direction(heading);
+                    release_orbit(ship);
                 }
                 Command::Follow { target, .. } if target == warped => ship.command = Command::Stop,
                 _ => {}
@@ -575,6 +699,7 @@ impl Park {
                 inertia: s.stats.inertia(),
                 mass: s.stats.mass,
                 free: true,
+                cloaked: s.cloaked,
                 key: (s.harmonic, s.pilot.corp_id, s.pilot.alliance_id.unwrap_or(-1)),
                 field: None,
             })
@@ -589,6 +714,7 @@ impl Park {
             inertia: IMMOVABLE,
             mass: IMMOVABLE,
             free: false,
+            cloaked: false,
             key: (-1, -1, -1),
             field: None,
         };
@@ -602,10 +728,16 @@ impl Park {
         }
 
         let mut out = BTreeMap::new();
+        let by_id:BTreeMap<_,_>=bodies.iter().map(|body|(body.id,body)).collect();
         for a in &bodies[..movers] {
             let prev_vel = self.ships[&a.id].prev_vel;
             let mut best: Option<(f64, Vec3)> = None;
-            for b in bodies.iter().filter(|b| b.id != a.id && !b.field.is_some_and(|f| passes(f, a.key))) {
+            // Trinity 45017's query (RVA 0x29819) skips cloaked targets;
+            // CloakBall also clears the mover's massive flag.
+            let candidates=self.partition.candidates(a.id,|id|by_id.get(&id).is_some_and(|b|
+                !b.cloaked && !b.field.is_some_and(|f|passes(f,a.key))));
+            for id in candidates {
+                let b=by_id[&id];
                 let Some((toi, push)) = bounce(a, prev_vel, b) else { continue };
                 let push = push * BOUNCE;
                 // The latest contact of the tick wins; of two at the same
@@ -634,6 +766,7 @@ struct Body {
     inertia: f64,
     mass: f64,
     free: bool,
+    cloaked: bool,
     /// Its (harmonic, corporation, alliance), for force fields to test.
     key: (i64, i64, i64),
     /// A force field's (harmonic, corporation, alliance); -1 where unset.
@@ -691,10 +824,20 @@ fn lose_target(ship: &mut Ship) -> Vec3 {
     Vec3::ZERO
 }
 
+/// RemoveBall and warp entry release interactive orbiters through
+/// GotoDirection(current velocity), including GotoPoint's zero-throttle reset
+/// (45017 RVAs 0x198c1–0x19903, 0x189ea–0x18a31, 0x18b31–0x18b38).
+fn release_orbit(ship:&mut Ship) {
+    let heading=ship.vel;
+    ship.goal=ship.pos+heading.unit()*GOTO_DIRECTION_REACH;
+    ship.command=Command::Direction(heading);
+    if ship.speed_fraction==0.0 {ship.speed_fraction=1.0;}
+}
+
 /// ORBIT (Evolve, case 4): head for the tangent of the orbit circle, blended
 /// with a sideways axis that drifts with time and the ship's ID, at full
 /// thrust.
-fn orbit(ship: &Ship, at: Vec3, reach: f64, now: i32) -> Vec3 {
+fn orbit(ship: &mut Ship, at: Vec3, reach: f64, now: i32) -> Vec3 {
     let cruise = ship.cruise();
     let accel = FRICTION * cruise / ship.stats.inertia();
     let to = at - ship.pos;
@@ -707,7 +850,7 @@ fn orbit(ship: &Ship, at: Vec3, reach: f64, now: i32) -> Vec3 {
     let side = axis.cross(toward).unit();
     let gap = dist * dist - reach * reach;
     let mut heading = toward;
-    if gap >= 0.0 {
+    if gap >= 0.0 && dist > 0.0 {
         heading = (toward * (gap / dist) + side * (gap.sqrt() * reach / dist)).unit();
     }
     let pull = ((reach - dist) * (reach - dist) / ORBIT_PULL).exp();
@@ -717,7 +860,9 @@ fn orbit(ship: &Ship, at: Vec3, reach: f64, now: i32) -> Vec3 {
     if dist - reach < 0.0 {
         along = -along;
     }
-    (side * pull + heading * along) * accel
+    let thrust=(side * pull + heading * along) * accel;
+    ship.goal=ship.pos+thrust*ORBIT_GOAL_SCALE;
+    thrust
 }
 
 /// Lined up and fast enough to warp (Evolve, case 3).
@@ -730,16 +875,59 @@ fn aligned(ship: &Ship) -> bool {
 
 /// The warp begins (0x100186b0): it ends `range` short of the warp point, on
 /// our side of it. destiny keeps the range as a float.
-fn enter_warp(ship: &mut Ship, range: f64, now: i32) {
-    let exit = ship.goal + (ship.pos - ship.goal).unit() * f64::from(range as f32);
-    ship.warp = Some(WarpState::InWarp { exit, distance: (exit - ship.pos).len(), start: i64::from(now) });
+fn enter_warp(ship: &mut Ship, range: f64, now: i32, capacitor_ms: i64) -> Option<WarpChange> {
+    // A cockpit/funded-activation transaction must publish its decision before
+    // an already queued alignment can enter warp or spend capacitor.
+    if ship.identity_reserved { return None; }
+    if ship.fight.as_ref().is_some_and(|f| f.afflictions.scrambled >= 1.0
+        || f.modules.iter().any(|m| matches!(m.action, crate::combat::Action::Cyno))) {
+        ship.warp = None;
+        ship.command = Command::Stop;
+        return Some(WarpChange::Stopped { scrambled: true });
+    }
+    let range = f64::from(range as f32);
+    // The ship can fly into the requested stopping range while aligning.
+    // Starting there would produce a zero-length or backwards warp profile.
+    if (ship.goal - ship.pos).len() <= range {
+        ship.warp = None;
+        ship.command = Command::Stop;
+        return Some(WarpChange::Stopped { scrambled: false });
+    }
+    let mut exit = ship.goal + (ship.pos - ship.goal).unit() * range;
+    let distance = (exit - ship.pos).len();
+    let available = ship.fight.as_ref().map_or(0.0, |f|f.vitals.capacitor.at(capacitor_ms));
+    let Some(quote) = crate::warp_energy::quote(distance,ship.stats.mass,ship.stats.warp_capacitor_need,available)
+        .filter(|quote|quote.distance_m > 0.0) else {
+        ship.warp = None;
+        ship.command = Command::Stop;
+        return Some(WarpChange::Stopped { scrambled: false });
+    };
+    if quote.limited { exit = ship.pos + (exit - ship.pos).unit() * quote.distance_m; }
+    let top = (ship.stats.warp_factor as f64 * WARP_FACTOR_SPEED).min(quote.distance_m * WARP_DISTANCE_SPEED);
+    // No server minimum distance is inferred here. Only reject a trip whose
+    // endpoint cannot be represented, or whose native logarithm underflows.
+    if exit == ship.pos || !exit.is_finite() || !(top / 3.0).is_finite() || top / 3.0 <= 0.0 {
+        ship.warp = None;
+        ship.command = Command::Stop;
+        return Some(WarpChange::Stopped { scrambled: false });
+    }
+    if quote.cost > 0.0 {
+        let paid = ship.fight.as_mut().is_some_and(|f| f.vitals.capacitor.spend(capacitor_ms,quote.cost));
+        if !paid {
+            ship.warp = None;
+            ship.command = Command::Stop;
+            return Some(WarpChange::Stopped { scrambled: false });
+        }
+    }
+    ship.warp = Some(WarpState::InWarp { exit, distance: quote.distance_m, start: now });
+    (quote.cost > 0.0 || quote.limited).then_some(WarpChange::Entered { cost: quote.cost, limited: quote.limited })
 }
 
 /// Step 3 for one ship: integrate it, or carry it along its warp.
 fn move_ship(ship: &mut Ship, push: Vec3, now: i32) {
     ship.prev_vel = ship.vel;
     if let Some(WarpState::InWarp { exit, distance, start }) = ship.warp {
-        warp_along(ship, exit, distance, (i64::from(now) - start) as f64 * DT);
+        warp_along(ship, exit, distance, f64::from(now.wrapping_sub(start)) * DT);
         return;
     }
     let (pos, vel) = drift(ship.pos, ship.vel, push, ship.stats.inertia(), DT);
@@ -953,6 +1141,187 @@ mod tests {
     }
 
     #[test]
+    fn a_short_actual_warp_keeps_its_stopping_range() {
+        let mut park = park_with_ship(Vec3::ZERO);
+        park.celestials.clear();
+        park.command(1, Command::Warp { target: Vec3::new(160_000.0, 0.0, 0.0), range: 100_000.0 });
+        park.advance(7);
+        assert!(park.ships[&1].in_warp());
+        park.advance(60);
+        let ship = &park.ships[&1];
+        assert_eq!(ship.command, Command::Stop);
+        assert!((ship.pos.x - 60_000.0).abs() < 1_000.0, "landed at {}", ship.pos.x);
+    }
+
+    #[test]
+    fn stop_cancels_alignment_but_not_an_active_warp() {
+        let mut park = park_with_ship(Vec3::ZERO);
+        let command = Command::Warp { target: Vec3::new(5.0e12, 0.0, 0.0), range: 0.0 };
+        park.command(1, command.clone());
+        park.advance(2);
+        park.command(1, Command::Stop);
+        assert!(!park.ships[&1].warping());
+        park.command(1, command.clone());
+        park.advance(10);
+        assert!(park.ships[&1].in_warp());
+        park.command(1, Command::Stop);
+        park.set_speed_fraction(1, 0.0);
+        assert_eq!(park.ships[&1].command, command);
+        assert_eq!(park.ships[&1].speed_fraction, 1.0);
+        park.advance(70);
+        assert_eq!(park.ships[&1].command, Command::Stop);
+        assert!(park.ships[&1].pos.x > 4.9e12);
+    }
+
+    #[test]
+    fn malformed_movement_does_not_poison_the_ballpark() {
+        let mut park = park_with_ship(Vec3::ZERO);
+        for command in [
+            Command::Direction(Vec3::new(f64::NAN, 0.0, 0.0)),
+            Command::Point(Vec3::new(f64::MAX, 0.0, 0.0)),
+            Command::Warp { target: Vec3::new(f64::INFINITY, 0.0, 0.0), range: 0.0 },
+            Command::Warp { target: Vec3::new(1.0e6, 0.0, 0.0), range: 1.0e6 },
+            Command::Orbit { target: 2, range: f64::NAN },
+            Command::Follow { target: 1, range: 0.0 },
+        ] {
+            park.command(1, command);
+            assert_eq!(park.ships[&1].command, Command::Stop);
+        }
+        for fraction in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] { park.set_speed_fraction(1, fraction); }
+        park.advance(10);
+        assert_eq!(park.ships[&1].speed_fraction, 1.0);
+        assert!(park.ships[&1].pos.is_finite() && park.ships[&1].vel.is_finite());
+    }
+
+    #[test]
+    fn warp_time_crosses_the_signed_destiny_stamp_boundary() {
+        let mut park = park_with_ship(Vec3::ZERO);
+        let ship = park.ships.get_mut(&1).unwrap();
+        ship.warp = Some(WarpState::InWarp { exit: Vec3::new(1.0e6, 0.0, 0.0), distance: 1.0e6, start: i32::MAX - 2 });
+        move_ship(ship, Vec3::ZERO, i32::MAX);
+        let before = ship.pos.x;
+        move_ship(ship, Vec3::ZERO, i32::MIN);
+        assert!(ship.pos.x > before && ship.pos.x < 1.0e6);
+        assert!(ship.pos.is_finite() && ship.vel.is_finite());
+    }
+
+    #[test]
+    fn entering_warp_inside_the_stopping_range_cancels_it() {
+        let mut park = park_with_ship(Vec3::ZERO);
+        park.command(1, Command::Warp { target: Vec3::new(160_000.0, 0.0, 0.0), range: 100_000.0 });
+        let ship = park.ships.get_mut(&1).unwrap();
+        ship.pos.x = 60_000.0;
+        enter_warp(ship, 100_000.0, 0, 0);
+        assert!(!ship.warping());
+        assert_eq!(ship.command, Command::Stop);
+    }
+
+    #[test]
+    fn relocation_discards_the_previous_warp_trajectory() {
+        let mut park = park_with_ship(Vec3::ZERO);
+        park.command(1,Command::Warp{target:Vec3::new(5.0e12,0.0,0.0),range:0.0});
+        park.advance(7);
+        assert!(park.ships[&1].in_warp());
+        let arrival=Vec3::new(-1.0e9,2.0e6,3.0e7);
+        park.ships.get_mut(&1).unwrap().arrive(arrival);
+        park.advance(40);
+        assert_eq!(park.ships[&1].pos,arrival);
+        assert_eq!(park.ships[&1].vel,Vec3::ZERO);
+        assert!(!park.ships[&1].warping());
+        assert!(park.ships[&1].warp_snapshot().is_none());
+    }
+
+    fn park_with_warp_power(charge: f64) -> Park {
+        use crate::combat::{Charged, Vitals};
+        let mut park=park_with_ship(Vec3::ZERO);
+        park.celestials.clear();
+        let ship=park.ships.get_mut(&1).unwrap();
+        ship.stats.mass=1.0e6;ship.stats.warp_capacitor_need=1.0e-6;
+        let mut capacitor=Charged::full(100.0,0.0,0);capacitor.set(0,charge);
+        ship.fight=Some(Fighter::new(Vitals{shield:Charged::full(100.0,0.0,0),armor_max:100.0,armor_damage:0.0,
+            hull_max:100.0,hull_damage:0.0,capacitor,resonance:[[1.0;4];3]},40.0,100.0,1.0e5,4));
+        park
+    }
+
+    #[test]
+    fn warp_spends_power_at_entry_and_cancelled_alignment_costs_nothing() {
+        let mut park=park_with_warp_power(100.0);
+        let target=Vec3::new(10.0*crate::warp_energy::AU_METRES,0.0,0.0);
+        park.command(1,Command::Warp{target,range:0.0});park.advance(2);
+        assert_eq!(park.ships[&1].fight.as_ref().unwrap().vitals.capacitor.at(0),100.0);
+        park.command(1,Command::Stop);
+        assert!(park.warp_events.is_empty());
+        park.command(1,Command::Warp{target,range:0.0});park.advance(10);
+        assert!(park.ships[&1].in_warp());
+        let cap=park.ships[&1].fight.as_ref().unwrap().vitals.capacitor.at(0);
+        assert!((cap-90.0).abs()<1.0e-6);
+        assert!(matches!(park.warp_events.as_slice(),[(1,WarpChange::Entered{limited:false,..})]));
+        park.advance(70);
+        assert_eq!(park.ships[&1].fight.as_ref().unwrap().vitals.capacitor.at(0),cap);
+    }
+
+    #[test]
+    fn low_power_shortens_the_native_warp_snapshot_without_free_distance() {
+        let mut park=park_with_warp_power(4.0);
+        let target=Vec3::new(10.0*crate::warp_energy::AU_METRES,0.0,0.0);
+        park.command(1,Command::Warp{target,range:0.0});
+        let ship=park.ships.get_mut(&1).unwrap();
+        assert_eq!(enter_warp(ship,0.0,123,0),Some(WarpChange::Entered{cost:4.0,limited:true}));
+        let snapshot=ship.warp_snapshot().unwrap();
+        assert!((snapshot.distance-4.0*crate::warp_energy::AU_METRES).abs()<0.001);
+        assert_eq!(snapshot.target,Vec3::new(snapshot.distance,0.0,0.0));
+        assert_eq!(snapshot.start,123);
+        assert_eq!(ship.fight.as_ref().unwrap().vitals.capacitor.at(0),0.0);
+        let mut empty=park_with_warp_power(0.0);
+        empty.command(1,Command::Warp{target,range:0.0});
+        assert_eq!(enter_warp(empty.ships.get_mut(&1).unwrap(),0.0,0,0),Some(WarpChange::Stopped{scrambled:false}));
+        assert!(!empty.ships[&1].warping());
+    }
+
+    #[test]
+    fn a_scramble_acquired_while_aligning_blocks_entry_without_charging() {
+        let mut park=park_with_warp_power(100.0);
+        park.command(1,Command::Warp{target:Vec3::new(1.0e12,0.0,0.0),range:0.0});
+        park.advance(2);
+        park.ships.get_mut(&1).unwrap().fight.as_mut().unwrap().afflictions.scrambled=1.0;
+        park.advance(10);
+        assert!(!park.ships[&1].warping());
+        assert_eq!(park.ships[&1].command,Command::Stop);
+        assert_eq!(park.ships[&1].fight.as_ref().unwrap().vitals.capacitor.at(0),100.0);
+        assert_eq!(park.warp_events,vec![(1,WarpChange::Stopped{scrambled:true})]);
+    }
+
+    #[test]
+    fn a_nonrepresentable_partial_warp_does_not_spend_power_or_make_nan() {
+        let mut park=park_with_warp_power(1.0e-20);
+        park.ships.get_mut(&1).unwrap().pos=Vec3::new(1.0e12,0.0,0.0);
+        park.command(1,Command::Warp{target:Vec3::new(2.0e12,0.0,0.0),range:0.0});
+        let ship=park.ships.get_mut(&1).unwrap();
+        assert_eq!(enter_warp(ship,0.0,0,0),Some(WarpChange::Stopped{scrambled:false}));
+        assert_eq!(ship.fight.as_ref().unwrap().vitals.capacitor.at(0),1.0e-20);
+        assert!(ship.pos.is_finite() && !ship.warping());
+    }
+
+    #[test]
+    fn cockpit_reservation_preserves_live_damage_and_defers_only_identity_changes() {
+        let mut park=park_with_warp_power(100.0);
+        park.ships.get_mut(&1).unwrap().identity_reserved=true;
+        park.command(1,Command::Direction(Vec3::new(1.0,0.0,0.0)));
+        park.set_speed_fraction(1,0.25);
+        assert_eq!(park.ships[&1].command,Command::Stop);
+        assert_eq!(park.ships[&1].speed_fraction,1.0);
+        park.ships.get_mut(&1).unwrap().fight.as_mut().unwrap().vitals.hull_damage=100.0;
+        let mut out=crate::heartbeat::Out::default();
+        crate::fight::step(&mut park,0,&mut out);
+        assert!(park.ships.contains_key(&1),"reserved identity survives until the transaction resolves");
+        assert_eq!(park.ships[&1].fight.as_ref().unwrap().vitals.hull_damage,100.0,"damage is not reverted");
+        park.ships.get_mut(&1).unwrap().identity_reserved=false;
+        crate::fight::step(&mut park,1,&mut out);
+        assert!(!park.ships.contains_key(&1),"real death proceeds after reservation release");
+        assert!(out.jobs.iter().any(|job|matches!(job,crate::heartbeat::Job::Lost(_))));
+    }
+
+    #[test]
     fn a_stopped_ship_levels_off() {
         let mut park = park_with_ship(Vec3::new(0.0, 100.0, 0.0));
         park.advance(1);
@@ -974,6 +1343,27 @@ mod tests {
         let (a, b) = (&park.ships[&1], &park.ships[&2]);
         assert!(b.pos.x - a.pos.x >= 2.0 * 37.0, "hulls overlap: {} m apart", b.pos.x - a.pos.x);
         assert!(b.vel.x > 0.0, "the other turned round too");
+    }
+
+    #[test]
+    fn cloaked_collision_targets_do_not_push_visible_ships() {
+        for both_cloaked in [false, true] {
+            let mut park = park_with_ship(Vec3::ZERO);
+            park.celestials.clear();
+            park.ships.get_mut(&1).unwrap().cloaked = both_cloaked;
+            let start = Vec3::new(20.0, 0.0, 0.0);
+            let mut hidden = Ship::new(2, 20, rifter(), pilot(), start, Vec3::ZERO);
+            hidden.cloaked = true;
+            park.ships.insert(2, hidden);
+
+            park.advance(1);
+
+            assert_eq!(park.ships[&1].pos, Vec3::ZERO, "a cloaked target cannot push another hull");
+            assert_eq!(park.ships[&1].vel, Vec3::ZERO);
+            // Native CloakBall also clears this ball's massive flag.
+            assert_eq!(park.ships[&2].pos, start);
+            assert_eq!(park.ships[&2].vel, Vec3::ZERO);
+        }
     }
 
     #[test]

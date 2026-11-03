@@ -24,7 +24,7 @@ const CSPA_MAILBOX: i64 = 127;
 const CHANNEL_HEADER: &[&str] = &[
     "channelID", "ownerID", "displayName", "motd", "comparisonKey", "memberless",
     "password", "mailingList", "cspa", "temporary", "mode", "subscribed",
-    "estimatedMemberCount",
+    "estimatedMemberCount", "languageRestriction",
 ];
 
 const IX_SUBSCRIBED: usize = 11;
@@ -34,11 +34,74 @@ const ACL_HEADER: &[&str] =
 
 const MEMBER_HEADER: &[&str] = &["charID", "corpID", "allianceID", "role", "extra"];
 
+pub async fn ensure(db: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    db.batch_execute(r#"ALTER TABLE channels ADD COLUMN IF NOT EXISTS "languageRestriction" smallint NOT NULL DEFAULT 0"#).await
+}
+
+async fn set_language_restriction(ctx: &Ctx<'_>, channel: i64, enabled: i64) -> Outcome {
+    // The Trinity channel dialog exposes this on its game-master tab only.
+    if ctx.session.role & (8 | 16) == 0 { return Outcome::custom("Only a game master can change the language restriction."); }
+    if !matches!(enabled, 0 | 1) { return Outcome::custom("Invalid language restriction."); }
+    match ctx.db.execute(r#"UPDATE channels SET "languageRestriction"=$2 WHERE "channelID"=$1"#,
+        &[&(channel as i32), &(enabled as i16)]).await {
+        Ok(0) => Outcome::custom("That channel does not exist."),
+        Ok(_) => {
+            let world = ctx.world.lock();
+            let id = Value::Int(channel);
+            announce(&world, &world.channel_members(&id), &id, "SetChannelLanguageRestriction", &who(ctx.session), vec![Value::Int(enabled)]);
+            Outcome::Value(Value::None)
+        }
+        Err(e) => { error!("channel language restriction: {e}"); Outcome::custom("Could not save the language restriction.") }
+    }
+}
+
+#[cfg(test)]
+mod trinity_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
+    async fn dashboard_feature_language_restriction_is_persisted_and_voice_requires_membership() {
+        let fixture = crate::test_support::Database::load().await;
+        let pilot = fixture.id().await;
+        let channel:i32 = fixture.db.query_one(r#"INSERT INTO channels ("ownerID","displayName") VALUES ($1,'Language test') RETURNING "channelID""#,&[&pilot]).await.unwrap().get(0);
+        let player = crate::session::Session {char_id:Some(pilot as i64),..Default::default()};
+        assert!(matches!(set_language_restriction(&fixture.ctx(&player),channel as i64,1).await,Outcome::UserError{..}));
+        let configure_call = Call {service:"LSC".into(),method:"Configure".into(),args:vec![Value::Int(channel as i64)],
+            kwargs:vec![(Value::bytes("languageRestriction"),Value::Int(1))]};
+        assert!(matches!(lsc(&configure_call,&fixture.ctx(&player)).await,Some(Outcome::UserError{..})));
+        let gm = crate::session::Session {role:8,..player.clone()};
+        assert!(matches!(set_language_restriction(&fixture.ctx(&gm),channel as i64,1).await,Outcome::Value(Value::None)));
+        let (line,_) = channel_info(&fixture.ctx(&player),channel as i64).await.unwrap();
+        assert_eq!(line.len(),CHANNEL_HEADER.len());
+        assert_eq!(line[13],Value::Int(1));
+        assert_eq!(synthetic_mailbox(pilot as i64).len(),CHANNEL_HEADER.len());
+        let call = Call {service:"LSC".into(),method:"VoiceStatus".into(),args:vec![Value::Int(channel as i64),Value::Int(2)],kwargs:vec![]};
+        assert!(matches!(lsc(&call,&fixture.ctx(&player)).await,Some(Outcome::UserError{..})));
+        let mut rx = fixture.world.lock().connect(1);
+        fixture.world.lock().join_channel(&Value::Int(channel as i64),1);
+        assert!(matches!(lsc(&call,&fixture.ctx(&player)).await,Some(Outcome::Value(Value::None))));
+        let crate::world::Push::Notify(note) = rx.try_recv().unwrap() else {panic!("notification")};
+        assert_eq!(note.event,"OnLSC");
+        assert_eq!(note.args.seq().unwrap()[2],Value::bytes("VoiceStatus"));
+    }
+}
+
 pub async fn lsc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
         "JoinChannels" => join_channels(ctx, call.args.first()).await,
         "GetChannels" => get_channels(ctx).await,
         "GetMembers" => get_members(ctx, call.args.first()).await,
+        "SetChannelLanguageRestriction" => return Some(set_language_restriction(ctx, call.arg_id(0), call.arg_id(1)).await),
+        "VoiceStatus" => {
+            let Some(channel) = call.args.first() else { return Some(Outcome::custom("Missing channel.")); };
+            let status = call.arg_id(1);
+            if !(0..=2).contains(&status) { return Some(Outcome::custom("Invalid voice status.")); }
+            let world = ctx.world.lock();
+            let members = world.channel_members(channel);
+            if !members.contains(&ctx.client_id) { return Some(Outcome::custom("Join the channel first.")); }
+            announce(&world, &members, channel, "VoiceStatus", &who(ctx.session), vec![Value::Int(status)]);
+            Value::None
+        }
         // LeaveChannels(channelIDs, unsubscribe) / LeaveChannel(channelID, unsubscribe)
         "LeaveChannels" => {
             for channel in call.args.first().and_then(|v| v.seq()).unwrap_or(&[]) {
@@ -70,7 +133,7 @@ pub async fn lsc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "MarkMessagesRead" => mark_messages_read(ctx, call.args.first()).await,
         "DeleteMessages" => delete_messages(ctx, call.arg_id(0), call.args.get(1)).await,
         "CreateChannel" => create_channel(ctx, call).await,
-        "Configure" => configure(ctx, call).await,
+        "Configure" => return Some(configure(ctx, call).await),
         "RenameChannel" => {
             let sql = r#"UPDATE "channels" SET "displayName" = $3, "comparisonKey" = lower($3)
                           WHERE "channelID" = $1 AND "ownerID" = $2 RETURNING 1"#;
@@ -484,7 +547,7 @@ fn refused(channel_id: Value, why: &str) -> Value {
 async fn channel_info(ctx: &Ctx<'_>, channel_id: i64) -> Option<(Vec<Value>, i64)> {
     let sql = r#"SELECT "channelID","ownerID","displayName","motd","comparisonKey",
                         "memberless","password","mailingList","cspa","temporary",
-                        "mode","subscribed","estimatedMemberCount"
+                        "mode","subscribed","estimatedMemberCount","languageRestriction"
                    FROM "channels" WHERE "channelID" = $1"#;
     match ctx.db.query(sql, &[&(channel_id as i32)]).await {
         Ok(rows) if !rows.is_empty() => {
@@ -520,6 +583,7 @@ fn channel_line(r: &PgRow, hide_password: bool) -> Vec<Value> {
         Value::int_or_none(int(r, 10)),
         Value::int_or_none(int(r, 11)),
         Value::int_or_none(int(r, 12)),
+        Value::int_or_none(int(r, 13)),
     ]
 }
 
@@ -538,6 +602,7 @@ fn synthetic_mailbox(owner_id: i64) -> Vec<Value> {
         Value::Int(CHTMODE_LISTENER),
         Value::Int(1),
         Value::Int(1),
+        Value::Int(0),
     ]
 }
 
@@ -550,7 +615,7 @@ async fn get_channels(ctx: &Ctx<'_>) -> Value {
     let sql = r#"SELECT c."channelID",c."ownerID",c."displayName",c."motd",
                         c."comparisonKey",c."memberless",c."password",c."mailingList",
                         c."cspa",c."temporary",c."mode",c."subscribed",
-                        c."estimatedMemberCount",
+                        c."estimatedMemberCount", c."languageRestriction",
                         (cc."charID" IS NOT NULL) AS "isMember"
                    FROM "channels" c
                    LEFT JOIN "channelChars" cc
@@ -566,7 +631,7 @@ async fn get_channels(ctx: &Ctx<'_>) -> Value {
                 let id = int(r, 0).unwrap_or(0);
                 seen.push(id);
                 let mut line = channel_line(r, true);
-                let subscribed = (int(r, 13) == Some(1)) || own_entity_ids(ctx).contains(&id);
+                let subscribed = (int(r, 14) == Some(1)) || own_entity_ids(ctx).contains(&id);
                 line[IX_SUBSCRIBED] = Value::Int(subscribed as i64);
                 lines.push(Value::List(line));
             }
@@ -839,11 +904,15 @@ async fn create_channel(ctx: &Ctx<'_>, call: &Call) -> Value {
 /// Configure(channelID, displayName=, motd=, cspa=, memberless=, oldPassword=,
 /// newPassword=): the channel settings dialog. Owner only; the password changes
 /// only if oldPassword matches.
-async fn configure(ctx: &Ctx<'_>, call: &Call) -> Value {
+async fn configure(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let channel_id = call.arg_id(0) as i32;
     let char_id = me(ctx);
     let text_kw = |name: &str| call.kwarg(name).and_then(|v| v.as_string());
     let int_kw = |name: &str| call.kwarg(name).and_then(|v| v.as_i64());
+    if let Some(value) = int_kw("languageRestriction") {
+        let result = set_language_restriction(ctx, i64::from(channel_id), value).await;
+        if !matches!(result, Outcome::Value(_)) { return result; }
+    }
     if let Some(name) = text_kw("displayName") {
         let sql = r#"UPDATE "channels" SET "displayName" = $3, "comparisonKey" = lower($3)
                       WHERE "channelID" = $1 AND "ownerID" = $2"#;
@@ -868,7 +937,7 @@ async fn configure(ctx: &Ctx<'_>, call: &Call) -> Value {
                       WHERE "channelID" = $1 AND "ownerID" = $2 AND COALESCE("password", '') = $4"#;
         ctx.execute(sql, &[&channel_id, &char_id, &new, &old]).await;
     }
-    Value::None
+    Outcome::Value(Value::None)
 }
 
 async fn access_control(ctx: &Ctx<'_>, call: &Call) -> Value {

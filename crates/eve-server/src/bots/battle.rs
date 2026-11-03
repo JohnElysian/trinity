@@ -267,6 +267,7 @@ mod tests {
             field: None,
             sentry: Default::default(),
             guard: None,
+            bridge: None,
         }
     }
 

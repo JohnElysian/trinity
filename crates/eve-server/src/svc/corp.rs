@@ -1,5 +1,8 @@
+mod offices;
+pub(crate) use offices::{ensure_schema as ensure_office_schema,ensure_slots_locked as ensure_office_slots_locked};
+
 use eve_marshal::Value;
-use tracing::{error, info};
+use tracing::error;
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::svc::bound;
@@ -38,7 +41,10 @@ pub async fn corpmgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             let corp = ctx.session.corp_id.unwrap_or(0) as i32;
             ctx.rowset(&["itemID", "locationID", "typeID"], sql, &[&corp]).await
         }
-        "GetItemsRented" => items_rented(ctx).await,
+        "GetItemsRented" => return Some(match items_rented(ctx).await {
+            Ok(value)=>Outcome::Value(value),Err(error)=>{error!("corporation rentals: {}",crate::logging::chain(&error));Outcome::custom("The corporation's rentals could not be read.")}
+        }),
+        "SearchAssets" => search_assets(ctx,call).await,
         // (corpID, which): the stations holding the corporation's assets of a kind.
         "GetAssetInventory" => {
             let which = call.arg_text(1).unwrap_or_default();
@@ -71,32 +77,77 @@ fn own_corp(ctx: &Ctx<'_>, corp_id: i64) -> Option<i32> {
     (ctx.session.corp_id == Some(corp_id)).then_some(corp_id as i32)
 }
 
-/// Office and other rentals (corp_ui_accounts.py reads typeID, rentedFromID,
-/// startDate, rentPeriodInDays, flag).
-async fn items_rented(ctx: &Ctx<'_>) -> Value {
-    const DAY: i64 = 24 * 60 * 60 * 10_000_000;
-    let sql = format!(
-        r#"SELECT "typeID", "stationID" AS "rentedFromID",
-                  "balanceDueDate"::bigint - "rentPeriodInDays"::bigint * {DAY} AS "startDate",
-                  "rentPeriodInDays", "slotNumber" AS "flag"
-             FROM "rentalInfo" WHERE "renterID" = $1 ORDER BY "stationID", "slotNumber""#
-    );
+/// The corporation asset and wallet views share these rental records.
+async fn items_rented(ctx: &Ctx<'_>) -> Result<Value,tokio_postgres::Error> {
+    let sql = r#"SELECT "typeID", "stationID" AS "rentedFromID", "startDate",
+                  "rentPeriodInDays", "slotNumber" AS "flag", "periodCost", "balanceDueDate"
+             FROM "rentalInfo" WHERE "renterID" = $1 AND "renterID">0 ORDER BY "stationID", "slotNumber""#;
     let corp = ctx.session.corp_id.unwrap_or(0) as i32;
-    let header = ["typeID", "rentedFromID", "startDate", "rentPeriodInDays", "flag"];
-    ctx.rowset(&header, &sql, &[&corp]).await
+    let header = ["typeID", "rentedFromID", "startDate", "rentPeriodInDays", "flag", "periodCost", "balanceDueDate"];
+    // Earlier builds created offices without rentalInfo. Preserve existing
+    // history while linking those offices under the station rental lock.
+    let stations=ctx.db.query(r#"SELECT DISTINCT "stationID" FROM "crpOffices" WHERE "corporationID"=$1 AND "rentalSlot" IS NULL ORDER BY 1"#,&[&corp]).await?;
+    if !stations.is_empty() {
+        let mut db=crate::db::connect(ctx.db_url).await?;let tx=db.transaction().await?;
+        for row in stations {
+            let station:i32=row.get(0);
+            if tx.query_opt(r#"SELECT 1 FROM "staStations" WHERE "stationID"=$1 FOR UPDATE"#,&[&station]).await?.is_some() {
+                ensure_office_slots_locked(&tx,station).await?;
+            }
+        }
+        tx.commit().await?;
+    }
+    Ok(rowset(&header,lines(&ctx.db.query(sql,&[&corp]).await?)))
 }
 
 /// SQL restricting entity `e` to one kind of corporation asset; $1 is the corp.
 fn asset_scope(which: &str) -> Option<String> {
     Some(match which {
-        "offices" => r#"e."locationID" IN (SELECT "itemID" FROM "crpOffices" WHERE "corporationID" = $1)"#.into(),
+        "offices" => r#"e."ownerID"=$1 AND e."locationID" IN (SELECT "itemID" FROM "crpOffices" WHERE "corporationID" = $1)"#.into(),
         "property" => format!(
             r#"e."ownerID" = $1 AND e."flag" <> {FLAG_CORP_MARKET}
-               AND e."locationID" IN (SELECT "stationID" FROM "staStations")"#
+               AND e."locationID" IN (SELECT "solarSystemID" FROM "mapSolarSystems")"#
         ),
         "deliveries" => format!(r#"e."ownerID" = $1 AND e."flag" = {FLAG_CORP_MARKET}"#),
         _ => return None, // "junk", "jobs": nothing tracks these yet
     })
+}
+
+async fn search_assets(ctx:&Ctx<'_>,call:&Call)->Value {
+    let empty=||rowset(&["locationID"],vec![]);
+    let Some(corp)=ctx.session.corp_id else {return empty()};
+    let Some(scope)=asset_scope(&call.arg_text(0).unwrap_or_default()) else {return empty()};
+    let criterion=|i|call.arg_i64(i).and_then(|n|i32::try_from(n).ok()).filter(|n|*n>0);
+    let category=criterion(1);let group=criterion(2);let ty=criterion(3);let quantity=criterion(4).unwrap_or(0);
+    if category.is_none() && group.is_none() && ty.is_none() {return empty()}
+    let sql=format!(r#"SELECT DISTINCT COALESCE(o."stationID",e."locationID") AS "locationID" FROM entity e
+      JOIN "invTypes" t ON t."typeID"=e."typeID" JOIN "invGroups" g ON g."groupID"=t."groupID"
+      LEFT JOIN "crpOffices" o ON o."itemID"=e."locationID" AND o."corporationID"=$1
+      WHERE {scope} AND ($2::integer IS NULL OR g."categoryID"=$2) AND ($3::integer IS NULL OR t."groupID"=$3)
+        AND ($4::integer IS NULL OR e."typeID"=$4) AND e.quantity>=$5 ORDER BY 1"#);
+    ctx.rowset(&["locationID"],&sql,&[&(corp as i32),&category,&group,&ty,&quantity]).await
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+    fn locations(value:Value)->Vec<i64> {
+        match value {Value::Instance {state,..}=>state.get_str("lines").and_then(Value::seq).unwrap_or(&[]).iter().filter_map(|line|line.seq()?.first()?.as_i64()).collect(),_=>vec![]}
+    }
+    #[tokio::test]
+    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
+    async fn corporation_asset_search_filters_owned_items_and_reports_office_stations() {
+        let fixture=crate::test_support::Database::load().await;let corp=fixture.id().await;let office=fixture.id().await;
+        fixture.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName") VALUES ($1,$2)"#,&[&corp,&format!("Asset corporation {corp}")]).await.unwrap();
+        fixture.db.execute(r#"INSERT INTO "crpOffices" ("corporationID","stationID","officeFolderID","itemID") VALUES ($1,60000004,$2,$2)"#,&[&corp,&office]).await.unwrap();
+        fixture.db.execute(r#"INSERT INTO entity ("typeID","ownerID","locationID",quantity,flag) VALUES (34,$1,$2,5,4),(35,1,$2,100,4),(34,$1,30000142,9,0)"#,&[&corp,&office]).await.unwrap();
+        let session=crate::session::Session {corp_id:Some(corp as i64),roles_at_all:1,..Default::default()};let ctx=fixture.ctx(&session);
+        let mut call=Call {service:"corpmgr".into(),method:"SearchAssets".into(),args:vec![Value::bytes("offices"),Value::None,Value::None,Value::Int(34),Value::Int(5)],kwargs:vec![]};
+        assert_eq!(locations(search_assets(&ctx,&call).await),vec![60000004]);
+        call.args[4]=Value::Int(6);assert!(locations(search_assets(&ctx,&call).await).is_empty());
+        call.args[3]=Value::Int(35);assert!(locations(search_assets(&ctx,&call).await).is_empty());
+        call.args[0]=Value::bytes("property");call.args[3]=Value::Int(34);assert_eq!(locations(search_assets(&ctx,&call).await),vec![30000142]);
+    }
 }
 
 async fn asset_locations(ctx: &Ctx<'_>, corp: i32, which: &str) -> Value {
@@ -359,8 +410,9 @@ fn role_text(name: &str) -> Option<(String, String)> {
             ("Factory Manager", "May rent and operate the corporation's factory slots")
         }
         "corpRoleStationManager" => {
-            ("Station Manager", "May rent offices and manage the corporation's stations")
+            ("Station Manager", "May manage the corporation's stations")
         }
+        "corpRoleCanRentOffice" => ("Rent Office", "May rent offices for the corporation"),
         "corpRoleAuditor" => ("Auditor", "May read the corporation's member audit log"),
         _ => return None,
     };
@@ -482,10 +534,14 @@ async fn npc_divisions(ctx: &Ctx<'_>) -> Value {
 }
 
 async fn employment_record(ctx: &Ctx<'_>, char_id: i64) -> Value {
-    const HEADER: &[&str] = &["corporationID", "startDate"];
-    let sql = r#"SELECT "corporationID","startDate" FROM "chrEmployment"
-                  WHERE "characterID" = $1 AND "deleted" = 0
-                  ORDER BY "startDate" DESC"#;
+    // `deleted` is whether the corporation has closed: the info window marks
+    // it so (infosvc.py GetEmploymentHistorySubContent).
+    const HEADER: &[&str] = &["corporationID", "startDate", "deleted"];
+    let sql = r#"SELECT e."corporationID", e."startDate", COALESCE(c."deleted", 0)::int
+                   FROM "chrEmployment" e
+                   LEFT JOIN "corporation" c ON c."corporationID" = e."corporationID"
+                  WHERE e."characterID" = $1 AND e."deleted" = 0
+                  ORDER BY e."startDate" DESC"#;
     ctx.rowset(HEADER, sql, &[&(char_id as i32)]).await
 }
 
@@ -619,7 +675,7 @@ async fn corp_station_mgr(
     let out = match method {
         "GetCorporateStationInfo" => corporate_station_info(ctx, station).await,
 
-        "GetQuoteForRentingAnOffice" => office_rental_cost(ctx, station).await,
+        "GetQuoteForRentingAnOffice" => return offices::quote(ctx,station,args).await,
 
         "DoesPlayersCorpHaveJunkAtStation" => Value::Int(0),
         "GetQuoteForGettingCorpJunkBack" => Value::Double(0.0),
@@ -636,10 +692,7 @@ async fn corp_station_mgr(
 
         "SetCloneTypeID" => return crate::svc::medical::set_clone_type(ctx, arg0.unwrap_or(0)).await,
         "SetHomeStation" => return crate::svc::medical::set_home_station(ctx, arg0.unwrap_or(0)).await,
-        "RentOffice" => {
-            let quoted = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
-            return rent_office(ctx, station, quoted).await;
-        }
+        "RentOffice" => return offices::rent(ctx,station,args).await,
 
         _ => return Outcome::Unknown(format!("corpStationMgr::{method}")),
     };
@@ -709,96 +762,6 @@ async fn eve_owners_by_id(ctx: &Ctx<'_>, ids: &[i32]) -> Value {
            AND COALESCE(NULLIF(o."typeID", 0), NULLIF(c."typeID", 0), bt."typeID",
                         CASE WHEN co."corporationID" IS NOT NULL THEN 2 END) IS NOT NULL"#;
     ctx.rowset(HEADER, SQL, &[&ids]).await
-}
-
-async fn office_rental_cost(ctx: &Ctx<'_>, station: i64) -> Value {
-    let sql = r#"SELECT "officeRentalCost"::double precision
-                   FROM "staStations" WHERE "stationID" = $1"#;
-    match ctx.db.query(sql, &[&(station as i32)]).await {
-        Ok(rows) => match rows.first() {
-            Some(r) => Value::Double(r.try_get::<_, Option<f64>>(0).ok().flatten().unwrap_or(0.0)),
-            None => Value::Double(0.0),
-        },
-        Err(e) => {
-            error!("GetQuoteForRentingAnOffice({station}): {err}", err = crate::logging::chain(&e));
-            Value::Double(0.0)
-        }
-    }
-}
-
-/// cfg.IsNPC: IDs below this are NPC owners.
-const FIRST_PLAYER_ID: i64 = 100_000_000;
-const TYPE_OFFICE: i32 = 27;
-
-/// RentOffice(cost): the caller's corporation takes an office here, paid from
-/// the corp wallet. Every member online hears OnOfficeRentalChanged(corpID,
-/// officeID, folderID) (bco_locations.py:200); the caller gets the officeID
-/// (lobby.py:461).
-async fn rent_office(ctx: &Ctx<'_>, station: i64, quoted: f64) -> Outcome {
-    use crate::session::CORP_ROLE_DIRECTOR;
-    use crate::svc::wallet::{move_cash, Payment, Transfer, REF_OFFICE_RENTAL_FEE};
-
-    let Some(corp_id) = ctx.session.corp_id else { return Outcome::custom("You are not in a corporation.") };
-    if corp_id < FIRST_PLAYER_ID {
-        return Outcome::custom("NPC corporations cannot rent offices.");
-    }
-    if !ctx.session.has_corp_role(CORP_ROLE_DIRECTOR) {
-        return Outcome::custom("Only a director of your corporation can rent an office.");
-    }
-    let cost = office_rental_cost(ctx, station).await.as_f64().unwrap_or(0.0);
-    if (cost - quoted).abs() > 0.5 {
-        return Outcome::custom("The rent here has changed; please try again.");
-    }
-
-    // Claim the office first, so two directors cannot both pay for one.
-    let claim = r#"
-        WITH office AS (
-            INSERT INTO "crpOffices" ("corporationID","stationID","itemID","typeID","officeFolderID")
-            SELECT $1, $2, nextval('dyn_id_seq'), $3, nextval('office_folder_seq')
-             WHERE NOT EXISTS (SELECT 1 FROM "crpOffices" WHERE "corporationID" = $1 AND "stationID" = $2)
-            RETURNING "itemID","officeFolderID"
-        ),
-        item AS (
-            INSERT INTO entity ("itemID","itemName","typeID","ownerID","locationID","flag",
-                                "contraband","singleton","quantity","x","y","z","customInfo")
-            SELECT "itemID", '', $3, $1, $2, 0, 0, 1, 1, 0, 0, 0, NULL FROM office
-        )
-        SELECT "itemID","officeFolderID" FROM office"#;
-    let Some(r) = ctx.query_one(claim, &[&(corp_id as i32), &(station as i32), &TYPE_OFFICE]).await else {
-        return Outcome::custom("Your corporation already has an office here.");
-    };
-    let office_id = int(&r, 0).unwrap_or(0);
-    let folder_id = int(&r, 1).unwrap_or(0);
-
-    let payment = Payment {
-        payer: corp_id,
-        payee: None,
-        amount: cost,
-        ref_type: REF_OFFICE_RENTAL_FEE,
-        arg_id1: "",
-        reason: "",
-    };
-    let refused = match move_cash(ctx.db_url, payment).await {
-        Ok(()) => None,
-        Err(Transfer::NotEnough { need, have }) => Some(Outcome::not_enough_money(need, have)),
-        Err(Transfer::NoSuchOwner) => Some(Outcome::custom("Your corporation has no wallet.")),
-        Err(Transfer::Db(e)) => {
-            error!("office rent for {corp_id} at {station}: {}", crate::logging::chain(&e));
-            Some(Outcome::custom("The rent could not be paid."))
-        }
-    };
-    if let Some(refused) = refused {
-        let release = r#"WITH office AS (DELETE FROM "crpOffices" WHERE "itemID" = $1)
-                         DELETE FROM entity WHERE "itemID" = $1"#;
-        ctx.execute(release, &[&(office_id as i32)]).await;
-        return refused;
-    }
-
-    info!("corporation {corp_id} rented office {office_id} at station {station} for {cost:.0} ISK");
-    let world = ctx.world.lock();
-    let event = Value::Tuple(vec![Value::Int(corp_id), Value::Int(office_id), Value::Int(folder_id)]);
-    world.notify(&world.corp_members(corp_id), "OnOfficeRentalChanged", event);
-    Outcome::Value(Value::Int(office_id))
 }
 
 async fn potential_home_stations(ctx: &Ctx<'_>, station: i64) -> Value {

@@ -206,7 +206,8 @@ pub async fn retract(ctx: &Ctx<'_>, declarer: i64, war_id: i64) -> Refused<Value
 
 /// A war surrendered in a CEO trade (svc/pvptrade.rs): it ends as a
 /// retracted one does, a day later, and its unpaid bill is forgiven.
-pub async fn surrender(world: &World, db: &impl GenericClient, war_id: i64) -> Refused<()> {
+pub async fn prepare_surrender(db: &tokio_postgres::Transaction<'_>, war_id: i64) -> Refused<(i64,i64,Value)> {
+    db.query_opt(r#"SELECT "warID" FROM "crpWars" WHERE "warID"=$1 FOR UPDATE"#,&[&(war_id as i32)]).await.map_err(|e|db_failed("locking the war",e))?;
     let old = war_line(db, war_id).await?.ok_or_else(|| Outcome::custom("There is no such war."))?;
     if old[5] != Value::None {
         return Err(message("CanNotSurrenderAsWarIsOver"));
@@ -215,15 +216,19 @@ pub async fn surrender(world: &World, db: &impl GenericClient, war_id: i64) -> R
     db.execute(r#"UPDATE "crpWars" SET "retracted" = $2, "timeFinished" = $3 WHERE "warID" = $1"#, &[&(war_id as i32), &now, &(now + DAY)])
         .await
         .map_err(|e| db_failed("ending the war", e))?;
-    forgive_bill(db, war_id).await;
+    db.execute(r#"DELETE FROM "billsReceivable" WHERE "billTypeID"=$1 AND "externalID"=$2 AND paid=0"#,&[&BILL_TYPE_WAR,&(war_id as i32)]).await.map_err(|e|db_failed("forgiving the war bill",e))?;
     let mut new = old.clone();
     new[4] = Value::Long(now + DAY);
     new[5] = Value::Long(now);
     let (declarer, against) = (old[1].as_i64().unwrap_or(0), old[2].as_i64().unwrap_or(0));
+    Ok((declarer,against,change(WAR_HEADER, Some(&old), Some(&new))))
+}
+
+pub async fn announce_surrender(world:&World,db:&impl GenericClient,war_id:i64,event:(i64,i64,Value)) {
+    let (declarer,against,changes)=event;
     info!("war {war_id} of {declarer} on {against} ends in surrender");
-    tell_war(world, db, war_id, declarer, against, change(WAR_HEADER, Some(&old), Some(&new))).await;
+    tell_war(world, db, war_id, declarer, against, changes).await;
     refresh(db).await;
-    Ok(())
 }
 
 /// The two sides of a war that has not ended: (declarer, against).

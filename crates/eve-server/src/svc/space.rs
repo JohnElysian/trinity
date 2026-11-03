@@ -25,6 +25,9 @@ const GROUP_STATION: i64 = 15;
 const CELESTIAL_GROUPS: [i32; 6] = [6, 7, 8, 9, 10, 15];
 /// WarpToStuff without minRange (menusvc's default warp-to distance).
 const DEFAULT_WARP_RANGE: f64 = 15_000.0;
+/// Trinity const.minWarpDistance / const.maxWarpEndDistance.
+const MIN_WARP_DISTANCE: f64 = 150_000.0;
+const MAX_WARP_RANGE: f64 = 100_000.0;
 /// The menu's "approach" with no range (menusvc.py:1598 `range or 50`).
 const DEFAULT_FOLLOW_RANGE: f64 = 50.0;
 /// How far from their own ship a pilot sees other ships: their grid. The
@@ -39,6 +42,7 @@ const GRID_RANGE_OUT: f64 = 330_000.0;
 /// The `ship` service. Undock and Board change the session, so the connection
 /// handles them.
 pub async fn ship(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
+    if let Some(result) = crate::svc::maintenance::handle(call, ctx).await { return Some(result); }
     match call.method.as_str() {
         "AssembleShip" => {
             let ids = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]);
@@ -79,11 +83,22 @@ pub async fn beyonce(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             push_set_state(ctx).await;
             Value::None
         }
-        "GetGangState" => Value::None,
+        "GetGangState" => key_val(vec![("targetTags", Value::Dict(Vec::new()))]),
+        // This node admits jumps immediately; there are no queued systems.
+        "GetJumpQueueStatus" => Value::Dict(Vec::new()),
+        "GetGangLocationAndInfo" => crate::svc::fleet::location_info(&ctx.world.lock(), ctx.session.char_id.unwrap_or(0)),
+        "GangRegroup" => return Some(crate::svc::fleet::regroup(&mut ctx.world.lock(), ctx.session.char_id.unwrap_or(0))
+            .map_or_else(|e| e, Outcome::Value)),
         "ConeScan" | "GetScans" | "CombineScans" | "GiveProbe" => return crate::svc::scan::beyonce(call, ctx).await,
         // BridgeToMember(charID, beaconID, solarsystemID): a titan's portal.
         "BridgeToMember" => {
             return Some(match crate::svc::jumps::open_bridge(ctx, call.arg_id(0), call.arg_id(1), call.arg_id(2)).await {
+                Ok(()) => Outcome::Value(Value::None),
+                Err(why) => Outcome::custom(why),
+            })
+        }
+        "BridgeToStructure" => {
+            return Some(match crate::svc::jumps::open_bridge_structure(ctx, call.arg_id(0), call.arg_id(1)).await {
                 Ok(()) => Outcome::Value(Value::None),
                 Err(why) => Outcome::custom(why),
             })
@@ -110,6 +125,14 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
         return;
     }
     let celestials = load_celestials(ctx, solar_system_id).await;
+    let launched_drones = crate::drones::load(ctx, solar_system_id).await.unwrap_or_else(|e| {
+        warn!("drones in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
+        Vec::new()
+    });
+    let empty_ships = super::embark::load_empty(ctx, solar_system_id).await.unwrap_or_else(|e| {
+        warn!("empty ships in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
+        Vec::new()
+    });
     let now = crate::combat::now_ms();
     if let Err(e) = crate::loot::ensure_table(ctx.db).await {
         warn!("no loot table: {}", crate::logging::chain(&e));
@@ -136,16 +159,25 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
         .and_then(|r| text(&r, 0))
         .map(|n| n.split_whitespace().next().unwrap_or("Pirate").trim_end_matches("'s").to_string())
         .unwrap_or_else(|| "Pirate".into());
+    let created = {
     let mut world = ctx.world.lock();
-    world.parks.entry(solar_system_id).or_insert_with(|| {
+    if let std::collections::hash_map::Entry::Vacant(entry) = world.parks.entry(solar_system_id) {
         let mut park = Park::new(solar_system_id, celestials, destiny::tick_now());
         park.wildlife = std::sync::Arc::new(wildlife);
         crate::npc::populate(&mut park);
+        park.ships.extend(empty_ships.into_iter().map(|ship| (ship.id, ship)));
         park.cans = cans.into_iter().map(|c| (c.id, c)).collect();
         park.structures = structures.into_iter().map(|s| (s.id, s)).collect();
         crate::complexes::place(&mut park, complexes, &faction);
-        park
-    });
+        entry.insert(park);
+        true
+    } else {false}
+    };
+    if created {
+        if let Err(e)=crate::drones::install(ctx,solar_system_id,launched_drones).await {
+            warn!("restoring drones in {solar_system_id}: {}",crate::logging::chain(&e));
+        }
+    }
 }
 
 async fn load_celestials(ctx: &Ctx<'_>, solar_system_id: i64) -> Vec<Celestial> {
@@ -210,8 +242,28 @@ pub fn send(world: &WorldState, solar_system_id: i64, clients: &[i64], entries: 
             continue;
         };
         if !mine.is_empty() {
-            world.notify(&[client], "DoDestinyUpdate", Value::Tuple(vec![Value::List(mine), Value::Int(0)]));
+            let (event,args)=destiny_notification(mine);
+            world.notify(&[client],event,args);
         }
+    }
+}
+
+/// michelle.DoDestinyUpdate checks that every action has the same stamp.
+/// Keep causal order while splitting at stamp boundaries; the plural envelope
+/// is explicitly supported by DoDestinyUpdates for these ordered sub-batches.
+pub(crate) fn destiny_notification(entries:Vec<Value>) -> (&'static str,Value) {
+    let mut batches:Vec<Vec<Value>>=Vec::new();
+    let mut previous:Option<Value>=None;
+    for entry in entries {
+        let stamp=entry.seq().and_then(|e|e.first()).cloned();
+        if batches.is_empty() || stamp!=previous { batches.push(Vec::new()); previous=stamp; }
+        batches.last_mut().unwrap().push(entry);
+    }
+    let envelope=|batch|Value::Tuple(vec![Value::List(batch),Value::Int(0)]);
+    if batches.len()==1 {
+        ("DoDestinyUpdate",envelope(batches.pop().unwrap()))
+    } else {
+        ("DoDestinyUpdates",Value::Tuple(vec![Value::List(batches.into_iter().map(envelope).collect())]))
     }
 }
 
@@ -251,13 +303,38 @@ fn slim_id(slim: &Value) -> Option<i64> {
     }
 }
 
+fn references_hidden(opcode:&[u8],args:&[Value],hidden:&HashSet<i64>) -> bool {
+    let hidden_arg=|i|args.get(i).and_then(Value::as_i64).is_some_and(|id|hidden.contains(&id));
+    hidden_arg(0) || match opcode {
+        b"OnSpecialFX"=>hidden_arg(3),
+        b"FollowBall" | b"Orbit"=>hidden_arg(1),
+        _=>false,
+    }
+}
+
+fn course_target(ship:&Ship) -> Option<i64> {
+    match ship.command {Command::Follow {target,..}|Command::Orbit {target,..}=>Some(target),_=>None}
+}
+
+/// Extrapolate the visible ship's current motion without disclosing or
+/// referencing a target ball that the observer does not have.
+fn untargeted_course(ship:&Ship,tick:i64) -> Value {
+    let direction=ship.vel.unit();
+    if direction==Vec3::ZERO {entry(tick,"Stop",vec![Value::Int(ship.id)])}
+    else {entry(tick,"GotoDirection",vec![Value::Int(ship.id),Value::Double(direction.x),Value::Double(direction.y),Value::Double(direction.z)])}
+}
+
+fn course_for_view(ship:&Ship,tick:i64,hidden:&HashSet<i64>) -> Vec<Value> {
+    if course_target(ship).is_some_and(|id|hidden.contains(&id)) {vec![untargeted_course(ship,tick)]}
+    else {snapshot_course_entries(ship,tick)}
+}
+
 /// One destiny entry as a client with `hidden` ships is to get it, if at all.
 /// An AddBalls for a single ship decides whether the client has it; a
 /// RemoveBalls loses the ships it never had; anything else about a hidden ship
 /// is dropped.
 fn sift(e: &Value, park: Option<&Park>, ego: Option<&Ship>, hidden: &mut HashSet<i64>) -> Option<Value> {
     let Some((opcode, args)) = parts(e) else { return Some(e.clone()) };
-    let arg_id = |i: usize| args.get(i).and_then(Value::as_i64);
     match opcode {
         b"SetState" => Some(e.clone()),
         b"AddBalls" => {
@@ -295,8 +372,13 @@ fn sift(e: &Value, park: Option<&Park>, ego: Option<&Ship>, hidden: &mut HashSet
                 ]))
             }
         }
-        b"OnSpecialFX" if arg_id(3).is_some_and(|t| hidden.contains(&t)) => None,
-        _ if arg_id(0).is_some_and(|id| hidden.contains(&id)) => None,
+        b"FollowBall" | b"Orbit" if !args.first().and_then(Value::as_i64).is_some_and(|id|hidden.contains(&id))
+            && args.get(1).and_then(Value::as_i64).is_some_and(|id|hidden.contains(&id)) => {
+            let ship=park?.ships.get(&args.first()?.as_i64()?)?;
+            let tick=e.seq()?.first()?.as_i64()?;
+            Some(untargeted_course(ship,tick))
+        }
+        _ if references_hidden(opcode,args,hidden) => None,
         _ => Some(e.clone()),
     }
 }
@@ -311,42 +393,50 @@ pub fn refresh_views(world: &WorldState) {
         }
         for client in world.in_space(park.solar_system_id) {
             let Some(me) = ego_of(park, client) else { continue };
-            let mut entries = Vec::new();
-            let mut gone = Vec::new();
-            world.with_hidden(client, |hidden| {
-                hidden.retain(|id| park.ships.contains_key(id));
-                for s in park.ships.values().filter(|s| s.id != me.id && !s.cloaked) {
-                    let shown = !hidden.contains(&s.id);
-                    match (shown, on_grid(me, s, shown)) {
-                        (false, true) => {
-                            hidden.remove(&s.id);
-                            entries.extend(add_ball_entries(park, s.id));
-                        }
-                        (true, false) => {
-                            hidden.insert(s.id);
-                            gone.push(Value::Int(s.id));
-                        }
-                        _ => {}
-                    }
-                }
-            });
-            if !gone.is_empty() {
-                entries.insert(0, entry(park.tick, "RemoveBalls", vec![Value::List(gone)]));
-            }
+            let entries=world.with_hidden(client,|hidden|refresh_view_entries(park,me,hidden)).unwrap_or_default();
             if !entries.is_empty() {
-                world.notify(&[client], "DoDestinyUpdate", Value::Tuple(vec![Value::List(entries), Value::Int(0)]));
+                let (event,args)=destiny_notification(entries);
+                world.notify(&[client],event,args);
             }
         }
     }
 }
 
+fn refresh_view_entries(park:&Park,me:&Ship,hidden:&mut HashSet<i64>) -> Vec<Value> {
+    let mut gone=Vec::new();
+    let mut arrived=Vec::new();
+    hidden.retain(|id|park.ships.contains_key(id));
+    for ship in park.ships.values().filter(|s|s.id!=me.id && !s.cloaked) {
+        let shown=!hidden.contains(&ship.id);
+        match (shown,on_grid(me,ship,shown)) {
+            (false,true)=>{hidden.remove(&ship.id);arrived.push(ship.id);}
+            (true,false)=>{hidden.insert(ship.id);gone.push(Value::Int(ship.id));}
+            _=>{}
+        }
+    }
+    let mut entries=Vec::new();
+    if !gone.is_empty() {entries.push(entry(park.tick,"RemoveBalls",vec![Value::List(gone)]));}
+    entries.extend(add_many_ball_entries(park,&arrived).into_iter().filter_map(|e|sift(&e,Some(park),Some(me),hidden)));
+    // A follower can remain visible while its target leaves or returns.
+    // Restore it after all incoming targets have been added, even though the
+    // follower itself did not cross the grid boundary.
+    for ship in park.ships.values().filter(|s|!hidden.contains(&s.id) && !arrived.contains(&s.id)) {
+        if course_target(ship).is_some_and(|id|hidden.contains(&id) || arrived.contains(&id)) {
+            entries.extend(course_for_view(ship,park.tick,hidden));
+        }
+    }
+    entries
+}
+
 fn ship_ball(ship: &Ship) -> Ball {
+    let warp = ship.warp_snapshot();
     Ball {
         id: ship.id,
-        mode: mode::STOP,
+        mode: if warp.is_some() { mode::WARP } else { mode::STOP },
+        warp,
         radius: ship.stats.radius,
         pos: ship.pos.tuple(),
-        flags: if ship.in_warp() { flags::SHIP_IN_WARP } else { flags::SHIP },
+        flags: if ship.massive() { flags::SHIP } else { flags::SHIP_IN_WARP },
         mass: ship.stats.mass,
         corp_id: ship.pilot.corp_id as i32,
         alliance_id: ship.pilot.alliance_id.unwrap_or(-1) as i32,
@@ -368,7 +458,7 @@ pub fn slim(fields: Vec<(&str, Value)>) -> Value {
 }
 
 /// groupID/categoryID are left out on purpose: the client derives them from typeID.
-fn ship_slim(ship: &Ship) -> Value {
+pub(crate) fn ship_slim(ship: &Ship) -> Value {
     let p = &ship.pilot;
     // An NPC belongs to its corporation and has no pilot to show.
     if ship.is_npc() {
@@ -392,7 +482,9 @@ fn ship_slim(ship: &Ship) -> Value {
         ("itemID", Value::Int(ship.id)),
         ("typeID", Value::Int(p.type_id)),
         ("ownerID", Value::Int(p.char_id)),
-        ("charID", Value::Int(p.char_id)),
+        // uix.GetSlimItemName and michelle.AddBalls distinguish an empty hull
+        // by charID=None; ownership survives the pilot leaving it.
+        ("charID", if ship.unpiloted { Value::None } else { Value::Int(p.char_id) }),
         ("corpID", Value::Int(p.corp_id)),
         ("allianceID", Value::int_or_none(p.alliance_id)),
         // consider.py rounds it; it must be a number.
@@ -473,6 +565,13 @@ pub fn course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
     vec![command_entry(ship, tick), speed]
 }
 
+/// WARP snapshots already restore the entire native course, including its
+/// entry tick. WarpTo here would overwrite that tick with the alignment
+/// sentinel -1 and restart a ship that is already in flight.
+fn snapshot_course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
+    if ship.warp_snapshot().is_some() { Vec::new() } else { course_entries(ship, tick) }
+}
+
 /// SetState for `ego`: the whole park, then every moving ship's course.
 pub fn set_state_entries(
     park: &Park,
@@ -480,9 +579,10 @@ pub fn set_state_entries(
     hidden: &HashSet<i64>,
     station_owners: &[(i64, i64)],
     char_gangs: &[(i64, i64)],
+    alliance_bridges: &[(i64, i64, i64)],
 ) -> Vec<Value> {
     const DRONE_HEADER: &[&str] =
-        &["droneID", "ownerID", "controllerID", "activityState", "typeID", "controllerOwnerID"];
+        &["droneID", "ownerID", "controllerID", "activityState", "typeID", "controllerOwnerID", "targetID"];
     let mut balls: Vec<Ball> = park
         .celestials
         .iter()
@@ -542,14 +642,20 @@ pub fn set_state_entries(
             Value::List(char_gangs.iter().map(|(c, g)| Value::Tuple(vec![Value::Int(*c), Value::Int(*g)])).collect()),
         ),
         ("damageState", Value::Dict(damage)),
-        ("effectStates", Value::List(Vec::new())),
-        // Trinity's alliance jump bridges active in the system, as
-        // (shipID, toSolarsystemID, toBeaconID) (michelle.py SetState): none.
-        ("allianceBridges", Value::List(Vec::new())),
+        ("effectStates", Value::List(park.ships.values()
+            .filter(|s|(!s.cloaked || s.id==ego) && !hidden.contains(&s.id))
+            .flat_map(|s|module_effect_entries(s,park.tick))
+            .filter_map(|e| {
+                let (op,args)=parts(&e)?;
+                (!references_hidden(op,args,hidden)).then(||Value::Tuple(args.to_vec()))
+            }).collect())),
+        // michelle.py restores these when entering a park or resetting it.
+        ("allianceBridges", Value::List(alliance_bridges.iter().map(|(ship,system,beacon)|
+            Value::Tuple(vec![Value::Int(*ship),Value::Int(*system),Value::Int(*beacon)])).collect())),
     ]);
     let mut entries = vec![entry(park.tick, "SetState", vec![bag])];
-    for ship in park.ships.values().filter(|s| !hidden.contains(&s.id)) {
-        entries.extend(course_entries(ship, park.tick));
+    for ship in park.ships.values().filter(|s| (!s.cloaked || s.id==ego) && !hidden.contains(&s.id)) {
+        entries.extend(course_for_view(ship,park.tick,hidden));
     }
     // Reset mid-warp: the pilot's tunnel goes on.
     entries.extend(park.ships.get(&ego).and_then(|s| warp_fx(s, park.tick)));
@@ -566,8 +672,31 @@ pub fn add_ball_entries(park: &Park, ship_id: i64) -> Vec<Value> {
         Value::Dict(vec![(Value::Int(ship.id), health(ship))]),
     ]);
     let mut entries = vec![entry(park.tick, "AddBalls", vec![chunk])];
-    entries.extend(course_entries(ship, park.tick));
+    entries.extend(snapshot_course_entries(ship, park.tick));
+    entries.extend(module_effect_entries(ship,park.tick));
+    entries.extend(warp_fx(ship, park.tick));
     entries
+}
+
+/// Reuse the ordinary module effect wire arguments so a new observer or a
+/// reset restores the original target and cycle start, not a fresh cycle.
+fn module_effect_entries(ship:&Ship,tick:i64) -> Vec<Value> {
+    ship.fight.iter().flat_map(|f|&f.modules).filter(|m|!m.guid.is_empty())
+        .map(|m|crate::fight::module_fx(tick,ship.id,m,true)).collect()
+}
+
+/// Add every newly visible ball before restoring any course: FollowBall and
+/// Orbit may refer to another ship that entered the grid in the same pulse.
+fn add_many_ball_entries(park:&Park,ships:&[i64]) -> Vec<Value> {
+    let mut additions=Vec::new();
+    let mut updates=Vec::new();
+    for id in ships {
+        let mut entries=add_ball_entries(park,*id).into_iter();
+        additions.extend(entries.next());
+        updates.extend(entries);
+    }
+    additions.extend(updates);
+    additions
 }
 
 pub fn remove_ball_entries(tick: i64, ship_id: i64) -> Vec<Value> {
@@ -622,7 +751,8 @@ pub fn add_ship(world: &mut WorldState, system: i64, ship: Ship) {
 pub fn order(world: &mut WorldState, system: i64, ship_id: i64, command: Command) {
     let Some(park) = world.parks.get_mut(&system) else { return };
     park.advance(destiny::tick_now());
-    if !park.ships.contains_key(&ship_id) {
+    if !park.ships.get(&ship_id).is_some_and(|ship| !ship.identity_reserved && !ship.in_warp()
+        && crate::ballpark::valid_command(ship_id,ship.pos,&command)) {
         return;
     }
     let tick = park.tick;
@@ -640,6 +770,7 @@ pub fn order(world: &mut WorldState, system: i64, ship_id: i64, command: Command
 /// Takes a ship out of its system's park, out of everyone's view and out of
 /// every fight it was in; returns it.
 pub fn remove_ship(world: &mut WorldState, system: i64, ship_id: i64) -> Option<Ship> {
+    world.maintenance.remove(&ship_id);
     let park = world.parks.get_mut(&system)?;
     park.advance(destiny::tick_now());
     let mut out = crate::heartbeat::Out::default();
@@ -647,20 +778,22 @@ pub fn remove_ship(world: &mut WorldState, system: i64, ship_id: i64) -> Option<
     crate::fight::stand_down(park, ship_id, now, &mut out);
     let ship = crate::fight::detach(park, ship_id, now, &mut out)?;
     let entries = remove_ball_entries(park.tick, ship_id);
-    out.deliver(world);
+    let jobs=out.deliver(world);
+    world.pending_jobs.extend(jobs);
     let others: Vec<i64> = world.in_space(system).into_iter().filter(|c| *c != ship.client_id).collect();
     send(world, system, &others, &entries);
     Some(ship)
 }
 
 /// Queues a SetState for the caller's own ship.
-async fn push_set_state(ctx: &Ctx<'_>) {
+pub(crate) async fn push_set_state(ctx: &Ctx<'_>) {
     let (Some(system), Some(ship_id)) = (ctx.session.solar_system_id, ctx.session.ship_id) else {
         return;
     };
     ensure_park(ctx, system).await;
     let owners = station_owners(ctx, system).await;
     let mut world = ctx.world.lock();
+    crate::drones::reconcile(&mut world);
     let Some(park) = world.parks.get_mut(&system) else { return };
     park.advance(destiny::tick_now());
     if !park.ships.contains_key(&ship_id) {
@@ -672,7 +805,10 @@ async fn push_set_state(ctx: &Ctx<'_>) {
     let char_gangs = world.gangs.memberships(pilots);
     let Some(park) = world.parks.get(&system) else { return };
     let hidden = hidden_from(park, ship_id);
-    let mut entries = set_state_entries(park, ship_id, &hidden, &owners, &char_gangs);
+    let alliance_bridges: Vec<_> = world.bridges.iter().filter(|(id,b)| b.system==system && b.member.is_none()
+        && b.until_ms>crate::combat::now_ms() && park.ships.contains_key(id) && !hidden.contains(id))
+        .map(|(id,b)|(*id,b.to_system,b.beacon)).collect();
+    let mut entries = set_state_entries(park, ship_id, &hidden, &owners, &char_gangs, &alliance_bridges);
     let shown = park.ships.len() - hidden.len();
     world.with_hidden(ctx.client_id, |h| *h = hidden);
     if let Some(gate) = arrival {
@@ -681,6 +817,40 @@ async fn push_set_state(ctx: &Ctx<'_>) {
     debug!("SetState: {} ball(s), ego {ship_id}", park.celestials.len() + shown);
     broadcast(&world, system, Some(ctx.client_id), entries);
     world.sees(ctx.client_id, system);
+}
+
+/// A capacitor-limited warp can choose a shorter exit at entry. Rebuild the
+/// native state for every client that already has this park, preserving each
+/// observer's visibility and the original entry stamp/distance. Called only
+/// after releasing the simulation lock; no world lock spans database I/O.
+pub async fn resync_after_warp_limit(db: &tokio_postgres::Client, world: &crate::world::World, system: i64) {
+    let owners = match db.query(r#"SELECT "stationID","corporationID" FROM "staStations" WHERE "solarSystemID"=$1"#,
+        &[&(system as i32)]).await {
+        Ok(rows) => rows.iter().filter_map(|r|Some((int(r,0)?,int(r,1)?))).collect::<Vec<_>>(),
+        Err(error) => {
+            // A missing station label must not leave the client following the
+            // old, longer warp. The ordinary reset path also tolerates no owners.
+            warn!("warp resync station owners in {system}: {}",crate::logging::chain(&error));
+            Vec::new()
+        }
+    };
+    resync_warp_views(&world.lock(),system,&owners);
+}
+
+fn resync_warp_views(world: &WorldState, system: i64, owners: &[(i64,i64)]) {
+    let Some(park)=world.parks.get(&system) else { return };
+    let char_gangs=world.gangs.memberships(park.ships.values().filter(|s|s.is_pilot()).map(|s|s.pilot.char_id));
+    let now=crate::combat::now_ms();
+    for client in world.in_space(system) {
+        let Some(ego)=ego_of(park,client) else { continue };
+        let hidden=hidden_from(park,ego.id);
+        let bridges=world.bridges.iter().filter(|(id,b)|b.system==system && b.member.is_none()
+            && b.until_ms>now && park.ships.contains_key(id) && !hidden.contains(id))
+            .map(|(id,b)|(*id,b.to_system,b.beacon)).collect::<Vec<_>>();
+        let entries=set_state_entries(park,ego.id,&hidden,owners,&char_gangs,&bridges);
+        world.with_hidden(client,|h|*h=hidden);
+        send(world,system,&[client],&entries);
+    }
 }
 
 /// (diff, x, y, z, serverTick, tTime, rTime): where the server has the ship, and
@@ -726,19 +896,52 @@ async fn movement(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let (Some(system), Some(ship_id)) = (ctx.session.solar_system_id, ctx.session.ship_id) else {
         return Outcome::UserError { msg: "ShipNotYours".into(), args: Vec::new() };
     };
-    // Trinity's tutorial asks to warp a new pilot to their personal tutorial
-    // site (tutorialsvc.py WarpToTutorial: WarpToStuff('tutorial', None)).
-    // There is no such site here, and the tutorial it serves stands in for
-    // tutorial 109 with the 2006 station sequence (svc::tutorial), which needs
-    // none; staying put lets the tutorial carry on.
     if call.method == "WarpToStuff" && call.arg_text(0).as_deref() == Some("tutorial") {
-        tracing::debug!("WarpToStuff('tutorial'): no tutorial site, the ship stays");
-        return Outcome::Value(Value::None);
+        return Outcome::custom("Your personal tutorial site is not available.");
     }
     let Some(order) = parse_order(ctx, call).await else {
-        return Outcome::Unknown(format!("beyonce::{} with arguments it cannot use", call.method));
+        return Outcome::custom("Invalid movement command or unavailable destination.");
     };
+    if call.method == "WarpToStuff" {
+        let fleet = match call.kwarg("gang") {
+            None | Some(Value::Bool(false)) | Some(Value::Int(0)) => false,
+            Some(Value::Bool(true)) | Some(Value::Int(1)) => true,
+            _ => return Outcome::custom("Invalid fleet warp flag."),
+        };
+        if fleet { return gang_warp(ctx, system, ship_id, order, call); }
+    }
     steer(ctx, system, ship_id, order, &call.method)
+}
+
+fn gang_warp(ctx: &Ctx<'_>, system: i64, ship_id: i64, requested: Order, call: &Call) -> Outcome {
+    let Some(me) = ctx.session.char_id else { return Outcome::custom("No character selected."); };
+    let Order::Command(Command::Warp { target, range }) = requested else { return Outcome::custom("Invalid fleet warp destination."); };
+    let mut world = ctx.world.lock();
+    let Some(gang) = world.gangs.of(me).and_then(|id|world.gangs.get(id)) else {
+        return Outcome::custom("You are not in a fleet.");
+    };
+    let members = match &gang.fleet {
+        Some(fleet) => match fleet.warp_members(me) { Ok(members) => members, Err(error) => return error },
+        None if gang.leader == Some(me) => gang.members.clone(),
+        None => return Outcome::custom("Only the gang leader can order a gang warp."),
+    };
+    let Some(park) = world.parks.get_mut(&system) else { return Outcome::custom("Your ship is not in space."); };
+    park.advance(destiny::tick_now());
+    let Some(leader) = park.ships.get(&ship_id).filter(|s|s.pilot.char_id==me && s.client_id==ctx.client_id && s.is_player()) else {
+        return Outcome::UserError{msg:"ShipNotYours".into(),args:vec![]};
+    };
+    if leader.identity_reserved { return Outcome::custom("Your ship transfer is still in progress."); }
+    if leader.in_warp() { return Outcome::Value(Value::None); }
+    let end_range = call.kwarg("minRange").and_then(finite_number).unwrap_or(DEFAULT_WARP_RANGE);
+    let radius = (range - leader.stats.radius - end_range).max(0.0);
+    let courses:Vec<_> = park.ships.values().filter(|s| s.is_pilot() && members.contains(&s.pilot.char_id)
+        && on_grid(leader,s,false) && !s.identity_reserved && !s.in_warp()
+        && !s.fight.as_ref().is_some_and(|f|f.afflictions.scrambled>=1.0)
+        && (!s.cloaked || crate::cloak::warp_safe(park,s.id)!=Some(false)))
+        .filter_map(|ship|course_to(ship,target,radius,end_range).map(|course|(ship.id,course))).collect();
+    if courses.is_empty() { return Outcome::custom("No fleet ships here can warp to that destination."); }
+    for (id, course) in courses { order(&mut world,system,id,course); }
+    Outcome::Value(Value::None)
 }
 
 /// Warps the caller's ship to `range` off something at `at` of `radius`
@@ -747,10 +950,10 @@ pub fn warp_to_point(ctx: &Ctx<'_>, at: Vec3, radius: f64, range: f64, why: &str
     let (Some(system), Some(ship_id)) = (ctx.session.solar_system_id, ctx.session.ship_id) else {
         return Outcome::UserError { msg: "ShipNotYours".into(), args: Vec::new() };
     };
-    let Some(target) = landing_point(ctx, at, radius + range.max(0.0)) else {
-        return Outcome::custom("Your ship is not in space here.");
+    let Some(command) = warp_course(ctx, at, radius, range) else {
+        return Outcome::custom("The destination is unavailable or too close to warp to.");
     };
-    steer(ctx, system, ship_id, Order::Command(Command::Warp { target, range: 0.0 }), why)
+    steer(ctx, system, ship_id, Order::Command(command), why)
 }
 
 /// Flies the caller's ship straight to `at`.
@@ -764,6 +967,11 @@ pub fn approach_point(ctx: &Ctx<'_>, at: Vec3, why: &str) -> Outcome {
 /// Puts a movement order to a ship: the park follows it, and the system is told.
 fn steer(ctx: &Ctx<'_>, system: i64, ship_id: i64, order: Order, method: &str) -> Outcome {
     let mut world = ctx.world.lock();
+    if let Order::Command(Command::Follow { target, .. } | Command::Orbit { target, .. }) = &order {
+        if world.with_hidden(ctx.client_id, |hidden| hidden.contains(target)).unwrap_or(false) {
+            return Outcome::custom("That target is not visible in your ballpark.");
+        }
+    }
     let Some(park) = world.parks.get_mut(&system) else {
         return Outcome::Unknown(format!("beyonce::{method}: no ballpark for {system}"));
     };
@@ -771,6 +979,9 @@ fn steer(ctx: &Ctx<'_>, system: i64, ship_id: i64, order: Order, method: &str) -
     let tick = park.tick;
     match park.ships.get(&ship_id) {
         None => return Outcome::Unknown(format!("beyonce::{method}: ship {ship_id} is not in space")),
+        Some(ship) if Some(ship.pilot.char_id) != ctx.session.char_id || ship.client_id != ctx.client_id || !ship.is_player() =>
+            return Outcome::UserError { msg: "ShipNotYours".into(), args: Vec::new() },
+        Some(ship) if ship.identity_reserved => return Outcome::custom("Your ship transfer is still in progress."),
         // destiny ignores course changes mid-warp; so does the server.
         Some(ship) if ship.in_warp() => return Outcome::Value(Value::None),
         Some(ship)
@@ -783,6 +994,9 @@ fn steer(ctx: &Ctx<'_>, system: i64, ship_id: i64, order: Order, method: &str) -
             return Outcome::custom("Your cloaking device does not let you warp; deactivate it first.");
         }
         Some(_) => {}
+    }
+    if !valid_order(park, ship_id, &order) {
+        return Outcome::custom("Invalid movement command or unavailable destination.");
     }
     let (entries, what) = match order {
         Order::SpeedFraction(f) => {
@@ -811,9 +1025,9 @@ fn steer(ctx: &Ctx<'_>, system: i64, ship_id: i64, order: Order, method: &str) -
 }
 
 async fn parse_order(ctx: &Ctx<'_>, call: &Call) -> Option<Order> {
-    let f = |i: usize| call.args.get(i).and_then(|v| v.as_f64());
+    let f = |i: usize| call.args.get(i).and_then(finite_number);
     let vec3 = || Some(Vec3::new(f(0)?, f(1)?, f(2)?));
-    let range = |default: f64| f(1).unwrap_or(default).max(0.0);
+    let range = |default: f64| match call.args.get(1) { Some(v) => finite_number(v), None => Some(default) };
     Some(match call.method.as_str() {
         "SetSpeedFraction" => Order::SpeedFraction(f(0)?.clamp(0.0, 1.0)),
         "GotoDirection" => Order::Command(Command::Direction(vec3()?)),
@@ -821,42 +1035,73 @@ async fn parse_order(ctx: &Ctx<'_>, call: &Call) -> Option<Order> {
         "Stop" => Order::Command(Command::Stop),
         "FollowBall" => Order::Command(Command::Follow {
             target: call.arg_i64(0)?,
-            range: range(DEFAULT_FOLLOW_RANGE),
+            range: range(DEFAULT_FOLLOW_RANGE)?,
         }),
-        "Orbit" => Order::Command(Command::Orbit { target: call.arg_i64(0)?, range: range(0.0) }),
+        "Orbit" => Order::Command(Command::Orbit { target: call.arg_i64(0)?, range: range(0.0)? }),
         "WarpToStuff" => {
             let kind = call.arg_text(0)?;
             let id = call.arg_i64(1)?;
-            let range = call.kwarg("minRange").and_then(|v| v.as_f64()).unwrap_or(DEFAULT_WARP_RANGE);
+            let range = match call.kwarg("minRange") { Some(v) => finite_number(v)?, None => DEFAULT_WARP_RANGE };
             let (at, radius) = warp_target(ctx, &kind, id).await?;
-            Order::Command(Command::Warp { target: landing_point(ctx, at, radius + range.max(0.0))?, range: 0.0 })
+            Order::Command(warp_course(ctx, at, radius, range)?)
         }
         _ => return None,
     })
 }
 
+fn finite_number(value: &Value) -> Option<f64> {
+    value.as_f64().filter(|v| v.is_finite())
+}
+
+fn valid_order(park: &Park, ship_id: i64, order: &Order) -> bool {
+    let Some(ship) = park.ships.get(&ship_id) else { return false; };
+    match order {
+        Order::SpeedFraction(f) => f.is_finite() && (0.0..=1.0).contains(f),
+        Order::Command(command) => {
+            if !crate::ballpark::valid_command(ship_id, ship.pos, command) { return false; }
+            match command {
+                Command::Follow { target, .. } | Command::Orbit { target, .. } => {
+                    if let Some(other) = park.ships.get(target) {
+                        !other.cloaked && !other.in_warp() && on_grid(ship, other, true)
+                    } else {
+                        // Celestials are always in the client's ballpark.
+                        park.ball(*target).is_some()
+                    }
+                }
+                _ => true,
+            }
+        }
+    }
+}
+
 /// What WarpToStuff(kind, id) goes to, as its centre and radius: an item in
 /// the system, a bookmark, or another character's ship.
 async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> {
+    let system = ctx.session.solar_system_id?;
+    let db_id = i32::try_from(id).ok()?;
+    let db_system = i32::try_from(system).ok()?;
     let point = |r: &tokio_postgres::Row, i: usize| {
         Some(Vec3::new(float(r, i)?, float(r, i + 1)?, float(r, i + 2)?))
     };
     match kind {
         "item" => {
-            if let Some(ball) = ctx.world.lock().parks.get(&ctx.session.solar_system_id?).and_then(|p| p.ball(id)) {
+            if let Some(ball) = ctx.world.lock().parks.get(&system).and_then(|p| {
+                if p.ships.get(&id).is_some_and(|s| s.cloaked || s.in_warp()) || p.beacons.get(&id).is_some_and(|b|b.hidden) { None } else { p.ball(id) }
+            }) {
                 return Some(ball);
             }
-            let sql = r#"SELECT "x","y","z", COALESCE("radius", 0) FROM "mapDenormalize" WHERE "itemID" = $1"#;
-            let r = ctx.query_one(sql, &[&(id as i32)]).await?;
+            let sql = r#"SELECT "x","y","z", COALESCE("radius", 0) FROM "mapDenormalize" WHERE "itemID" = $1 AND "solarSystemID" = $2"#;
+            let r = ctx.query_one(sql, &[&db_id, &db_system]).await?;
             Some((point(&r, 0)?, float(&r, 3).unwrap_or(0.0)))
         }
         "bookmark" => {
             let sql = r#"SELECT b."x", b."y", b."z", d."x", d."y", d."z", COALESCE(d."radius", 0)
                            FROM bookmarks b
                            LEFT JOIN "mapDenormalize" d ON d."itemID" = b."itemID"
-                          WHERE b."bookmarkID" = $1 AND b."ownerID" = $2"#;
+                          WHERE b."bookmarkID" = $1 AND b."ownerID" = $2 AND b."locationID" = $3
+                            AND (d."solarSystemID" IS NULL OR d."solarSystemID" = $3)"#;
             let owner = ctx.session.char_id? as i32;
-            let r = ctx.query_one(sql, &[&(id as i32), &owner]).await?;
+            let r = ctx.query_one(sql, &[&db_id, &owner, &db_system]).await?;
             // A bookmark of a celestial carries the celestial's position.
             match point(&r, 3) {
                 Some(at) => Some((at, float(&r, 6).unwrap_or(0.0))),
@@ -865,10 +1110,12 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> 
         }
         "char" => {
             let world = ctx.world.lock();
-            let park = world.parks.get(&ctx.session.solar_system_id?)?;
-            park.ships.values().find(|s| s.pilot.char_id == id && !s.cloaked).map(|s| (s.pos, s.stats.radius))
+            let gang = world.gangs.of(ctx.session.char_id?)?;
+            if world.gangs.of(id) != Some(gang) { return None; }
+            let park = world.parks.get(&system)?;
+            park.ships.values().find(|s| s.pilot.char_id == id && s.is_pilot() && !s.cloaked && !s.in_warp()).map(|s| (s.pos, s.stats.radius))
         }
-        "scan" => crate::svc::scan::result_at(ctx.world, ctx.session.char_id?, id),
+        "scan" => crate::svc::scan::result_at(ctx.world, ctx.session.char_id?, system, id),
         _ => {
             warn!("WarpToStuff to a {kind:?} is not supported");
             None
@@ -876,19 +1123,125 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> 
     }
 }
 
-/// Where the warp lands: `reach` (the target's radius plus the warp range)
-/// out from `at` towards the ship, plus the ship's own radius, so the
-/// overview's surfaceDist reads the range asked for.
-///
-/// The server works the point out and sends WarpTo a range of 0. Left to
-/// destiny, the range is counted from wherever the ship finished aligning,
-/// which beside a planet can point under its surface; and a warp of under
-/// 100 km is a GotoPoint to the raw point, flying the ship into the planet.
-fn landing_point(ctx: &Ctx<'_>, at: Vec3, reach: f64) -> Option<Vec3> {
+/// Keep the target and stopping range separate: converting the range to a
+/// closer point can turn a valid short warp into Destiny's GotoPoint fallback.
+fn warp_course(ctx: &Ctx<'_>, at: Vec3, radius: f64, range: f64) -> Option<Command> {
     let world = ctx.world.lock();
     let park = world.parks.get(&ctx.session.solar_system_id?)?;
     let ship = park.ships.get(&ctx.session.ship_id?)?;
-    Some(at + (ship.pos - at).unit() * (reach + ship.stats.radius))
+    course_to(ship, at, radius, range)
+}
+
+fn course_to(ship: &Ship, at: Vec3, radius: f64, range: f64) -> Option<Command> {
+    if !at.is_finite() || !radius.is_finite() || radius < 0.0 || !range.is_finite() || !(0.0..=MAX_WARP_RANGE).contains(&range)
+        || (ship.pos - at).len() - radius - ship.stats.radius <= MIN_WARP_DISTANCE { return None; }
+    let command = Command::Warp { target: at, range: radius + ship.stats.radius + range };
+    crate::ballpark::valid_command(ship.id, ship.pos, &command).then_some(command)
+}
+
+#[cfg(test)]
+mod movement_tests {
+    use super::*;
+    use crate::ballpark::{Pilot, ShipStats};
+
+    fn ship(id: i64, who: i64, x: f64) -> Ship {
+        Ship::new(id, id, ShipStats::new(37.0, 1_100_000.0, 3.1, 320.0, 2.0),
+            Pilot { type_id:587, group_id:25, name:"Movement test".into(), char_id:who, corp_id:1000002,
+                alliance_id:None, security:0.0, bounty:0.0 }, Vec3::new(x,0.0,0.0),Vec3::ZERO)
+    }
+
+    #[test]
+    fn warp_eligibility_uses_surface_distance_without_shortening_the_target() {
+        let ship = ship(1, 101, 0.0);
+        assert!(course_to(&ship, Vec3::new(150_037.0,0.0,0.0),0.0,0.0).is_none());
+        let command = course_to(&ship,Vec3::new(160_037.0,0.0,0.0),0.0,100_000.0).unwrap();
+        assert_eq!(command,Command::Warp{target:Vec3::new(160_037.0,0.0,0.0),range:100_037.0});
+        let mut park=Park::new(30_000_001,vec![],0);park.ships.insert(1,ship);
+        park.command(1,command);
+        assert!(park.ships[&1].warping());
+        for (at,radius,range) in [(Vec3::new(f64::NAN,0.0,0.0),0.0,0.0),
+            (Vec3::new(1.0e6,0.0,0.0),f64::INFINITY,0.0),(Vec3::new(1.0e6,0.0,0.0),0.0,100_001.0),
+            (Vec3::new(1.0e6,0.0,0.0),0.0,-1.0)] {
+            assert!(course_to(&park.ships[&1],at,radius,range).is_none());
+        }
+    }
+
+    #[test]
+    fn course_targets_must_be_visible_and_numeric_values_must_be_finite() {
+        let mut park=Park::new(30_000_001,vec![],0);
+        park.ships.insert(1,ship(1,101,0.0));park.ships.insert(2,ship(2,102,1_000.0));
+        let follow=Order::Command(Command::Follow{target:2,range:50.0});
+        assert!(valid_order(&park,1,&follow));
+        park.ships.get_mut(&2).unwrap().cloaked=true;
+        assert!(!valid_order(&park,1,&follow));
+        park.ships.get_mut(&2).unwrap().cloaked=false;
+        park.ships.get_mut(&2).unwrap().pos.x=1.0e9;
+        assert!(!valid_order(&park,1,&follow));
+        assert!(!valid_order(&park,1,&Order::Command(Command::Orbit{target:1,range:0.0})));
+        for value in [f64::NAN,f64::INFINITY,f64::NEG_INFINITY] {
+            assert!(finite_number(&Value::Double(value)).is_none());
+            assert!(!valid_order(&park,1,&Order::SpeedFraction(value)));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
+    async fn warp_destinations_respect_system_ownership_and_fleet_membership() {
+        let database=crate::test_support::Database::load().await;
+        let local=database.db.query_one(r#"SELECT "itemID","solarSystemID" FROM "mapDenormalize" WHERE "groupID"=10 ORDER BY "itemID" LIMIT 1"#,&[]).await.unwrap();
+        let local_id:i32=local.get(0);let system:i32=local.get(1);
+        let remote=database.db.query_one(r#"SELECT "itemID","solarSystemID" FROM "mapDenormalize" WHERE "groupID"=10 AND "solarSystemID"<>$1 ORDER BY "itemID" LIMIT 1"#,&[&system]).await.unwrap();
+        let remote_id:i32=remote.get(0);let remote_system:i32=remote.get(1);
+        let owner=database.id().await;let ally=database.id().await;
+        let session=crate::session::Session{char_id:Some(owner as i64),ship_id:Some(1),solar_system_id:Some(system as i64),..Default::default()};
+        let ctx=database.ctx(&session);
+        let mut park=Park::new(system as i64,vec![],destiny::tick_now());
+        park.ships.insert(1,ship(1,owner as i64,0.0));park.ships.insert(2,ship(2,ally as i64,1.0e6));
+        database.world.lock().parks.insert(system as i64,park);
+        assert!(warp_target(&ctx,"item",local_id as i64).await.is_some());
+        assert!(warp_target(&ctx,"item",remote_id as i64).await.is_none());
+        assert!(warp_target(&ctx,"item",i64::MAX).await.is_none());
+        database.world.lock().parks.get_mut(&(system as i64)).unwrap().beacons.insert(99,
+            crate::beacons::Beacon::new(99,19728,None,"Hidden signature",Vec3::new(1.0e6,0.0,0.0),1.0,
+                crate::beacons::Kind::Complex {complex_id:99}).hidden());
+        assert!(warp_target(&ctx,"item",99).await.is_none(),"hidden signature requires an authorized scan result");
+        assert!(warp_target(&ctx,"char",ally as i64).await.is_none());
+        database.world.lock().gangs.test_members(vec![owner as i64,ally as i64]);
+        assert_eq!(warp_target(&ctx,"char",ally as i64).await,Some((Vec3::new(1.0e6,0.0,0.0),37.0)));
+        database.world.lock().parks.get_mut(&(system as i64)).unwrap().ships.get_mut(&2).unwrap().cloaked=true;
+        assert!(warp_target(&ctx,"char",ally as i64).await.is_none());
+        database.world.lock().scan_results.insert(owner as i64,vec![super::super::scan::Found{id:99,signal:100.0,pos:Vec3::new(1.0e6,0.0,0.0),accuracy:0.0,system:remote_system as i64}]);
+        assert!(warp_target(&ctx,"scan",99).await.is_none());
+        database.world.lock().scan_results.get_mut(&(owner as i64)).unwrap()[0].system=system as i64;
+        assert!(warp_target(&ctx,"scan",99).await.is_some());
+        let bookmark:i32=database.db.query_one(r#"INSERT INTO bookmarks ("ownerID","itemID","typeID",memo,created,x,y,z,"locationID") VALUES ($1,$2,5,'warp test',0,1000000,0,0,$3) RETURNING "bookmarkID""#,&[&owner,&system,&remote_system]).await.unwrap().get(0);
+        assert!(warp_target(&ctx,"bookmark",bookmark as i64).await.is_none());
+        database.db.execute(r#"UPDATE bookmarks SET "locationID"=$2 WHERE "bookmarkID"=$1"#,&[&bookmark,&system]).await.unwrap();
+        assert!(warp_target(&ctx,"bookmark",bookmark as i64).await.is_some());
+        database.db.execute(r#"UPDATE bookmarks SET "ownerID"=$2 WHERE "bookmarkID"=$1"#,&[&bookmark,&ally]).await.unwrap();
+        assert!(warp_target(&ctx,"bookmark",bookmark as i64).await.is_none());
+        database.db.execute(r#"DELETE FROM bookmarks WHERE "bookmarkID"=$1"#,&[&bookmark]).await.unwrap();
+        {
+            let mut world=database.world.lock();let park=world.parks.get_mut(&(system as i64)).unwrap();
+            let ally_ship=park.ships.get_mut(&2).unwrap();ally_ship.pos.x=1_000.0;ally_ship.cloaked=false;
+            park.ships.insert(3,ship(3,owner as i64+1_000_000,2_000.0));
+        }
+        let fleet_call=Call{service:"beyonce".into(),method:"WarpToStuff".into(),args:vec![],kwargs:vec![(Value::bytes("minRange"),Value::Int(0)),(Value::bytes("gang"),Value::Bool(true))]};
+        assert!(matches!(gang_warp(&ctx,system as i64,1,Order::Command(Command::Warp{target:Vec3::new(1.0e9,0.0,0.0),range:37.0}),&fleet_call),Outcome::Value(Value::None)));
+        {
+            let mut world=database.world.lock();let park=world.parks.get_mut(&(system as i64)).unwrap();
+            assert!(park.ships[&1].warping() && park.ships[&2].warping());
+            assert_eq!(park.ships[&3].command,Command::Stop);
+            park.command(1,Command::Stop);park.command(2,Command::Stop);
+        }
+        let member_session=crate::session::Session{char_id:Some(ally as i64),ship_id:Some(2),..session.clone()};
+        assert!(matches!(gang_warp(&database.ctx(&member_session),system as i64,2,Order::Command(Command::Warp{target:Vec3::new(1.0e9,0.0,0.0),range:37.0}),&fleet_call),Outcome::UserError{..}));
+        let call=Call{service:"beyonce".into(),method:"GotoDirection".into(),args:vec![Value::Double(f64::NAN),Value::Int(0),Value::Int(0)],kwargs:vec![]};
+        assert!(matches!(movement(&ctx,&call).await,Outcome::UserError{..}));
+        let stale_session=crate::session::Session{char_id:Some(ally as i64),..session.clone()};
+        assert!(matches!(steer(&database.ctx(&stale_session),system as i64,1,Order::Command(Command::Stop),"Stop"),Outcome::UserError{..}));
+        assert_eq!(database.world.lock().parks[&(system as i64)].ships[&1].command,Command::Stop);
+    }
 }
 
 // ---- jumps --------------------------------------------------------------------------
@@ -988,6 +1341,28 @@ mod tests {
         assert_eq!(event[1], Value::Tuple(vec![Value::Int(140_000_016)]));
     }
 
+    #[test]
+    fn mixed_ticks_use_ordered_single_stamp_update_batches() {
+        let entries=vec![entry(9,"SetState",vec![Value::None]),entry(9,"Stop",vec![Value::Int(1)]),
+            entry(10,"GotoDirection",vec![Value::Int(1)]),entry(9,"Stop",vec![Value::Int(2)])];
+        let (event,args)=destiny_notification(entries.clone());
+        assert_eq!(event,"DoDestinyUpdates");
+        let batches=args.seq().unwrap()[0].seq().unwrap();
+        assert_eq!(batches.len(),3);
+        let mut flattened=Vec::new();
+        for batch in batches {
+            let envelope=batch.seq().unwrap();
+            assert_eq!(envelope[1],Value::Int(0));
+            let actions=envelope[0].seq().unwrap();
+            assert!(actions.iter().all(|e|e.seq().unwrap()[0]==actions[0].seq().unwrap()[0]));
+            flattened.extend_from_slice(actions);
+        }
+        assert_eq!(flattened,entries,"splitting never reorders actions");
+        let (event,args)=destiny_notification(entries[..2].to_vec());
+        assert_eq!(event,"DoDestinyUpdate");
+        assert_eq!(args.seq().unwrap()[0].seq().unwrap(),&entries[..2]);
+    }
+
     fn park_with_moving_ship() -> Park {
         let mut park = Park::new(30002780, Vec::new(), 100);
         let stats = ShipStats::new(37.0, 1_100_000.0, 3.1, 320.0, 2.0);
@@ -1009,7 +1384,12 @@ mod tests {
     #[test]
     fn set_state_comes_first_and_moving_ships_are_put_back_on_course() {
         let park = park_with_moving_ship();
-        let entries = set_state_entries(&park, 1, &HashSet::new(), &[], &[]);
+        let entries = set_state_entries(&park, 1, &HashSet::new(), &[], &[], &[(1,30000143,99)]);
+        let event=entries[0].seq().unwrap()[1].seq().unwrap();
+        let bag=&event[1].seq().unwrap()[0];
+        let Value::Instance { state,.. }=bag else { panic!("state bag") };
+        assert_eq!(state.get_str("allianceBridges"),Some(&Value::List(vec![Value::Tuple(vec![
+            Value::Int(1),Value::Int(30000143),Value::Int(99)])])));
         let opcode = |e: &Value| match e {
             Value::Tuple(t) => match &t[1] {
                 Value::Tuple(ev) => ev[0].clone(),
@@ -1025,11 +1405,169 @@ mod tests {
     }
 
     #[test]
+    fn aligning_and_midwarp_snapshots_restore_native_state_without_restarting_warp() {
+        let mut park=park_with_moving_ship();
+        park.command(1,Command::Warp{target:Vec3::new(1.5e12,0.0,0.0),range:1500.0});
+        let aligning=ship_ball(&park.ships[&1]);
+        assert_eq!(aligning.mode,mode::WARP);
+        assert_eq!(aligning.warp.unwrap().start,-1);
+        assert_eq!(aligning.warp.unwrap().distance,0.0);
+        assert!(snapshot_course_entries(&park.ships[&1],park.tick).is_empty());
+        assert_eq!(parts(&course_entries(&park.ships[&1],park.tick)[0]).unwrap().0,b"WarpTo",
+            "ordinary new warp orders still carry WarpTo");
+        for _ in 0..100 {
+            park.advance(park.tick+1);
+            if park.ships[&1].in_warp() { break; }
+        }
+        assert!(park.ships[&1].in_warp());
+        let original=park.ships[&1].warp_snapshot().unwrap();
+        park.advance(park.tick+2);
+        let ship=&park.ships[&1];
+        assert!(ship.in_warp());
+        assert_eq!(ship.warp_snapshot().unwrap(),original,"snapshot retains the warp entry, not current tick");
+        let state=set_state_entries(&park,1,&HashSet::new(),&[],&[],&[]);
+        let Value::Instance{state:bag,..}=&parts(&state[0]).unwrap().1[0] else { panic!("state bag") };
+        let expected=Value::Bytes(destiny::encode(destiny::stamp(park.tick),&[ship_ball(ship)]));
+        assert_eq!(bag.get_str("state"),Some(&expected));
+        let added=add_ball_entries(&park,1);
+        assert_eq!(&parts(&added[0]).unwrap().1[0].seq().unwrap()[0],&expected);
+        for entries in [&state,&added] {
+            assert!(!entries.iter().any(|e|parts(e).unwrap().0==b"WarpTo"));
+            assert!(entries.iter().any(|e|parts(e).unwrap().0==b"OnSpecialFX"),"restore the warp effect after the native ball");
+        }
+    }
+
+    #[test]
+    fn all_new_balls_precede_courses_that_reference_each_other() {
+        let mut park=park_with_moving_ship();
+        let template=&park.ships[&1];
+        let other=Ship::new(2,20,ShipStats::new(37.0,1_100_000.0,3.1,320.0,2.0),template.pilot.clone(),Vec3::new(1000.0,0.0,0.0),Vec3::ZERO);
+        park.ships.insert(2,other);
+        park.command(2,Command::Follow {target:1,range:500.0});
+        let entries=add_many_ball_entries(&park,&[1,2]);
+        let names:Vec<_>=entries.iter().map(|e|parts(e).unwrap().0).collect();
+        assert_eq!(&names[..2],&[b"AddBalls".as_slice(),b"AddBalls".as_slice()]);
+        assert!(names[2..].contains(&b"Orbit".as_slice()));
+        assert!(names[2..].contains(&b"FollowBall".as_slice()));
+        let mut hidden=HashSet::from([2]);
+        let orbit=command_entry(&park.ships[&1],park.tick);
+        let safe=sift(&orbit,Some(&park),Some(&park.ships[&1]),&mut hidden).unwrap();
+        assert_eq!(parts(&safe).unwrap().0,b"Stop","a stationary ship gets no invalid hidden target reference");
+    }
+
+    #[test]
+    fn visible_follower_recovers_its_course_after_hidden_target_returns() {
+        let mut park=park_with_moving_ship();
+        let pilot=park.ships[&1].pilot.clone();
+        park.ships.get_mut(&1).unwrap().vel=Vec3::new(25.0,0.0,0.0);
+        park.ships.insert(2,Ship::new(2,20,ShipStats::new(37.0,1e6,3.1,320.0,2.0),pilot,
+            Vec3::new(GRID_RANGE_OUT*2.0,0.0,0.0),Vec3::ZERO));
+        let mut hidden=HashSet::new();
+        let leaving=refresh_view_entries(&park,&park.ships[&1],&mut hidden);
+        assert!(hidden.contains(&2));
+        assert_eq!(parts(&leaving[0]).unwrap().0,b"RemoveBalls");
+        assert!(leaving.iter().any(|e|parts(e).unwrap().0==b"GotoDirection"));
+        assert!(!leaving.iter().any(|e|parts(e).unwrap().0==b"Orbit"));
+        park.ships.get_mut(&2).unwrap().pos=Vec3::new(1000.0,0.0,0.0);
+        let returning=refresh_view_entries(&park,&park.ships[&1],&mut hidden);
+        assert!(!hidden.contains(&2));
+        let addition=returning.iter().position(|e|parts(e).unwrap().0==b"AddBalls").unwrap();
+        let orbit=returning.iter().position(|e|parts(e).unwrap().0==b"Orbit").unwrap();
+        assert!(addition<orbit,"the target is added before its existing follower resumes Orbit");
+        assert_eq!(parts(&returning[orbit]).unwrap().1[0],Value::Int(1));
+    }
+
+    #[test]
+    fn state_and_grid_entry_restore_only_visible_running_effects() {
+        let mut park=park_with_moving_ship();
+        let kind=crate::npc::NpcType::with(3634,53,1.0,1.0,&[]);
+        let mut module=crate::npc::entity_module(&kind,99,34,"effects.ProjectileFired",crate::combat::Action::Passive,1500.0);
+        module.target=Some(2);
+        module.started_ms=12345;
+        module.repeat=1000;
+        let mut fighter=crate::npc::entity_fighter(&kind,10000.0,1,100.0,12345);
+        fighter.modules.push(module.clone());
+        park.ships.get_mut(&1).unwrap().fight=Some(fighter);
+        let state=set_state_entries(&park,1,&HashSet::new(),&[],&[],&[]);
+        let (_,args)=parts(&state[0]).unwrap();
+        let Value::Instance {state:bag,..}=&args[0] else { panic!("state bag") };
+        let effects=bag.get_str("effectStates").unwrap().seq().unwrap();
+        assert_eq!(effects.len(),1);
+        let expected=crate::fight::module_fx(park.tick,1,&module,true);
+        assert_eq!(effects[0].seq().unwrap(),parts(&expected).unwrap().1);
+        assert_eq!(effects[0].seq().unwrap()[12],Value::Long(crate::combat::filetime(12345)));
+        let addition=add_ball_entries(&park,1);
+        assert_eq!(parts(&addition[0]).unwrap().0,b"AddBalls");
+        assert_eq!(addition.last(),Some(&expected));
+        let state=set_state_entries(&park,1,&HashSet::from([2]),&[],&[],&[]);
+        let Value::Instance {state:bag,..}=&parts(&state[0]).unwrap().1[0] else { panic!("state bag") };
+        assert!(bag.get_str("effectStates").unwrap().seq().unwrap().is_empty(),"hidden target effects stay hidden after reset");
+    }
+
+    #[test]
     fn a_ship_slim_carries_a_numeric_security_status() {
         let park = park_with_moving_ship();
         let Value::Instance { state, .. } = ship_slim(&park.ships[&1]) else { panic!() };
         assert_eq!(state.get_str("securityStatus"), Some(&Value::Double(-1.5)));
         assert_eq!(state.get_str("allianceID"), Some(&Value::None));
+    }
+
+    #[test]
+    fn an_empty_hull_keeps_its_owner_but_has_no_pilot() {
+        let mut park=park_with_moving_ship();
+        let ship=park.ships.get_mut(&1).unwrap();
+        ship.unpiloted=true;
+        let Value::Instance{state,..}=ship_slim(ship) else { panic!("slim item") };
+        assert_eq!(state.get_str("charID"),Some(&Value::None));
+        assert_eq!(state.get_str("ownerID"),Some(&Value::Int(ship.pilot.char_id)));
+        assert_eq!(state.get_str("corpID"),Some(&Value::Int(ship.pilot.corp_id)));
+        assert!(!ship.is_pilot());
+        assert!(ego_of(&park,10).is_none(),"an old client ID cannot make an empty hull the ego");
+    }
+
+    #[test]
+    fn shortened_warp_resync_preserves_each_clients_ego_and_visibility() {
+        let mut park=park_with_moving_ship();
+        park.command(1,Command::Warp{target:Vec3::new(1.5e12,0.0,0.0),range:1500.0});
+        for _ in 0..100 {
+            park.advance(park.tick+1);
+            if park.ships[&1].in_warp() { break; }
+        }
+        assert!(park.ships[&1].in_warp());
+        let original=park.ships[&1].warp_snapshot().unwrap();
+        let at=park.ships[&1].pos;
+        let template=park.ships[&1].clone();
+        for (id,offset) in [(2,1000.0),(3,GRID_RANGE_OUT*2.0)] {
+            let mut pilot=template.pilot.clone();pilot.char_id+=id;
+            park.ships.insert(id,Ship::new(id,id*10,template.stats.clone(),pilot,at+Vec3::new(offset,0.0,0.0),Vec3::ZERO));
+        }
+        let system=park.solar_system_id;
+        let mut world=WorldState::default();
+        let mut receivers=Vec::new();
+        for id in 1..=4 {
+            let rx=world.connect(id*10);
+            world.set_presence(id*10,Some(crate::world::Presence{char_id:template.pilot.char_id+id,
+                corp_id:1000002,solar_system_id:system,docked:false,station_id:None,role:0}));
+            if id<4 { world.sees(id*10,system); }
+            receivers.push(rx);
+        }
+        world.parks.insert(system,park);
+        resync_warp_views(&world,system,&[]);
+        for (index,rx) in receivers.iter_mut().take(3).enumerate() {
+            let crate::world::Push::Notify(n)=rx.try_recv().unwrap() else { panic!("reset notification") };
+            assert_eq!(n.event,"DoDestinyUpdate");
+            let entries=n.args.seq().unwrap()[0].seq().unwrap();
+            assert_eq!(parts(&entries[0]).unwrap().0,b"SetState");
+            assert!(!entries.iter().any(|e|parts(e).unwrap().0==b"WarpTo"));
+            let Value::Instance{state:bag,..}=&parts(&entries[0]).unwrap().1[0] else { panic!("state bag") };
+            assert_eq!(bag.get_str("ego"),Some(&Value::Int(index as i64+1)));
+            let visible=bag.get_str("slims").unwrap().seq().unwrap().iter().filter_map(slim_id).collect::<Vec<_>>();
+            assert_eq!(visible.contains(&1),index<2,"only nearby observers receive the warping ball");
+            assert!(visible.contains(&(index as i64+1)));
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(receivers[3].try_recv().is_err(),"a client without an initialized park gets no unsolicited reset");
+        assert_eq!(world.parks[&system].ships[&1].warp_snapshot().unwrap(),original);
     }
 
     #[test]

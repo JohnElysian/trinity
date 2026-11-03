@@ -337,6 +337,7 @@ impl Sim {
     }
 
     async fn run(mut self) {
+        let mut reconnect=crate::db::Reconnect::default();
         {
             let ctx = Ctx { atlas: &self.atlas, econ: &mut self.econ, yard: Some(&*self.yard), day0: self.day0, density: &self.density };
             for (i, bot) in self.bots.iter_mut().enumerate() {
@@ -359,6 +360,15 @@ impl Sim {
         info!("bots: running {} at {}x", self.bots.len(), self.speed);
         loop {
             interval.tick().await;
+            if self.db.is_closed() {
+                // Pause bot economic decisions while disconnected; do not
+                // replay an interrupted tick or catch up its elapsed time.
+                last_tick=Instant::now();
+                match reconnect.poll(&self.server.db_url).await {
+                    Some(db)=>self.db=db,
+                    None=>continue,
+                }
+            }
             let elapsed = last_tick.elapsed();
             last_tick = Instant::now();
             let running = RUNNING.load(Ordering::Relaxed);

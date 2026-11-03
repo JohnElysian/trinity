@@ -97,6 +97,7 @@ impl Out {
 /// Work a pulse leaves for after the lock.
 #[derive(Debug, Clone)]
 pub enum Job {
+    NpcKill { system:i64 },
     /// A charge stack burned down to `quantity`.
     Ammo { client_id: i64, charge_id: i64, quantity: i64 },
     /// Ore into `ship_id`'s hold, mined by `module_id` on `miner_id` (the ship, or a drone).
@@ -117,7 +118,7 @@ pub enum Job {
     /// A drone flew home: back into its ship's drone bay.
     DroneHome { client_id: i64, drone_id: i64, ship_id: i64 },
     /// A drone was destroyed.
-    DroneLost { client_id: Option<i64>, drone_id: i64 },
+    DroneLost { client_id: Option<i64>, drone_id: i64, system:i64, owner:i64, generation:Option<i64> },
     /// The last rat of a mission site died.
     SiteCleared { mission_id: i64, char_id: i64 },
     /// A crime, or a kill, changed a pilot's security status by this much.
@@ -134,42 +135,88 @@ pub enum Job {
     Structure { id: i64, state: i16, stamp: Option<i64>, tower: Option<i64> },
     /// A cloaking device stopped: the ship is seen again.
     Uncloak { system: i64, ship_id: i64 },
+    /// Available power or a new scramble changed the predicted warp at entry.
+    WarpResync { system: i64 },
     /// The last room of a deadspace complex was cleared.
     ComplexCleared { complex_id: i64 },
 }
 
 pub async fn run(server: Arc<Server>) {
-    let mut db = loop {
-        match crate::db::connect(&server.db_url).await {
-            Ok(c) => break c,
-            Err(e) => {
-                error!("heartbeat cannot reach the database: {}", crate::logging::chain(&e));
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
-    crate::svc::pvptrade::recover(&db).await;
+    let (queued,waiting)=tokio::sync::mpsc::unbounded_channel();
+    // A stalled established query is just as possible as a failed reconnect.
+    // Join two scoped futures: dropping run cancels both; database I/O never
+    // holds up the simulation and there is only one persistence consumer.
+    tokio::join!(simulation(&server,queued),persistence(&server,waiting));
+}
+
+async fn simulation(server:&Server,queued:tokio::sync::mpsc::UnboundedSender<Job>) {
     info!("heartbeat every {PULSE_MS} ms");
     let mut interval = tokio::time::interval(Duration::from_millis(PULSE_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut pulses = 0u64;
     loop {
         interval.tick().await;
         for job in pulse(&server.world, combat::now_ms()) {
-            perform(&server, &mut db, job).await;
+            match job {
+                // Decloaking changes the live ballpark, not the database.
+                Job::Uncloak{system,ship_id}=>crate::cloak::uncloaked(&mut server.world.lock(),system,ship_id),
+                job=>if queued.send(job).is_err() {return;},
+            }
         }
-        pulses += 1;
+    }
+}
+
+async fn persistence(server:&Server,mut waiting:tokio::sync::mpsc::UnboundedReceiver<Job>) {
+    let mut connection:Option<tokio_postgres::Client>=None;
+    let mut reconnect=crate::db::Reconnect::default();
+    // The receiver owns undispatched jobs during outages. Once dispatched, an
+    // error might mean COMMIT succeeded: only the subsystem's journal can retry.
+    let mut interval=tokio::time::interval(Duration::from_millis(PULSE_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pulses=0u64;
+    loop {
+        interval.tick().await;
+        pulses=pulses.wrapping_add(1);
+        if connection.as_ref().is_some_and(|db|db.is_closed()) {connection=None;}
+        if connection.is_none() {connection=reconnect.poll(&server.db_url).await;}
+        let Some(db)=connection.as_mut() else {continue;};
+        // Bound each batch so a continuously producing simulation cannot
+        // starve checkpoints, journal repair, or other periodic work.
+        for _ in 0..128 {
+            if db.is_closed() {break;}
+            let job=match waiting.try_recv() {
+                Ok(job)=>job,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)=>break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)=>return,
+            };
+            perform(server, db, job).await;
+        }
+        if db.is_closed() {continue;}
+        crate::svc::fleet::update_bonuses(&server.world, db, &server.dogma).await;
+        if pulses%4==0 {crate::svc::boosters::pulse(&server,db).await;}
+        if pulses % 20 == 1 {
+            crate::drones::checkpoint(&server.world, db).await;
+            crate::space_state::checkpoint(&server.world, db).await;
+            crate::svc::maintenance::retry_repairs(&server.world, &server.db_url).await;
+            crate::losses::pending::retry(&server, db).await;
+            crate::losses::journal::retry(&server, db).await;
+            crate::travel::retry(&server, db).await;
+            crate::svc::jumps::portal::retry(&server, db).await;
+            crate::conn::logout::retry(&server,db).await;
+            if let Err(e) = crate::svc::fleet::refresh_skills(&server.world, db).await {
+                warn!("refreshing fleet skills: {e}");
+            }
+        }
         if pulses % AFFAIRS_EVERY == 1 {
-            crate::svc::alliance::take_effect(&server.world, &mut db, server.alliance_join_delay_secs).await;
-            crate::svc::alliance::bill_alliances(&db).await;
-            crate::svc::war::bill_wars(&server.world, &db).await;
-            crate::svc::starbase::burn_fuel(&server.world, &mut db).await;
-            crate::svc::starbase::sovereignty(&db, server.sov_claim_delay_secs).await;
-            crate::svc::votes::close_votes(&server.world, &db).await;
-            crate::complexes::seed(&db).await;
-            crate::svc::outposts::finish(&server.world, &db).await;
-            crate::guard::reload(&server.world, &db).await;
-            crate::guard::refresh_standings(&db).await;
+            crate::svc::alliance::take_effect(&server.world, db, server.alliance_join_delay_secs).await;
+            crate::svc::alliance::bill_alliances(db).await;
+            crate::svc::war::bill_wars(&server.world, db).await;
+            crate::svc::starbase::burn_fuel(&server.world, db).await;
+            crate::svc::starbase::sovereignty(db, server.sov_claim_delay_secs).await;
+            crate::svc::votes::close_votes(&server.world, db).await;
+            crate::complexes::seed(db).await;
+            crate::svc::outposts::finish(&server.world, db).await;
+            crate::guard::reload(&server.world, db).await;
+            crate::guard::refresh_standings(db).await;
         }
     }
 }
@@ -177,6 +224,7 @@ pub async fn run(server: Arc<Server>) {
 /// One pulse of every occupied system.
 fn pulse(world: &World, now: i64) -> Vec<Job> {
     let mut w = world.lock();
+    crate::drones::reconcile(&mut w);
     let mut out = Out::default();
     let tick = crate::destiny::tick_now();
     for park in w.parks.values_mut() {
@@ -185,6 +233,7 @@ fn pulse(world: &World, now: i64) -> Vec<Job> {
             continue;
         }
         park.advance(tick);
+        warp_changes(park, &mut out);
         crate::cloak::proximity(park, now, &mut out);
         crate::complexes::step(park, now, &mut out);
         crate::fight::step(park, now, &mut out);
@@ -194,13 +243,54 @@ fn pulse(world: &World, now: i64) -> Vec<Job> {
     }
     crate::svc::jumps::orphaned_cynos(&mut w);
     crate::svc::jumps::close_bridges(&mut w, now);
-    let jobs = out.deliver(&w);
+    crate::svc::fleet::pulse(&mut w, now);
+    let mut jobs = std::mem::take(&mut w.pending_jobs);
+    jobs.extend(out.deliver(&w));
+    // A shared RPC connection may recover before this worker does. Quarantine
+    // a confirmed death while still holding the simulation lock, even if its
+    // SQL job has not started, so reconnect cannot reload the destroyed hull.
+    for job in &jobs {
+        if let Job::Lost(loss)=job {
+            w.pending_ship_losses.entry(loss.ship_id).or_insert_with(||(**loss).clone());
+        }
+    }
     crate::svc::space::refresh_views(&w);
     jobs
 }
 
+fn warp_changes(park: &mut crate::ballpark::Park, out: &mut Out) {
+    let mut resync = false;
+    for (ship_id, change) in std::mem::take(&mut park.warp_events) {
+        let Some(ship) = park.ships.get(&ship_id) else { continue; };
+        match change {
+            crate::ballpark::WarpChange::Entered { cost, limited } => {
+                if cost > 0.0 { out.drained(ship_id); }
+                if limited {
+                    resync = true;
+                    if ship.is_player() {
+                        out.note(ship.client_id,"OnRemoteMessage",Value::Tuple(vec![Value::bytes("WarpingWithAvailablePower"),Value::Dict(vec![])]));
+                    }
+                }
+            }
+            crate::ballpark::WarpChange::Stopped { scrambled } => {
+                resync = true;
+                if ship.is_player() {
+                    let (key,args) = if scrambled { ("WarpScrambled",Value::Dict(vec![])) } else {
+                        ("CustomNotify",Value::Dict(vec![(Value::bytes("notify"),Value::text("Your ship cannot enter warp with its current power or destination."))]))
+                    };
+                    out.note(ship.client_id,"OnRemoteMessage",Value::Tuple(vec![Value::bytes(key),args]));
+                }
+            }
+        }
+    }
+    if resync { out.jobs.push(Job::WarpResync { system:park.solar_system_id }); }
+}
+
 async fn perform(server: &Server, db: &mut Client, job: Job) {
     match job {
+        Job::NpcKill { system } => {
+            if let Err(e) = crate::svc::map::record_activity(db,system,2).await { warn!("recording NPC kill: {e}"); }
+        }
         Job::Ammo { client_id, charge_id, quantity } => ammo(server, db, client_id, charge_id, quantity).await,
         Job::Ore { client_id, char_id, ship_id, miner_id, module_id, system, type_id, quantity } => {
             ore(server, db, client_id, char_id, (ship_id, miner_id, module_id), system, type_id, quantity).await
@@ -217,7 +307,7 @@ async fn perform(server: &Server, db: &mut Client, job: Job) {
         Job::Loot { system, pos, owner_id, stash } => crate::loot::drop_can(db, &server.world, system, pos, owner_id, stash).await,
         Job::Scrap { can_id } => crate::loot::scrap(db, can_id).await,
         Job::DroneHome { client_id, drone_id, ship_id } => crate::drones::home(server, db, client_id, drone_id, ship_id).await,
-        Job::DroneLost { client_id, drone_id } => crate::drones::lost(server, db, client_id, drone_id).await,
+        Job::DroneLost { client_id, drone_id, system, owner, generation } => crate::drones::lost(server, db, client_id, drone_id, system, owner, generation).await,
         Job::Security { char_id, delta } => change_security(db, char_id, delta).await,
         Job::SiteCleared { mission_id, char_id } => crate::svc::agent_missions::site_cleared(&server.world, db, mission_id, char_id).await,
         Job::Structure { id, state, stamp, tower } => save_structure(db, id, state, stamp, tower).await,
@@ -226,6 +316,7 @@ async fn perform(server: &Server, db: &mut Client, job: Job) {
         Job::StructureLost { id, tower } => crate::svc::starbase::lost(db, id, tower).await,
         Job::StructureAmmo { item_id, quantity } => crate::guard::save_ammo(db, item_id, quantity).await,
         Job::Uncloak { system, ship_id } => crate::cloak::uncloaked(&mut server.world.lock(), system, ship_id),
+        Job::WarpResync { system } => space::resync_after_warp_limit(db, &server.world, system).await,
         Job::ComplexCleared { complex_id } => crate::complexes::cleared(db, complex_id).await,
     }
 }
@@ -382,4 +473,24 @@ mod tests {
         assert_eq!(drained.into_iter().collect::<Vec<_>>(), vec![2]);
         assert_eq!(out.hurt.into_iter().collect::<Vec<_>>(), vec![1]);
     }
+
+    #[test]
+    fn limited_warp_reports_charge_and_resynchronizes_the_native_phase_once() {
+        use crate::ballpark::{Park,Pilot,Ship,ShipStats,WarpChange};
+        let mut park=Park::new(30_000_001,vec![],0);
+        park.ships.insert(1,Ship::new(1,10,ShipStats::new(10.0,1.0e6,1.0,300.0,1.0),Pilot{
+            type_id:587,group_id:25,name:"Warp test".into(),char_id:100,corp_id:1000002,
+            alliance_id:None,security:0.0,bounty:0.0},Vec3::ZERO,Vec3::ZERO));
+        park.warp_events.push((1,WarpChange::Entered{cost:4.0,limited:true}));
+        let mut out=Out::default();warp_changes(&mut park,&mut out);
+        assert_eq!(out.drained.into_iter().collect::<Vec<_>>(),vec![1]);
+        assert!(matches!(out.jobs.as_slice(),[Job::WarpResync{system:30_000_001}]));
+        assert_eq!(out.notes[0].1,"OnRemoteMessage");
+        assert_eq!(out.notes[0].2.seq().unwrap()[0],Value::bytes("WarpingWithAvailablePower"));
+        assert!(park.warp_events.is_empty());
+        let mut next=Out::default();warp_changes(&mut park,&mut next);
+        assert!(next.jobs.is_empty() && next.notes.is_empty());
+    }
 }
+
+#[cfg(test)] mod recovery_tests;

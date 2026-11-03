@@ -3,7 +3,9 @@ pub mod agents;
 pub mod alert;
 pub mod alliance;
 pub mod bookmark;
+pub mod boosters;
 pub mod bound;
+pub mod bridges;
 pub mod charcreation;
 pub mod charsheet;
 pub mod chat;
@@ -13,10 +15,13 @@ pub mod jumps;
 pub mod outposts;
 pub mod scan;
 pub mod config;
+pub mod contracts;
 pub mod corp;
 pub mod dogma;
+pub mod embark;
 pub mod factory;
 pub mod fitting;
+pub mod fleet;
 pub mod gang;
 pub mod gm;
 pub mod inflight;
@@ -29,6 +34,7 @@ pub mod lookup;
 pub mod medical;
 pub mod map;
 pub mod market;
+pub mod maintenance;
 pub mod membership;
 pub mod moonmining;
 pub mod missions;
@@ -40,6 +46,7 @@ pub mod petition;
 pub mod ram;
 pub mod repair;
 pub mod reprocessing;
+pub mod recruitment;
 pub mod rows;
 pub mod skills;
 pub mod space;
@@ -75,10 +82,11 @@ pub fn registry() -> Registry {
         .add("character", handler!(charsheet::character))
         .add("character", handler!(notes::character))
         .add("character", handler!(trinity::character))
-        .add("contractMgr", handler!(trinity::contract_mgr))
+        .add("contractMgr", handler!(contracts::contract_mgr))
         .add("LPSvc", handler!(lp::lp_svc))
         .add("voiceMgr", handler!(trinity::voice_mgr))
-        .add("gangSvc", handler!(trinity::gang_svc))
+        .add("gangSvc", handler!(fleet::gang_svc))
+        .add_bound("gangSvcObjectHandler", handler!(fleet::object_handler))
         .add("charmgr", handler!(charsheet::charmgr))
         .add_bound("skillMgr", handler!(skills::skill_mgr))
         .add_bound("jumpCloneSvc", handler!(clones::jump_clone_svc))
@@ -117,7 +125,8 @@ pub fn registry() -> Registry {
         // corporations and alliances
         .add("corpmgr", handler!(corp::corpmgr))
         .add("corporationSvc", handler!(corp::corporation_svc))
-        .add("corporationSvc", handler!(trinity::corporation_svc))
+        .add("corporationSvc", handler!(recruitment::corporation_svc))
+        .add_bound("corpRegistry", handler!(recruitment::corp_registry))
         .add_bound("corpRegistry", handler!(membership::corp_registry))
         .add_bound("corpRegistry", handler!(alliance::corp_registry))
         .add_bound("corpRegistry", handler!(war::corp_registry))

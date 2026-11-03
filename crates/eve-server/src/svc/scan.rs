@@ -123,13 +123,14 @@ fn cone_scan(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     for c in park.celestials.iter().filter(|c| seen(c.pos)) {
         add(c.id, c.type_id, c.group_id);
     }
-    for b in park.beacons.values().filter(|b| seen(b.pos) && !matches!(b.kind, Kind::Probe { .. })) {
+    for b in park.beacons.values().filter(|b| !b.hidden && seen(b.pos) && !matches!(b.kind, Kind::Probe { .. })) {
         add(b.id, b.type_id, beacon_group(b));
     }
     Outcome::Value(rowset(&["id", "typeID", "groupID"], lines))
 }
 
 fn beacon_group(b: &Beacon) -> i64 {
+    if b.type_id==crate::beacons::TYPE_COVERT_CYNOSURAL_FIELD {return 897;}
     match b.kind {
         Kind::Gate { .. } => 366,
         _ => 310,
@@ -296,9 +297,9 @@ fn analyse(park: &Park, probes: &[Probe], group: i64, ships: bool, me: i64, now:
 }
 
 /// Where a scan result lies, for WarpToStuff('scan', resultID).
-pub fn result_at(world: &crate::world::World, char_id: i64, id: i64) -> Option<(Vec3, f64)> {
+pub fn result_at(world: &crate::world::World, char_id: i64, system: i64, id: i64) -> Option<(Vec3, f64)> {
     let w = world.lock();
-    w.scan_results.get(&char_id)?.iter().find(|r| r.id == id).map(|r| (r.pos, 0.0))
+    w.scan_results.get(&char_id)?.iter().find(|r| r.id == id && r.system == system).map(|r| (r.pos, 0.0))
 }
 
 /// Before a scanning module starts: a probe launcher needs probes loaded;

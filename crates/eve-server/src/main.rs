@@ -27,9 +27,16 @@ mod pos;
 mod services;
 mod session;
 mod sites;
+mod static_entities;
+mod space_state;
 mod svc;
 mod web;
+mod warp_energy;
 mod world;
+#[cfg(test)]
+mod test_support;
+
+mod travel;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -96,6 +103,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         jump_clone_min_standing: config.jump_clone_min_standing,
     });
     schema::ensure(&client).await.map_err(|e| format!("bringing the database's tables up to date: {}", logging::chain(&e)))?;
+    // Startup-only cleanup must finish before clients can create live trades.
+    // A recovered heartbeat connection must never repeat it.
+    svc::pvptrade::recover(&client).await;
 
     let started = Instant::now();
     let bulk =
@@ -109,7 +119,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let server = Arc::new(Server {
         table,
-        db: client,
+        db: db::Shared::new(client,config.database.clone()),
         db_url: config.database.clone(),
         node_id: config.node_id,
         bulk,
