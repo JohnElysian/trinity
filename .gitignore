@@ -2,4 +2,5 @@ tools/
 target/
 crates/eve-server/web/node_modules/
 logs/
-scripts/__pycache__/
+scripts/
+compatibility/

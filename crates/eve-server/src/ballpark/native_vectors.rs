@@ -164,6 +164,11 @@ fn sequential_collision_dispatch_integration_and_next_ticks_match_original() {
 #[test]
 fn near_equal_nonaxis_forces_use_the_calibrated_client_precision_winner() {
     let cases=vectors();let case=&cases["precision_boundary"];let values=case["balls"].as_array().unwrap();
+    let bits=|value:&Value|u64::from_str_radix(value.as_str().unwrap().trim_start_matches("0x"),16).unwrap();
+    for value in values {
+        let id=value["id"].as_i64().unwrap().to_string();
+        for axis in 0..3 {assert_eq!(value["pos"][axis].as_f64().unwrap().to_bits(),bits(&case["input_position_bits"][&id][axis]),"oracle input must survive JSON round-trip exactly");}
+    }
     let mover=body(&values[0]);let mut winner=None;let mut force=Vec3::ZERO;
     for value in &values[1..] {
         let (contact,next)=bounce(&mover,Vec3::ZERO,&body(value)).unwrap();assert_eq!(contact,0.0);
@@ -172,4 +177,5 @@ fn near_equal_nonaxis_forces_use_the_calibrated_client_precision_winner() {
     }
     assert_eq!(winner,Some(50_000_003));
     assert_eq!(force,vector(&case["steps"][0]["100"]["correction"]));
+    for (axis,value) in [force.x,force.y,force.z].into_iter().enumerate() {assert_eq!(value.to_bits(),bits(&case["first_correction_bits"][axis]));}
 }
