@@ -207,6 +207,10 @@ async fn persistence(server:&Server,mut waiting:tokio::sync::mpsc::UnboundedRece
             }
         }
         if pulses % AFFAIRS_EVERY == 1 {
+            let session = crate::session::Session::default();
+            let ctx = crate::services::Ctx { db, db_url: &server.db_url, dogma: &server.dogma,
+                bulk: &server.bulk, world: &server.world, node_id: server.node_id, client_id: 0, session: &session };
+            crate::svc::trade::expire(&ctx).await;
             crate::svc::alliance::take_effect(&server.world, db, server.alliance_join_delay_secs).await;
             crate::svc::alliance::bill_alliances(db).await;
             crate::svc::war::bill_wars(&server.world, db).await;

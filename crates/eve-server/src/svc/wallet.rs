@@ -1,4 +1,7 @@
 use eve_marshal::Value;
+#[path="wallet_accounts.rs"]
+mod accounts;
+pub use accounts::{can_take,post_account,select_account};
 use tokio_postgres::types::ToSql;
 use tracing::{error, info};
 
@@ -18,15 +21,31 @@ const REASON_MAX: usize = 40;
 
 pub async fn account(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
+        "GiveCash" if call.kwarg("toAccountKey").is_some() => return Some(accounts::transfer_accounts(ctx,call,false).await),
         "GiveCash" => return Some(give_cash(call, ctx, false).await),
-        "GiveCashFromCorpAccount" => return Some(give_cash(call, ctx, true).await),
+        "GiveCashFromCorpAccount" => return Some(accounts::transfer_accounts(ctx,call,true).await),
         "GetCashBalance" => {
             let corp = call.arg_id(0) != 0;
-            cash_balance(ctx, corp).await
+            let key=call.kwarg("accountKey").and_then(Value::as_i64).or_else(||call.arg_i64(1))
+                .unwrap_or(ctx.session.corp_account_key.unwrap_or(1000) as i64) as i32;
+            if corp && (!(1000..=1006).contains(&key) ||
+                (ctx.session.corp_role() & (1|256|1024)==0 && !can_take(ctx.session.corp_role(),key))) {
+                return Some(Outcome::custom("You do not have access to that corporation wallet."));
+            }
+            if corp && key!=1000 {
+                let balance=ctx.query_one(r#"SELECT balance FROM corporation_wallets WHERE "corporationID"=$1 AND "accountKey"=$2"#,
+                    &[&(ctx.session.corp_id.unwrap_or(0) as i32),&key]).await.map(|r|r.get::<_,f64>(0)).unwrap_or(0.0);
+                Value::Double(balance)
+            } else {cash_balance(ctx, corp).await}
         }
         "GetKeyMap" => key_map(ctx).await,
         "GetRefTypes" => ref_types(ctx).await,
-        "GetJournal" => journal(call, ctx).await,
+        "GetJournal" => {
+            if call.arg_id(3)!=0 && ctx.session.corp_role() & (1|256|1024)==0 {
+                return Some(Outcome::custom("Corporation journals require an accounting role."));
+            }
+            journal(call, ctx).await
+        },
         _ => return None,
     };
     Some(Outcome::Value(value))
@@ -99,14 +118,11 @@ pub async fn settle_bill(ctx: &Ctx<'_>, bill_id: i64, debtor: i64, payer: i64) -
 
 /// The wallet-transaction part of the `marketProxy` service.
 pub async fn market_proxy(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
-    let value = match call.method.as_str() {
-        "CharGetNewTransactions" => transactions(ctx, None).await,
-        "CharGetTransactions" => {
-            transactions(ctx, call.arg_i64(0)).await
-        }
-        _ => return None,
-    };
-    Some(Outcome::Value(value))
+    match call.method.as_str() {
+        "CharGetNewTransactions" | "CharGetTransactions" | "CorpGetNewTransactions" | "CorpGetTransactions" =>
+            Some(transactions(ctx, call).await),
+        _ => None,
+    }
 }
 
 async fn cash_balance(ctx: &Ctx<'_>, corp: bool) -> Value {
@@ -341,27 +357,42 @@ pub async fn bills(ctx: &Ctx<'_>, owner: Option<i64>, side: Side) -> Value {
     }
 }
 
-async fn transactions(ctx: &Ctx<'_>, before_id: Option<i64>) -> Value {
+async fn transactions(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     const HEADER: &[&str] = &[
         "transactionID", "transactionDateTime", "typeID", "quantity", "price", "transactionType",
-        "clientID", "regionID", "stationID",
+        "clientID", "regionID", "stationID", "characterID", "corpTransaction", "accountKey",
     ];
-    const PAGE: i64 = 25;
-    let Some(char_id) = ctx.session.char_id else { return rowset(HEADER, Vec::new()) };
-
-    let sql = r#"SELECT "transactionID","transactionDateTime","typeID","quantity","price",
-                        "transactionType","clientID","regionID","stationID"
-                   FROM market_transactions
-                  WHERE "characterID" = $1
-                    AND ($2::int IS NULL OR "transactionID" < $2)
-                  ORDER BY "transactionID" DESC
-                  LIMIT $3"#;
-    let before = before_id.and_then(|v| i32::try_from(v).ok());
-    match ctx.db.query(sql, &[&(char_id as i32), &before, &PAGE]).await {
-        Ok(rows) => rowset(HEADER, crate::svc::rows::lines(&rows)),
-        Err(e) => {
-            error!("CharGetTransactions({char_id}): {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
+    let corp = call.method.starts_with("Corp");
+    let Some(me) = ctx.session.char_id else { return Outcome::custom("Select a character first.") };
+    if corp && ctx.session.corp_role() & (crate::session::CORP_ROLE_DIRECTOR | CORP_ROLE_ACCOUNTANT | 1024) == 0 {
+        return Outcome::custom("Corporation transactions require the Accountant or Junior Accountant role.");
+    }
+    let owner = if corp { ctx.session.corp_id.unwrap_or(0) } else { me } as i32;
+    let offset = usize::from(!call.method.contains("New"));
+    let int = |i| call.arg_i64(i + offset).and_then(|v| i32::try_from(v).ok());
+    let number = |i| call.args.get(i + offset).and_then(Value::as_f64).filter(|v| v.is_finite());
+    let before = if offset == 1 { call.arg_i64(0).and_then(|v| i32::try_from(v).ok()) } else { None };
+    let kind = int(0); let type_id = int(1); let client_id = int(2); let quantity = int(3);
+    let from = call.arg_i64(4 + offset); let maximum = number(5); let minimum = number(6);
+    let account = if corp { int(7) } else { None }; let actor = if corp { int(8) } else { None };
+    let sql = r#"SELECT "transactionID","transactionDateTime","typeID",quantity,price,
+        "transactionType","clientID","regionID","stationID","characterID","isCorp","accountKey"
+        FROM market_transactions
+        WHERE (($2 AND "corporationID"=$1 AND "isCorp"=1) OR (NOT $2 AND "characterID"=$1))
+        AND ($3::int IS NULL OR "transactionID"<$3)
+        AND ($4::int IS NULL OR "transactionType"=$4)
+        AND ($5::int IS NULL OR "typeID"=$5)
+        AND ($6::int IS NULL OR "clientID"=$6)
+        AND ($7::int IS NULL OR quantity >= $7)
+        AND ($8::bigint IS NULL OR "transactionDateTime">=$8)
+        AND ($9::float8 IS NULL OR price <= $9) AND ($10::float8 IS NULL OR price >= $10)
+        AND ($11::int IS NULL OR "accountKey"=$11) AND ($12::int IS NULL OR "characterID"=$12)
+        ORDER BY "transactionID" DESC LIMIT 25"#;
+    match ctx.db.query(sql, &[&owner,&corp,&before,&kind,&type_id,&client_id,&quantity,&from,&maximum,&minimum,&account,&actor]).await {
+        Ok(rows) => Outcome::Value(rowset(HEADER, crate::svc::rows::lines(&rows))),
+        Err(error) => {
+            error!("market transactions: {}", crate::logging::chain(&error));
+            Outcome::custom("The wallet transaction history could not be loaded.")
         }
     }
 }

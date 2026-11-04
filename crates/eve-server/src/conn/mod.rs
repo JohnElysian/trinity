@@ -285,6 +285,20 @@ impl Conn {
         if call.service == "authentication" && call.method == "SetLanguageID" {
             return self.set_language_id(req, call).await;
         }
+        let wallet_bind=if call.method=="MachoBindObject" {bound::piggyback(call).filter(|(method,_)|method=="SetAccountKey")} else {None};
+        if bound::owns(&call.service,"corpRegistry") && (call.method=="SetAccountKey" || wallet_bind.is_some()) {
+            let before=self.session.clone();
+            let args=wallet_bind.as_ref().map(|(_,args)|args.as_slice()).unwrap_or(&call.args);
+            if args.len()!=1 {return self.send_error(req,custom_error("Select one wallet division.")).await;}
+            let key=args[0].as_i64().and_then(|key|i32::try_from(key).ok()).unwrap_or(0);
+            if let Err(why)=crate::svc::wallet::select_account(&self.db,&mut self.session,key).await {
+                return self.send_error(req,custom_error(&why)).await;
+            }
+            self.send_session_change_from(&before).await?;
+            let result=if wallet_bind.is_some() {bound::bind_result(self.server.node_id,"corpRegistry",&bound::params_of(call),Value::None)} else {Value::None};
+            self.reply(req,&result).await?;
+            return self.flush_pending_session_change(call).await;
+        }
         if let Some(pilot)=self.session.char_id {
             if crate::losses::journal::blocked_character_in_memory(&self.server.world,pilot)
                 || crate::travel::blocked_character_in_memory(&self.server.world,pilot)

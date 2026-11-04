@@ -1,0 +1,13 @@
+# Read-only market protocol checks after selecting a test character.
+marketProxy.StartupCheck
+marketProxy.GetMarketGroups
+marketProxy.GetOrders 34
+marketProxy.GetStationAsks
+marketProxy.GetSystemAsks
+marketProxy.GetRegionBest
+marketProxy.GetCharOrders
+marketProxy.GetCorporationOrders
+marketProxy.GetOldPriceHistory 34
+marketProxy.GetNewPriceHistory 34
+marketProxy.CharGetNewTransactions None 34 None None None None None
+account.GetCashBalance 0

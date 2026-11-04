@@ -11,7 +11,7 @@ pub const PERSIST_VARS: &[&str] = &[
     "userid", "languageID", "regionid", "constellationid", "role", "charid",
     "allianceid", "corpid", "gangid", "gangrole", "wingid", "squadid", "shipid", "stationid",
     "solarsystemid", "solarsystemid2", "address", "callback", "userType",
-    "hqID", "baseID", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther",
+    "hqID", "baseID", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther", "corpAccountKey",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -25,6 +25,7 @@ pub struct Session {
     pub char_id: Option<i64>,
 
     pub corp_id: Option<i64>,
+    pub corp_account_key: Option<i32>,
     pub alliance_id: Option<i64>,
     pub ship_id: Option<i64>,
     pub station_id: Option<i64>,
@@ -98,6 +99,7 @@ impl Session {
             "gangrole" => Value::int_or_none(self.gang_role),
             "wingid" => Value::int_or_none(self.wing_id),
             "squadid" => Value::int_or_none(self.squad_id),
+            "corpAccountKey" => if self.corp_id.is_some() {Value::Int(self.corp_account_key.unwrap_or(1000) as i64)} else {Value::None},
             "rolesAtAll" => Value::Long(self.roles_at_all),
             "rolesAtHQ" => Value::Long(self.roles_at_hq),
             "rolesAtBase" => Value::Long(self.roles_at_base),

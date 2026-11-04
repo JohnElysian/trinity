@@ -10,14 +10,19 @@ fn motion_checkpoint_json_preserves_native_coordinates_bit_for_bit() {
     let pilot=crate::ballpark::Pilot {type_id:587,group_id:25,name:"Exact motion".into(),char_id:7,corp_id:1,alliance_id:None,security:0.0,bounty:0.0};
     let mut original=Ship::new(70,1,crate::ballpark::ShipStats::new(300.0,1e6,1.0,100.0,1.0),pilot,
         Vec3::new(127.51127349558429,1.2345678901234567e16,-1.2345678901234567e16),Vec3::new(0.12345678901234567,-0.0,1e-300));
-    original.prev_vel=Vec3::new(-3.9633091422683018,-26.083010907094472,0.0);
-    original.goal=Vec3::new(157.91809379952542,152.59168855107683,120.0);
+    let mut fields=serde_json::to_value(original.motion(1)).unwrap();
+    fields["prev_vel"]=serde_json::to_value(Vec3::new(-3.9633091422683018,-26.083010907094472,0.0)).unwrap();
+    fields["goal"]=serde_json::to_value(Vec3::new(157.91809379952542,152.59168855107683,120.0)).unwrap();
+    let motion=serde_json::from_value(fields.clone()).unwrap();
+    assert!(original.restore_motion(&motion,1));
     let raw=serde_json::to_string(&Snapshot{motion:original.motion(1),cloak:Default::default()}).unwrap();
     let saved:Snapshot=serde_json::from_str(&raw).unwrap();
-    let mut restored=original.clone();restored.pos=Vec3::ZERO;restored.vel=Vec3::ZERO;restored.prev_vel=Vec3::ZERO;restored.goal=Vec3::ZERO;
+    let mut restored=original.clone();restored.pos=Vec3::ZERO;restored.vel=Vec3::ZERO;
     assert!(restored.restore_motion(&saved.motion,1));
-    for (name,before,after) in [("position",original.pos,restored.pos),("velocity",original.vel,restored.vel),
-        ("previous velocity",original.prev_vel,restored.prev_vel),("goal",original.goal,restored.goal)] {
+    let after=serde_json::to_value(restored.motion(1)).unwrap();
+    for name in ["pos","vel","prev_vel","goal"] {
+        let before:Vec3=serde_json::from_value(fields[name].clone()).unwrap();
+        let after:Vec3=serde_json::from_value(after[name].clone()).unwrap();
         assert_eq!([before.x.to_bits(),before.y.to_bits(),before.z.to_bits()],[after.x.to_bits(),after.y.to_bits(),after.z.to_bits()],"{name}");
     }
 }

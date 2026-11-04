@@ -2085,7 +2085,7 @@ impl Conn {
         const SQL: &str = r#"
             SELECT c."corporationID", co."allianceID", co."stationID",
                    COALESCE(r."rolesAtAll", 0), COALESCE(r."rolesAtHQ", 0),
-                   COALESCE(r."rolesAtBase", 0), COALESCE(r."rolesAtOther", 0)
+                   COALESCE(r."rolesAtBase", 0), COALESCE(r."rolesAtOther", 0), c."corpAccountKey"
               FROM "character_" c
               LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
               LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
@@ -2111,6 +2111,7 @@ impl Conn {
         s.roles_at_hq = opt(4).unwrap_or(0);
         s.roles_at_base = opt(5).unwrap_or(0);
         s.roles_at_other = opt(6).unwrap_or(0);
+        s.corp_account_key = opt(7).and_then(|key|i32::try_from(key).ok()).filter(|key|crate::svc::wallet::can_take(s.corp_role(),*key)).or(Some(1000));
     }
 
     /// Pick the character's ship in `station_id` (preferring the recorded one) and

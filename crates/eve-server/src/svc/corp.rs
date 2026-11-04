@@ -219,6 +219,8 @@ const CORP_HEADER: &[&str] = &[
     "shares", "memberCount", "memberLimit", "allowedMemberRaceIDs", "graphicID", "shape1",
     "shape2", "shape3", "color1", "color2", "color3", "typeface", "division1", "division2",
     "division3", "division4", "division5", "division6", "division7", "balance", "deleted",
+    "walletDivision1", "walletDivision2", "walletDivision3", "walletDivision4",
+    "walletDivision5", "walletDivision6", "walletDivision7",
 ];
 
 // NPC corporations have no founder (creatorID 0, which no owner record
@@ -230,7 +232,8 @@ const CORP_SQL: &str = r#"SELECT "corporationID","corporationName","description"
                                  "memberCount","memberLimit","allowedMemberRaceIDs","graphicID",
                                  "shape1","shape2","shape3","color1","color2","color3","typeface",
                                  "division1","division2","division3","division4","division5",
-                                 "division6","division7","balance","deleted"
+                                 "division6","division7","balance","deleted",
+                                 NULL::text,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text
                             FROM "corporation" WHERE "corporationID" = $1"#;
 
 async fn corporation_row(ctx: &Ctx<'_>, corp_id: i64) -> Value {

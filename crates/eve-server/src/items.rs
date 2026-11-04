@@ -257,6 +257,9 @@ impl<'c> ItemTxn<'c> {
             Some(r) => {
                 let id = r.get::<_, i32>(0) as i64;
                 let Some(item)=self.item(id).await? else { return self.create(new).await; };
+                if item.quantity.checked_add(new.quantity).is_none_or(|n|n>i32::MAX as i64) {
+                    return self.create(new).await;
+                }
                 self.set_quantity(id, item.quantity + new.quantity).await?;
                 Ok(id)
             }

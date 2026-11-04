@@ -8,15 +8,33 @@ use crate::services::{Call, Ctx, Outcome};
 use crate::svc::rows::{cell, row, rowset_with_columns};
 
 pub async fn market_proxy(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
+    if matches!(call.method.as_str(), "StartupCheck" | "GetOrders" | "GetCharOrders" | "GetCorporationOrders"
+        | "GetStationAsks" | "GetSystemAsks" | "GetRegionBest" | "PlaceCharOrder" | "CancelCharOrder" | "ModifyCharOrder") {
+        let result = crate::svc::trade::expire(ctx).await;
+        if !matches!(result, Outcome::Value(_)) { return Some(result); }
+    }
     let arg0 = || call.arg_id(0);
 
     let out = match call.method.as_str() {
+        "StartupCheck" => {
+            if ctx.session.char_id.is_none() || ctx.session.region_id.is_none() {
+                Outcome::custom("Select a character in a region before opening the market.")
+            } else {
+                match ctx.db.query_one("SELECT EXISTS(SELECT 1 FROM market_orders)", &[]).await {
+                    Ok(_) => Outcome::Value(Value::None),
+                    Err(error) => {
+                        error!("market StartupCheck: {}", crate::logging::chain(&error));
+                        Outcome::custom("The market is temporarily unavailable. Please try again.")
+                    }
+                }
+            }
+        }
         "GetMarketGroups" => Outcome::Value(market_groups(ctx).await),
 
-        "GetOrders" => Outcome::Value(orders_for_type(ctx, arg0()).await),
+        "GetOrders" => cached_orders(orders_for_type(ctx, arg0()).await),
 
         "GetOldPriceHistory" => {
-            Outcome::Value(Value::Tuple(vec![Value::None, Value::List(Vec::new())]))
+            Outcome::Value(history_rows(Vec::new()))
         }
         "GetNewPriceHistory" => Outcome::Value(price_history(ctx, arg0()).await),
 
@@ -37,6 +55,27 @@ pub async fn market_proxy(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         _ => return None,
     };
     Some(out)
+}
+
+fn cached_orders(value: Value) -> Outcome {
+    let table=eve_marshal::StringTable::default();
+    let bytes=match eve_marshal::save(&value,&table) {
+        Ok(bytes)=>bytes,
+        Err(error)=>{error!("serializing market orders: {error}");return Outcome::custom("Market orders could not be loaded.");}
+    };
+    // The original marketQuote compares the cached result's checksum before
+    // replacing its local order list. Raw RPC results leave that version at 0.
+    let (mut a,mut b)=(1u32,0u32);
+    for byte in &bytes {a=(a+u32::from(*byte))%65521;b=(b+a)%65521;}
+    Outcome::Value(Value::Instance {
+        class:Box::new(Value::bytes("objectCaching.CachedMethodCallResult")),
+        state:Box::new(Value::Tuple(vec![
+            Value::Dict(vec![(Value::bytes("versionCheck"),Value::bytes("always")),
+                (Value::bytes("sessionInfo"),Value::bytes("regionid"))]),
+            Value::Bytes(bytes),
+            Value::List(vec![Value::Long(crate::bulkdata::filetime_now()),Value::Int(((b<<16)|a) as i32 as i64)]),
+        ])),
+    })
 }
 
 
@@ -63,7 +102,6 @@ async fn market_groups(ctx: &Ctx<'_>) -> Value {
                        SELECT s."rootID", t."typeID"
                          FROM "sub" s
                          JOIN "invTypes" t ON t."marketGroupID" = s."nodeID"
-                        WHERE t."published" = 1
                         ORDER BY s."rootID", t."typeID""#;
 
     let mut types_by_group: BTreeMap<i32, Vec<Value>> = BTreeMap::new();
@@ -133,7 +171,7 @@ pub const ORDER_HEADER: &[&str] = &[
     "orderState",
     "minVolume",
     "contraband",
-    "accountID",
+    "accountKey",
     "duration",
     "isCorp",
     "solarSystemID",
@@ -177,9 +215,24 @@ pub fn order_line(r: &Row) -> Vec<Value> {
     ]
 }
 
+fn order_rows(lines: Vec<Value>) -> Value {
+    use eve_marshal::dbrow::{dbtype,DbRow,DbRowDescriptor};
+    let descriptor=std::sync::Arc::new(DbRowDescriptor::new(ORDER_HEADER.iter().map(|name| {
+        let kind=match *name {"price"|"escrow"=>dbtype::R8,"issued"=>dbtype::FILETIME,_=>dbtype::I4};
+        (name.as_bytes().to_vec(),kind)
+    }).collect()));
+    let rows=lines.into_iter().map(|line| {
+        let Value::List(values)=line else {unreachable!("order line")};
+        Value::DbRow(Box::new(DbRow{descriptor:descriptor.clone(),values}))
+    }).collect();
+    // GetBestMatchableBid appends these rows to dbutil.RowList, which rejects
+    // util.Row. Native rows also provide __keys__, mutable cells and columns.
+    Value::reduce("dbutil.RowList",vec![Value::Tuple(vec![descriptor.to_value(),Value::List(rows)])])
+}
+
 async fn orders_for_type(ctx: &Ctx<'_>, type_id: i64) -> Value {
     let empty =
-        || Value::Tuple(vec![rowset_with_columns(ORDER_HEADER, Vec::new()), rowset_with_columns(ORDER_HEADER, Vec::new())]);
+        || Value::Tuple(vec![order_rows(Vec::new()), order_rows(Vec::new())]);
     let Some(region_id) = ctx.session.region_id else { return empty() };
 
     let sql = format!(
@@ -202,41 +255,41 @@ async fn orders_for_type(ctx: &Ctx<'_>, type_id: i64) -> Value {
         let line = Value::List(order_line(r));
         if bid == 0 { asks.push(line) } else { bids.push(line) }
     }
-    Value::Tuple(vec![rowset_with_columns(ORDER_HEADER, asks), rowset_with_columns(ORDER_HEADER, bids)])
+    Value::Tuple(vec![order_rows(asks), order_rows(bids)])
 }
 
 async fn char_orders(ctx: &Ctx<'_>) -> Value {
-    let Some(char_id) = ctx.session.char_id else { return rowset_with_columns(ORDER_HEADER, Vec::new()) };
+    let Some(char_id) = ctx.session.char_id else { return order_rows(Vec::new()) };
     let sql = format!(
         r#"{sel} WHERE o."charID" = $1 AND o."orderState" = 0 ORDER BY o."issued" DESC"#,
         sel = ORDER_SELECT
     );
     match ctx.db.query(sql.as_str(), &[&(char_id as i32)]).await {
         Ok(rows) => {
-            rowset_with_columns(ORDER_HEADER, rows.iter().map(|r| Value::List(order_line(r))).collect())
+            order_rows(rows.iter().map(|r| Value::List(order_line(r))).collect())
         }
         Err(e) => {
             error!("GetCharOrders: {err}", err = crate::logging::chain(&e));
-            rowset_with_columns(ORDER_HEADER, Vec::new())
+            order_rows(Vec::new())
         }
     }
 }
 
 async fn corporation_orders(ctx: &Ctx<'_>) -> Value {
-    let Some(corp_id) = ctx.session.corp_id else { return rowset_with_columns(ORDER_HEADER, Vec::new()) };
+    let Some(corp_id) = ctx.session.corp_id else { return order_rows(Vec::new()) };
     let sql = format!(
         r#"{sel}
-                 WHERE o."isCorp" = 1 AND o."orderState" = 0 AND o."walletOwnerID" = $1
+                 WHERE o."isCorp" = 1 AND o."orderState" = 0 AND o."walletOwnerID" = $1 AND o."charID" >= 100000000
                  ORDER BY o."issued" DESC"#,
         sel = ORDER_SELECT
     );
     match ctx.db.query(sql.as_str(), &[&(corp_id as i32)]).await {
         Ok(rows) => {
-            rowset_with_columns(ORDER_HEADER, rows.iter().map(|r| Value::List(order_line(r))).collect())
+            order_rows(rows.iter().map(|r| Value::List(order_line(r))).collect())
         }
         Err(e) => {
             error!("GetCorporationOrders: {err}", err = crate::logging::chain(&e));
-            rowset_with_columns(ORDER_HEADER, Vec::new())
+            order_rows(Vec::new())
         }
     }
 }
@@ -279,71 +332,28 @@ async fn best_asks(ctx: &Ctx<'_>, scope: Scope) -> Value {
     }
 }
 
-const HISTORY_HEADER: &[&str] = &["historyDate", "lowPrice", "highPrice", "avgPrice", "volume", "orders"];
 
-const FILETIME_DAY: i64 = 864_000_000_000;
-
-async fn price_history(ctx: &Ctx<'_>, type_id: i64) -> Value {
-    let mut lines: Vec<Value> = Vec::new();
-
-    if let Some(region_id) = ctx.session.region_id {
-        let sql = r#"SELECT ("transactionDateTime" / 864000000000)::bigint,
-                            min("price")::float8,
-                            max("price")::float8,
-                            (sum("price" * "quantity") / NULLIF(sum("quantity"),0))::float8,
-                            sum("quantity")::bigint,
-                            count(*)::bigint
-                       FROM "market_transactions"
-                      WHERE "typeID" = $1 AND "regionID" = $2
-                      GROUP BY 1 ORDER BY 1"#;
-        match ctx.db.query(sql, &[&(type_id as i32), &(region_id as i32)]).await {
-            Ok(rows) => {
-                for r in &rows {
-                    let day: i64 = r.get(0);
-                    lines.push(row(
-                        HISTORY_HEADER,
-                        vec![
-                            Value::Long(day * FILETIME_DAY),
-                            cell(r, 1),
-                            cell(r, 2),
-                            cell(r, 3),
-                            r.get::<_, Option<i64>>(4).map(Value::Int).unwrap_or(Value::Int(0)),
-                            r.get::<_, Option<i64>>(5).map(Value::Int).unwrap_or(Value::Int(0)),
-                        ],
-                    ));
-                }
-            }
-            Err(e) => error!("GetNewPriceHistory({type_id}): {err}", err = crate::logging::chain(&e)),
-        }
-    }
-
-    if lines.is_empty() {
-        let mut price = 0.0f64;
-        let sql = r#"SELECT "basePrice","portionSize" FROM "invTypes" WHERE "typeID" = $1"#;
-        if let Ok(rows) = ctx.db.query(sql, &[&(type_id as i32)]).await {
-            if let Some(r) = rows.first() {
-                let base: f64 = r.get(0);
-                let portion: i32 = r.get(1);
-                price = if portion > 0 { base / portion as f64 } else { base };
-            }
-        }
-        let today = (crate::bulkdata::filetime_now() / FILETIME_DAY) * FILETIME_DAY;
-        lines.push(row(
-            HISTORY_HEADER,
-            vec![
-                Value::Long(today),
-                Value::Double(price),
-                Value::Double(price),
-                Value::Double(price),
-                Value::Int(0),
-                Value::Int(0),
-            ],
-        ));
-    }
-
-    Value::Tuple(vec![Value::None, Value::List(lines)])
+fn history_rows(lines: Vec<Vec<Value>>) -> Value {
+    use eve_marshal::dbrow::{dbtype, DbRow, DbRowDescriptor};
+    let descriptor = std::sync::Arc::new(DbRowDescriptor::of(&[
+        ("historyDate", dbtype::FILETIME), ("lowPrice", dbtype::R8),
+        ("highPrice", dbtype::R8), ("avgPrice", dbtype::R8),
+        ("volume", dbtype::I8), ("orders", dbtype::I4),
+    ]));
+    let rows = lines.into_iter().map(|values| Value::DbRow(Box::new(DbRow {
+        descriptor: descriptor.clone(), values,
+    }))).collect();
+    // marketsvc.GetPriceHistory constructs a RowList from new.header and
+    // appends blue.DBRows; a util.Rowset or bare tuple is not compatible.
+    Value::reduce("dbutil.RowList", vec![Value::Tuple(vec![descriptor.to_value(), Value::List(rows)])])
 }
 
-
-
-
+async fn price_history(ctx: &Ctx<'_>, type_id: i64) -> Value {
+    let Some(region) = ctx.session.region_id else { return history_rows(vec![]) };
+    match ctx.db.query(r#"SELECT "historyDate","lowPrice","highPrice","avgPrice","volume","orders"
+        FROM market_history WHERE "regionID"=$1 AND "typeID"=$2 ORDER BY "historyDate""#,
+        &[&(region as i32), &(type_id as i32)]).await {
+        Ok(rows) => history_rows(rows.iter().map(crate::svc::rows::line).collect()),
+        Err(error) => { error!("market history: {}", crate::logging::chain(&error)); history_rows(vec![]) }
+    }
+}
