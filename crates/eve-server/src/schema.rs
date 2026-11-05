@@ -41,6 +41,10 @@ const STATEMENTS: &[&str] = &[
            PRIMARY KEY ("stationID", "serviceID"))"#,
     r#"COMMENT ON TABLE "stationServiceRules" IS 'MADE: who a player-owned station lets use each service, and at what cost (svc::outposts).'"#,
     r#"ALTER TABLE "staStations" ADD COLUMN IF NOT EXISTS "description" text"#,
+    // A bookmark's notes (the client's bm.note, addressbook.EditBookmark),
+    // kept apart from its label in memo; a voucher carries them along.
+    r#"ALTER TABLE "bookmarks" ADD COLUMN IF NOT EXISTS "note" text NOT NULL DEFAULT ''"#,
+    r#"ALTER TABLE "bookmarkVouchers" ADD COLUMN IF NOT EXISTS "note" text NOT NULL DEFAULT ''"#,
     // Trinity's bulk categories and groups carry a published flag (its
     // static data has it; RMR's did not).
     r#"ALTER TABLE "invCategories" ADD COLUMN IF NOT EXISTS "published" smallint NOT NULL DEFAULT 1"#,

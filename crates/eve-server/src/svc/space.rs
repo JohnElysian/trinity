@@ -1095,11 +1095,21 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> 
             Some((point(&r, 0)?, float(&r, 3).unwrap_or(0.0)))
         }
         "bookmark" => {
-            let sql = r#"SELECT b."x", b."y", b."z", d."x", d."y", d."z", COALESCE(d."radius", 0)
+            // A celestial in this system warps to the celestial; a coordinate
+            // bookmark (itemID = locationID = the system) to its own x/y/z.
+            // A system, constellation or region is never a warp target --
+            // its mapDenormalize x/y/z are galactic, and older bookmarks of
+            // one were filed under the system the pilot was in.
+            let sql = r#"SELECT b."x", b."y", b."z",
+                                CASE WHEN d."groupID" IN (3,4,5) THEN NULL ELSE d."x" END,
+                                d."y", d."z", COALESCE(d."radius", 0)
                            FROM bookmarks b
                            LEFT JOIN "mapDenormalize" d ON d."itemID" = b."itemID"
                           WHERE b."bookmarkID" = $1 AND b."ownerID" = $2 AND b."locationID" = $3
-                            AND (d."solarSystemID" IS NULL OR d."solarSystemID" = $3)"#;
+                            AND (d."itemID" IS NULL
+                                 OR (d."groupID" NOT IN (3,4,5) AND d."solarSystemID" = $3)
+                                 OR (d."groupID" IN (3,4,5) AND b."itemID" = b."locationID"
+                                     AND b."x" IS DISTINCT FROM d."x"))"#;
             let owner = ctx.session.char_id? as i32;
             let r = ctx.query_one(sql, &[&db_id, &owner, &db_system]).await?;
             // A bookmark of a celestial carries the celestial's position.
