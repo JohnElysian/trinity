@@ -4,13 +4,17 @@
 //! Quotes include a ship's hull, armour, fitted modules and drones. Repair
 //! prices remain zero until the original server's pricing formula is known.
 
+use std::collections::HashMap;
+
 use eve_marshal::Value;
 use tracing::{error, info};
 
+use crate::items::invitem_cells;
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Row, StoreError};
 use crate::svc::bound;
-use crate::svc::inventory::{invitem_cells, item_change, INVITEM_SELECT};
-use crate::svc::rows::{float, int, key_val};
+use crate::svc::inventory::item_change;
+use crate::svc::rows::key_val;
 
 const ATTR_DAMAGE: i32 = 3;
 const ATTR_HP: i32 = 9;
@@ -55,50 +59,80 @@ fn ids(v: Option<&Value>) -> Vec<i64> {
         .filter(|id| *id > 0 && i32::try_from(*id).is_ok()).collect()
 }
 
-/// An item at the station, or fitted to a ship docked there. Ownership must
-/// hold for both the item and its containing ship.
-const LOCAL_ITEMS: &str = r#"
-    SELECT e."itemID" FROM entity e
-     WHERE e."ownerID" = $2 AND (e."locationID" = $3 OR EXISTS (
-        SELECT 1 FROM entity ship JOIN "invTypes" t ON t."typeID" = ship."typeID"
-        JOIN "invGroups" g ON g."groupID" = t."groupID"
-        WHERE ship."itemID" = e."locationID" AND ship."ownerID" = $2
-          AND ship."locationID" = $3 AND g."categoryID" = 6))"#;
+/// Whether `item` is at the station, or fitted to a ship docked there.
+/// Ownership must hold for both the item and its containing ship.
+fn local(db: &Db, item: &Row, me: i64, station: i64) -> bool {
+    if item.int("ownerID") != Some(me) {
+        return false;
+    }
+    let location = item.int("locationID");
+    location == Some(station)
+        || location.and_then(|l| db.table("entity").get_id(l)).is_some_and(|ship| {
+            ship.int("ownerID") == Some(me)
+                && ship.int("locationID") == Some(station)
+                && ship.int("typeID").is_some_and(|t| ship_types().contains(&(t as i32)))
+        })
+}
+
+/// The types of the Ship category.
+fn ship_types() -> &'static [i32] {
+    crate::sde::get().types_in_category(6)
+}
+
+/// One attribute's dgmTypeAttribs value (stored as text) for every type
+/// that has it.
+fn type_attribs(attribute: i32) -> HashMap<i64, f64> {
+    crate::sde::table("dgmTypeAttribs")
+        .find("attributeID", attribute as i64)
+        .filter_map(|r| Some((r.int("typeID")?, r.text("value")?.trim().parse::<f64>().ok()?)))
+        .collect()
+}
+
+/// An item's stored attribute, 0 if it has none.
+fn stored(db: &Db, item: i64, attribute: i32) -> f64 {
+    db.table("entity_attributes")
+        .get(&[store::Value::Int(item), store::Value::Int(attribute.into())])
+        .and_then(|a| a.float("valueFloat").or(a.float("valueInt")))
+        .unwrap_or(0.0)
+}
 
 /// {itemID: KeyVal(quote=[KeyVal(itemID, typeID, damage, maxHealth,
 /// costToRepairOneUnitOfDamage)])} for the caller's items
 /// (base_repairshop.py:176-187).
 async fn damage_reports(ctx: &Ctx<'_>, item_ids: &[i64]) -> Value {
     let (Some(me), Some(station)) = (ctx.session.char_id, ctx.session.station_id) else { return Value::Dict(Vec::new()) };
-    let ids: Vec<i32> = item_ids.iter().map(|i| *i as i32).collect();
-    let sql = format!(r#"
-        WITH local_items AS ({LOCAL_ITEMS}), requested AS (
-            SELECT "itemID" FROM local_items WHERE "itemID" = ANY($1))
-        SELECT requested."itemID", e."itemID", e."typeID",
-               coalesce(d."valueFloat", d."valueInt"::float8, 0)
-                 + coalesce(ad."valueFloat", ad."valueInt"::float8, 0),
-               coalesce(hp."value"::float8, 0) + coalesce(ahp."value"::float8, 0)
-          FROM requested JOIN entity e ON e."itemID" = requested."itemID" OR
-            (e."locationID" = requested."itemID" AND (e.flag BETWEEN 11 AND 35 OR e.flag BETWEEN 92 AND 99 OR e.flag = 87))
-          JOIN local_items local ON local."itemID" = e."itemID"
-          LEFT JOIN entity_attributes d ON d."itemID" = e."itemID" AND d."attributeID" = {ATTR_DAMAGE}
-          LEFT JOIN entity_attributes ad ON ad."itemID" = e."itemID" AND ad."attributeID" = {ATTR_ARMOR_DAMAGE}
-          LEFT JOIN "dgmTypeAttribs" hp ON hp."typeID" = e."typeID" AND hp."attributeID" = {ATTR_HP}
-          LEFT JOIN "dgmTypeAttribs" ahp ON ahp."typeID" = e."typeID" AND ahp."attributeID" = {ATTR_ARMOR_HP}
-          ORDER BY requested."itemID", e."itemID""#);
-    let rows = ctx.query(&sql, &[&ids, &(me as i32), &(station as i32)]).await;
-    let mut reports: std::collections::BTreeMap<i64, Vec<Value>> = std::collections::BTreeMap::new();
-    for r in &rows {
-            let item_id = int(r, 1).unwrap_or(0);
-            let quote = key_val(vec![
-                ("itemID", Value::Int(item_id)),
-                ("typeID", Value::int_or_none(int(r, 2))),
-                ("damage", Value::Double(float(r, 3).unwrap_or(0.0))),
-                ("maxHealth", Value::Double(float(r, 4).unwrap_or(0.0))),
-                ("costToRepairOneUnitOfDamage", Value::Double(0.0)),
-            ]);
-            reports.entry(int(r, 0).unwrap_or(0)).or_default().push(quote);
-    }
+    let hp = type_attribs(ATTR_HP);
+    let armor = type_attribs(ATTR_ARMOR_HP);
+    let reports = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        let mut requested: Vec<i64> =
+            item_ids.iter().copied().filter(|id| entity.get_id(*id).is_some_and(|e| local(db, &e, me, station))).collect();
+        requested.sort_unstable();
+        requested.dedup();
+        let mut reports: std::collections::BTreeMap<i64, Vec<Value>> = std::collections::BTreeMap::new();
+        for id in requested {
+            // The item, and what is fitted to it or in its drone bay.
+            let fitted = entity
+                .find(&["locationID"], &[store::Value::Int(id)])
+                .filter(|e| e.int("itemID") != Some(id) && matches!(e.int("flag"), Some(11..=35 | 92..=99 | 87)));
+            let mut parts: Vec<Row> = entity.get_id(id).into_iter().chain(fitted).filter(|e| local(db, e, me, station)).collect();
+            parts.sort_by_key(|e| e.int("itemID"));
+            for e in parts {
+                let item_id = e.int("itemID").unwrap_or(0);
+                let type_id = e.int("typeID");
+                let max = |by_type: &HashMap<i64, f64>| type_id.and_then(|t| by_type.get(&t)).copied().unwrap_or(0.0);
+                let quote = key_val(vec![
+                    ("itemID", Value::Int(item_id)),
+                    ("typeID", Value::int_or_none(type_id)),
+                    ("damage", Value::Double(stored(db, item_id, ATTR_DAMAGE) + stored(db, item_id, ATTR_ARMOR_DAMAGE))),
+                    ("maxHealth", Value::Double(max(&hp) + max(&armor))),
+                    ("costToRepairOneUnitOfDamage", Value::Double(0.0)),
+                ]);
+                reports.entry(id).or_default().push(quote);
+            }
+        }
+        reports
+    });
     Value::Dict(reports.into_iter().map(|(id, quotes)| (Value::Int(id), key_val(vec![("quote", Value::List(quotes))]))).collect())
 }
 
@@ -106,28 +140,36 @@ async fn repair(ctx: &Ctx<'_>, item_ids: &[i64]) -> Outcome {
     let (Some(me), Some(station)) = (ctx.session.char_id, ctx.session.station_id) else {
         return Outcome::custom("Dock at a station before repairing items.");
     };
-    let ids: Vec<i32> = item_ids.iter().map(|i| *i as i32).collect();
-    let result = async {
-        let mut db = crate::db::connect(ctx.db_url).await?;
-        let txn = db.transaction().await?;
-        let sql = format!(r#"WITH local_items AS ({LOCAL_ITEMS})
-            SELECT e."itemID" FROM entity e JOIN local_items local ON local."itemID" = e."itemID"
-            WHERE e."itemID" = ANY($1) ORDER BY e."itemID" FOR UPDATE OF e"#);
-        let allowed = txn.query(&sql, &[&ids, &(me as i32), &(station as i32)]).await?;
-        let allowed: Vec<i32> = allowed.iter().map(|row| row.get(0)).collect();
-        if ids.iter().any(|id| !allowed.contains(id)) { return Ok(None); }
-        let changed = txn.query(r#"DELETE FROM entity_attributes WHERE "itemID" = ANY($1)
-            AND "attributeID" IN (3,266) RETURNING "itemID", "attributeID", COALESCE("valueFloat", "valueInt"::float8)"#,
-            &[&allowed]).await?;
-        txn.commit().await?;
-        Ok::<_, tokio_postgres::Error>(Some(changed))
-    }.await;
+    let result = ctx.store.write(|tx| {
+        let db = tx.db();
+        let entity = db.table("entity");
+        let mut allowed: Vec<i64> =
+            item_ids.iter().copied().filter(|id| entity.get_id(*id).is_some_and(|e| local(db, &e, me, station))).collect();
+        allowed.sort_unstable();
+        allowed.dedup();
+        if item_ids.iter().any(|id| !allowed.contains(id)) { return Ok(None); }
+        // Hull (3) and armour (266) damage, with the value each had.
+        let mut damage = Vec::new();
+        for id in &allowed {
+            for a in db.table("entity_attributes").find(&["itemID"], &[store::Value::Int(*id)]) {
+                if matches!(a.int("attributeID"), Some(3 | 266)) {
+                    damage.push((a.id, *id, a.int("attributeID").unwrap_or(0), a.float("valueFloat").or(a.float("valueInt")).unwrap_or(0.0)));
+                }
+            }
+        }
+        let mut changed = Vec::with_capacity(damage.len());
+        for (row, item, attribute, value) in damage {
+            tx.delete("entity_attributes", row)?;
+            changed.push((item, attribute, value));
+        }
+        Ok::<_, StoreError>(Some(changed))
+    });
     match result {
         Ok(Some(changed)) => {
             let now = crate::bulkdata::filetime_now();
-            let changes = changed.iter().map(|row| Value::Tuple(vec![
-                Value::bytes("OnModuleAttributeChange"), Value::Int(me), Value::Int(i64::from(row.get::<_, i32>(0))),
-                Value::Int(i64::from(row.get::<_, i32>(1))), Value::Long(now), Value::Int(0), Value::Double(row.get(2)),
+            let changes = changed.into_iter().map(|(item, attribute, value)| Value::Tuple(vec![
+                Value::bytes("OnModuleAttributeChange"), Value::Int(me), Value::Int(item),
+                Value::Int(attribute), Value::Long(now), Value::Int(0), Value::Double(value),
             ])).collect();
             ctx.world.lock().notify(&[ctx.client_id], "OnModuleAttributeChanges", Value::Tuple(vec![Value::List(changes)]));
             Outcome::Value(Value::None)
@@ -147,44 +189,52 @@ async fn repackage(ctx: &Ctx<'_>, station: i64, item_ids: &[i64]) -> Outcome {
     if ctx.session.station_id != Some(station) {
         return Outcome::custom("Dock at this station before repackaging items.");
     }
-    let ids: Vec<i32> = item_ids.iter().map(|i| *i as i32).collect();
-    let active_ship = ctx.session.ship_id.map(|s| s as i32);
+    let mut ids = item_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let active_ship = ctx.session.ship_id;
 
-    let damaged = ctx.query_one(r#"SELECT count(*) FROM entity_attributes WHERE "itemID" = ANY($1)
-        AND "attributeID" IN (3,266) AND COALESCE("valueFloat", "valueInt"::float8, 0) > 0"#, &[&ids])
-        .await.and_then(|row| int(&row, 0)).unwrap_or(0);
-    if damaged > 0 {
+    let (damaged, holding) = ctx.store.read(|db| {
+        let damaged = ids.iter().any(|id| [3, 266].iter().any(|a| stored(db, *id, *a) > 0.0));
+        let holding = ids.iter().any(|id| db.table("entity").find(&["locationID"], &[store::Value::Int(*id)]).next().is_some());
+        (damaged, holding)
+    });
+    if damaged {
         return Outcome::custom("Repair damaged items before repackaging them.");
     }
-
-    let sql = r#"SELECT count(*) FROM entity WHERE "locationID" = ANY($1)"#;
-    let holding = ctx.query_one(sql, &[&ids]).await.and_then(|r| int(&r, 0)).unwrap_or(0);
-    if holding > 0 {
+    if holding {
         return Outcome::custom("Remove everything from an item before repackaging it.");
     }
-    let sql = r#"UPDATE entity SET "singleton" = 0
-                  WHERE "itemID" = ANY($1) AND "ownerID" = $2 AND "locationID" = $3
-                    AND "singleton" = 1 AND "itemID" IS DISTINCT FROM $4
-                RETURNING "itemID""#;
-    let done: Vec<i32> = ctx
-        .query(sql, &[&ids, &(me as i32), &(station as i32), &active_ship])
-        .await
-        .iter()
-        .filter_map(|r| int(r, 0))
-        .map(|i| i as i32)
-        .collect();
-    if done.is_empty() {
+    let repackaged = ctx.store.write(|tx| {
+        let mut done = Vec::new();
+        for id in &ids {
+            let Some(row) = tx.table("entity").get_id(*id).filter(|e| {
+                e.int("ownerID") == Some(me) && e.int("locationID") == Some(station) && e.int("singleton") == Some(1) && active_ship != Some(*id)
+            }) else {
+                continue;
+            };
+            let row = row.id;
+            tx.update("entity", row, &[("singleton", store::Value::Int(0))])?;
+            done.push(row);
+        }
+        let entity = tx.table("entity");
+        let rows: Vec<Vec<Value>> = done.iter().filter_map(|row| entity.row(*row)).filter_map(|r| invitem_cells(&r)).collect();
+        Ok::<_, StoreError>((done.len(), rows))
+    });
+    let (count, rows) = repackaged.unwrap_or_else(|e| {
+        error!("repackaging: {}", crate::logging::chain(&e));
+        (0, Vec::new())
+    });
+    if count == 0 {
         return Outcome::Value(Value::None);
     }
 
-    let sql = format!(r#"{INVITEM_SELECT} e."itemID" = ANY($1)"#);
-    let rows = ctx.query(&sql, &[&done]).await;
     let world = ctx.world.lock();
-    for r in &rows {
-        let event = item_change(invitem_cells(r), vec![(IX_SINGLETON, Value::Int(1))]);
+    for cells in rows {
+        let event = item_change(cells, vec![(IX_SINGLETON, Value::Int(1))]);
         world.notify(&[ctx.client_id], "OnItemChange", event);
     }
-    info!("repackaged {} item(s) at station {station}", done.len());
+    info!("repackaged {count} item(s) at station {station}");
     Outcome::Value(Value::None)
 }
 
@@ -199,37 +249,40 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
     async fn station_repairs_clear_hull_and_armour_and_refuse_remote_items() {
         let database = crate::test_support::Database::load().await;
-        let owner = database.id().await;
-        let ship = database.id().await;
-        let module = database.id().await;
-        let remote = database.id().await;
-        for (id, type_id, location, flag) in [(ship, 606, 60014689, 4), (module, 3634, ship, 27), (remote, 606, 60000004, 4)] {
-            database.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES ($1,$2,$3,$4,$5,1,1)"#, &[&id, &type_id, &owner, &location, &flag]).await.unwrap();
-        }
-        for (id, attribute, value) in [(ship, 3, 15.0), (ship, 266, 25.0), (module, 3, 10.0), (remote, 3, 50.0)] {
-            database.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueFloat") VALUES ($1,$2,$3)"#,
-                &[&id, &attribute, &value]).await.unwrap();
-        }
-        let session = crate::session::Session { char_id: Some(i64::from(owner)), station_id: Some(60014689), ..Default::default() };
+        let owner = i64::from(database.id().await);
+        let ship = i64::from(database.id().await);
+        let module = i64::from(database.id().await);
+        let remote = i64::from(database.id().await);
+        let int = store::Value::Int;
+        database.store.write(|tx| {
+            for (id, type_id, location, flag) in [(ship, 606, 60014689, 4), (module, 3634, ship, 27), (remote, 606, 60000004, 4)] {
+                tx.insert("entity", &[("itemID", int(id)), ("typeID", int(type_id)), ("ownerID", int(owner)), ("locationID", int(location)),
+                    ("flag", int(flag)), ("quantity", int(1)), ("singleton", int(1))])?;
+            }
+            for (id, attribute, value) in [(ship, 3, 15.0), (ship, 266, 25.0), (module, 3, 10.0), (remote, 3, 50.0)] {
+                tx.insert("entity_attributes", &[("itemID", int(id)), ("attributeID", int(attribute)), ("valueFloat", store::Value::Float(value))])?;
+            }
+            Ok::<_, StoreError>(())
+        }).unwrap();
+        let session = crate::session::Session { char_id: Some(owner), station_id: Some(60014689), ..Default::default() };
         let ctx = database.ctx(&session);
-        let Value::Dict(reports) = damage_reports(&ctx, &[i64::from(ship)]).await else { panic!("reports") };
+        let Value::Dict(reports) = damage_reports(&ctx, &[ship]).await else { panic!("reports") };
         let quotes = field(&reports[0].1, "quote").seq().unwrap();
         assert_eq!(quotes.len(), 2, "ship and fitted module");
-        let hull = quotes.iter().find(|quote| field(quote, "itemID") == &Value::Int(i64::from(ship))).unwrap();
+        let hull = quotes.iter().find(|quote| field(quote, "itemID") == &Value::Int(ship)).unwrap();
         assert_eq!(field(hull, "damage"), &Value::Double(40.0), "hull plus armour");
-        assert!(matches!(repair(&ctx, &[i64::from(ship), i64::from(remote)]).await, Outcome::UserError { .. }));
-        let count = database.db.query_one(r#"SELECT count(*) FROM entity_attributes WHERE "itemID" = $1"#, &[&ship]).await.unwrap().get::<_, i64>(0);
-        assert_eq!(count, 2, "invalid mixed requests cannot partly repair local items");
-        assert!(matches!(repackage(&ctx, 60014689, &[i64::from(module)]).await, Outcome::UserError { .. }));
-        assert!(matches!(repair(&ctx, &[i64::from(ship), i64::from(module)]).await, Outcome::Value(Value::None)));
-        let count = database.db.query_one(r#"SELECT count(*) FROM entity_attributes WHERE "itemID" = ANY($1) AND "attributeID" IN (3,266)"#,
-            &[&vec![ship, module]]).await.unwrap().get::<_, i64>(0);
-        assert_eq!(count, 0);
-        let remote_damage = database.db.query_one(r#"SELECT "valueFloat" FROM entity_attributes WHERE "itemID" = $1 AND "attributeID" = 3"#, &[&remote]).await.unwrap().get::<_, f64>(0);
+        assert!(matches!(repair(&ctx, &[ship, remote]).await, Outcome::UserError { .. }));
+        let attributes = |ids: &[i64]| database.store.read(|db| {
+            ids.iter().map(|id| db.table("entity_attributes").find(&["itemID"], &[int(*id)])
+                .filter(|a| matches!(a.int("attributeID"), Some(3 | 266))).count()).sum::<usize>()
+        });
+        assert_eq!(attributes(&[ship]), 2, "invalid mixed requests cannot partly repair local items");
+        assert!(matches!(repackage(&ctx, 60014689, &[module]).await, Outcome::UserError { .. }));
+        assert!(matches!(repair(&ctx, &[ship, module]).await, Outcome::Value(Value::None)));
+        assert_eq!(attributes(&[ship, module]), 0);
+        let remote_damage = database.store.read(|db| stored(db, remote, 3));
         assert_eq!(remote_damage, 50.0);
     }
 }

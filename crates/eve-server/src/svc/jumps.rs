@@ -25,7 +25,7 @@ use crate::beacons::{self, Beacon, Kind};
 use crate::dogma::Loadout;
 use crate::items::ItemTxn;
 use crate::services::Ctx;
-use crate::svc::rows::{float, int};
+use crate::store::{self, Db, StoreError};
 use crate::world::{World, WorldState};
 
 pub(crate) mod portal;
@@ -67,37 +67,43 @@ pub struct FuelCost {
 }
 
 impl FuelCost {
+    /// The fuel's stacks in the hold, by itemID: (itemID, quantity).
+    fn stacks(&self, db: &Db) -> Vec<(i64, i64)> {
+        let mut stacks: Vec<(i64, i64)> = db
+            .table("entity")
+            .find(&["locationID"], &[store::Value::Int(self.cargo)])
+            .filter(|e| e.int("typeID") == Some(self.type_id) && self.flag.is_none_or(|f| e.int("flag") == Some(f.into())))
+            .filter_map(|e| Some((e.int("itemID")?, e.int("quantity").filter(|q| *q > 0)?)))
+            .collect();
+        stacks.sort_unstable();
+        stacks
+    }
+
     pub async fn check(&self, ctx: &Ctx<'_>) -> Refused<()> {
-        let row=ctx.query_one(r#"SELECT COALESCE(sum(quantity),0)::bigint FROM entity
-            WHERE "locationID"=$1 AND "typeID"=$2 AND ($3::integer IS NULL OR flag=$3) AND quantity>0"#,
-            &[&(self.cargo as i32),&(self.type_id as i32),&self.flag]).await.ok_or("The jump fuel could not be read.")?;
-        if row.get::<_,i64>(0)<self.quantity { return Err(format!("That jump needs {} units of fuel.",self.quantity)); }
+        let have: i64 = ctx.store.read(|db| self.stacks(db)).iter().map(|(_, quantity)| quantity).sum();
+        if have<self.quantity { return Err(format!("That jump needs {} units of fuel.",self.quantity)); }
         Ok(())
     }
 
     /// The caller owns the arrival transaction. Refusal or a later failed
     /// arrival write rolls these item changes back together.
-    pub async fn debit(&self, txn: &mut ItemTxn<'_>) -> Refused<()> {
+    pub fn debit(&self, txn: &mut ItemTxn<'_, '_>) -> Refused<()> {
         if self.type_id<=0 || self.quantity<0 { return Err("The jump fuel requirement is invalid.".into()); }
-        let stacks=txn.tx().query(r#"SELECT "itemID",quantity FROM entity
-            WHERE "locationID"=$1 AND "typeID"=$2 AND ($3::integer IS NULL OR flag=$3)
-              AND quantity>0 ORDER BY "itemID" FOR UPDATE"#,
-            &[&(self.cargo as i32),&(self.type_id as i32),&self.flag]).await.map_err(payment_error)?;
-        let have:i64=stacks.iter().map(|r|i64::from(r.get::<_,i32>(1))).sum();
+        let stacks=self.stacks(txn.db());
+        let have:i64=stacks.iter().map(|(_,quantity)|quantity).sum();
         if have<self.quantity { return Err(format!("That jump needs {} units of fuel; only {have} remain.",self.quantity)); }
         let mut left=self.quantity;
-        for row in stacks {
+        for (id,quantity) in stacks {
             if left==0 { break; }
-            let (id,quantity)=(i64::from(row.get::<_,i32>(0)),i64::from(row.get::<_,i32>(1)));
             let take=left.min(quantity);
-            txn.set_quantity(id,quantity-take).await.map_err(payment_error)?;
+            txn.set_quantity(id,quantity-take).map_err(payment_error)?;
             left-=take;
         }
         Ok(())
     }
 }
 
-fn payment_error(error: tokio_postgres::Error) -> String {
+fn payment_error(error: StoreError) -> String {
     tracing::error!("jump fuel: {}",crate::logging::chain(&error));
     "The jump fuel could not be paid.".into()
 }
@@ -175,14 +181,25 @@ pub fn orphaned_cynos(w: &mut WorldState) {
 /// Trinity's map consumer unpacks (moduleCnt, structureCnt), including fixed
 /// beacons whose system has no connected clients and therefore no ballpark.
 pub async fn beacon_count(ctx: &Ctx<'_>) -> Value {
-    let rows = ctx.query(r#"SELECT e."locationID",COUNT(*) FROM entity e
-        JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "posStructures" p ON p."itemID"=e."itemID"
-        JOIN "mapSolarSystems" s ON s."solarSystemID"=e."locationID"
-        WHERE t."groupID"=838 AND p.state IN (4,5) AND e.quantity>0
-        GROUP BY e."locationID""#, &[]).await;
-    let fixed = rows.iter().filter_map(|r| Some((int(r,0)?,r.get::<_,i64>(1))));
+    let fixed = ctx.store.read(|db| {
+        let mut counts = std::collections::BTreeMap::<i64, i64>::new();
+        for type_id in crate::sde::get().types_in_group(838) {
+            for e in db.table("entity").find(&["typeID"], &[store::Value::Int((*type_id).into())]) {
+                let Some(system) = e.int("locationID") else { continue };
+                if online(db, e.value("itemID")) && e.int("quantity").is_some_and(|q| q > 0)
+                    && db.table("mapSolarSystems").get_id(system).is_some() {
+                    *counts.entry(system).or_default() += 1;
+                }
+            }
+        }
+        counts
+    });
     beacon_counts(ctx.world, fixed)
+}
+
+/// Whether a fixed beacon's structure is online (state 4 or 5).
+fn online(db: &Db, item: &store::Value) -> bool {
+    db.table("posStructures").get(std::slice::from_ref(item)).is_some_and(|p| matches!(p.int("state"), Some(4 | 5)))
 }
 
 fn beacon_counts(world: &World, fixed: impl IntoIterator<Item=(i64,i64)>) -> Value {
@@ -198,11 +215,13 @@ fn beacon_counts(world: &World, fixed: impl IntoIterator<Item=(i64,i64)>) -> Val
 
 /// Light years between two systems.
 pub async fn light_years(ctx: &Ctx<'_>, a: i64, b: i64) -> Option<f64> {
-    let rows = ctx
-        .query(r#"SELECT "solarSystemID", "x", "y", "z" FROM "mapSolarSystems" WHERE "solarSystemID" = ANY($1)"#, &[&vec![a as i32, b as i32]])
-        .await;
-    let at = |id: i64| rows.iter().find(|r| int(r, 0) == Some(id)).map(|r| Vec3::new(float(r, 1).unwrap_or(0.0), float(r, 2).unwrap_or(0.0), float(r, 3).unwrap_or(0.0)));
-    Some((at(a)? - at(b)?).len() / METERS_PER_LIGHT_YEAR)
+    ctx.store.read(|db| Some((system_at(db, a)? - system_at(db, b)?).len() / METERS_PER_LIGHT_YEAR))
+}
+
+/// Where a solar system is on the map.
+fn system_at(db: &Db, id: i64) -> Option<Vec3> {
+    let r = db.table("mapSolarSystems").get_id(id)?;
+    Some(Vec3::new(r.float("x").unwrap_or(0.0), r.float("y").unwrap_or(0.0), r.float("z").unwrap_or(0.0)))
 }
 
 /// Where a field is: its system's park must hold it, lit by `char_id`.
@@ -216,15 +235,16 @@ pub fn field_at(w: &WorldState, system: i64, beacon: i64, char_id: i64) -> Optio
 async fn alliance_field_at(ctx: &Ctx<'_>, system: i64, beacon: i64) -> Refused<Vec3> {
     let alliance = ctx.session.alliance_id.filter(|id| *id > 0)
         .ok_or("You must belong to the beacon's alliance.")?;
-    let row = ctx.query_one(r#"SELECT e.x,e.y,e.z FROM entity e
-        JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "posStructures" p ON p."itemID"=e."itemID"
-        JOIN corporation c ON c."corporationID"=e."ownerID"
-        WHERE e."itemID"=$1 AND e."locationID"=$2 AND c."allianceID"=$3
-          AND t."groupID"=838 AND p.state IN (4,5)"#,
-        &[&(beacon as i32),&(system as i32),&(alliance as i32)]).await
-        .ok_or("That alliance cynosural beacon is not available.")?;
-    Ok(Vec3::new(float(&row,0).unwrap_or(0.0),float(&row,1).unwrap_or(0.0),float(&row,2).unwrap_or(0.0)))
+    ctx.store.read(|db| {
+        let e = db.table("entity").get_id(beacon).filter(|e| {
+            e.int("locationID") == Some(system)
+                && e.int("typeID").is_some_and(|t| crate::sde::get().types_in_group(838).contains(&(t as i32)))
+                && online(db, e.value("itemID"))
+                && e.int("ownerID").and_then(|o| db.table("corporation").get_id(o)).is_some_and(|c| c.int("allianceID") == Some(alliance))
+        })?;
+        Some(Vec3::new(e.float("x").unwrap_or(0.0), e.float("y").unwrap_or(0.0), e.float("z").unwrap_or(0.0)))
+    })
+    .ok_or_else(|| "That alliance cynosural beacon is not available.".into())
 }
 
 fn may_jump(ctx: &Ctx<'_>, ship_id: i64, system: i64) -> Refused<()> {
@@ -253,7 +273,7 @@ pub struct Drive {
 
 /// The ship's jump drive, with its pilot's skills applied; None if it has none.
 pub async fn drive(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Option<Drive> {
-    let loadout = Loadout::load(ctx.db, ctx.dogma, char_id, Some(ship_id), &HashSet::new()).await.ok()?;
+    let loadout = ctx.store.read(|db| Loadout::load(db, ctx.dogma, char_id, Some(ship_id), &HashSet::new())).ok()?;
     let i = loadout.find(ship_id)?;
     let v = |a: i32| loadout.value(i, a);
     if v(ATTR_CAN_JUMP) <= 0.0 && v(ATTR_JUMP_RANGE) <= 0.0 {
@@ -271,7 +291,7 @@ pub async fn drive(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Option<Drive> {
 /// The portal generator fitted to a titan, with its fuel per activation.
 #[cfg(test)]
 pub async fn portal_generator(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Option<(i64, i64, i64)> {
-    let loadout = Loadout::load(ctx.db, ctx.dogma, char_id, Some(ship_id), &HashSet::new()).await.ok()?;
+    let loadout = ctx.store.read(|db| Loadout::load(db, ctx.dogma, char_id, Some(ship_id), &HashSet::new())).ok()?;
     let p = loadout.pieces.iter().position(|p| p.group_id == GROUP_JUMP_PORTAL_GENERATOR && p.state != crate::dogma::State::Offline)?;
     Some((loadout.pieces[p].item_id, loadout.value(p, ATTR_CONSUMPTION_TYPE) as i64, loadout.value(p, ATTR_CONSUMPTION_QUANTITY) as i64))
 }
@@ -425,16 +445,21 @@ pub async fn prepare_jump_through(ctx: &Ctx<'_>, char_id: i64, ship_id: i64, fro
         return Err(format!("You must be within {:.0} km of the titan to jump through its bridge.", BRIDGE_RANGE / 1_000.0));
     }
     if bridge.harmonics>0 {
-        let loadout=Loadout::load(ctx.db,ctx.dogma,char_id,Some(ship_id),&HashSet::new()).await.map_err(payment_error)?;
+        let loadout=ctx.store.read(|db|Loadout::load(db,ctx.dogma,char_id,Some(ship_id),&HashSet::new())).map_err(payment_error)?;
         let index=loadout.find(ship_id).ok_or("Your ship could not be read.")?;
         if loadout.value(index,1253)<bridge.harmonics as f64 {
             return Err("Your ship does not have the jump harmonics required by that covert portal.".into());
         }
     }
-    if ctx.query_one(r#"SELECT 1 FROM entity e JOIN entity_attributes a ON a."itemID"=e."itemID" AND a."attributeID"=2
-        WHERE e."itemID"=$1 AND e."ownerID"=$2 AND e."locationID"=$3 AND e.flag BETWEEN 11 AND 35
-        AND e.singleton=1 AND e.quantity=1 AND COALESCE(a."valueFloat",a."valueInt"::float8,0)<>0"#,
-        &[&(bridge.generator_id as i32),&(titan_pilot as i32),&(titan as i32)]).await.is_none() {
+    let generator_online = ctx.store.read(|db| {
+        let fitted = db.table("entity").get_id(bridge.generator_id).is_some_and(|e| {
+            e.int("ownerID") == Some(titan_pilot) && e.int("locationID") == Some(titan) && e.int("flag").is_some_and(|f| (11..=35).contains(&f))
+                && e.int("singleton") == Some(1) && e.int("quantity") == Some(1)
+        });
+        fitted && db.table("entity_attributes").get(&[store::Value::Int(bridge.generator_id), store::Value::Int(2)])
+            .is_some_and(|a| a.float("valueFloat").or(a.float("valueInt")).unwrap_or(0.0) != 0.0)
+    });
+    if !generator_online {
         return Err("The portal generator is no longer online and fitted to that ship.".into());
     }
     let at = match bridge.member {
@@ -475,96 +500,107 @@ mod tests {
     use crate::ballpark::{Park, Pilot, Ship, ShipStats};
     use crate::world::World;
 
+    /// Test rows, inserted as they are given.
+    fn insert(fixture: &crate::test_support::Database, table: &str, sets: &[(&str, store::Value)]) {
+        fixture.store.write(|tx| tx.insert(table, sets)).unwrap();
+    }
+
+    fn set(fixture: &crate::test_support::Database, table: &str, id: i64, sets: &[(&str, store::Value)]) {
+        fixture.store.write(|tx| {
+            let row = tx.table(table).get_id(id).unwrap().id;
+            tx.update(table, row, sets)
+        }).unwrap();
+    }
+
+    fn quantity(fixture: &crate::test_support::Database, id: i64) -> i64 {
+        fixture.store.read(|db| db.table("entity").get_id(id).unwrap().int("quantity").unwrap())
+    }
+
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn alliance_beacons_check_ownership_state_and_drive_payment() {
         let fixture = crate::test_support::Database::load().await;
-        let corp = fixture.id().await;
-        let alliance = fixture.id().await;
-        let pilot = fixture.id().await;
-        let ship_id = fixture.id().await;
-        let beacon = fixture.id().await;
-        let fuel_id = fixture.id().await;
-        let generator = fixture.id().await;
-        let beacon_type:i32 = fixture.db.query_one(r#"SELECT "typeID" FROM "invTypes" WHERE "groupID"=838 ORDER BY "typeID" LIMIT 1"#,&[]).await.unwrap().get(0);
-        let portal_type:i32 = fixture.db.query_one(r#"SELECT "typeID" FROM "invTypes" WHERE "groupID"=590 ORDER BY "typeID" LIMIT 1"#,&[]).await.unwrap().get(0);
-        fixture.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName","allianceID") VALUES ($1,$2,$3)"#,
-            &[&corp,&format!("Beacon test {corp}"),&alliance]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","corporationID","shipID","solarSystemID","stationID") VALUES ($1,$2,$3,$4,30000142,0)"#,
-            &[&pilot,&format!("Beacon pilot {pilot}"),&corp,&ship_id]).await.unwrap();
+        let int = store::Value::Int;
+        let corp = i64::from(fixture.id().await);
+        let alliance = i64::from(fixture.id().await);
+        let pilot = i64::from(fixture.id().await);
+        let ship_id = i64::from(fixture.id().await);
+        let beacon = i64::from(fixture.id().await);
+        let fuel_id = i64::from(fixture.id().await);
+        let generator = i64::from(fixture.id().await);
+        let beacon_type = i64::from(crate::sde::get().types_in_group(838)[0]);
+        let portal_type = i64::from(crate::sde::get().types_in_group(590)[0]);
+        insert(&fixture, "corporation", &[("corporationID", int(corp)), ("corporationName", store::Value::Text(format!("Beacon test {corp}").into())), ("allianceID", int(alliance))]);
+        insert(&fixture, "character_", &[("characterID", int(pilot)), ("characterName", store::Value::Text(format!("Beacon pilot {pilot}").into())),
+            ("corporationID", int(corp)), ("shipID", int(ship_id)), ("solarSystemID", int(30000142)), ("stationID", int(0))]);
         for (id,typ,owner,location,flag) in [(pilot,1373,pilot,ship_id,57),(ship_id,11567,pilot,30000142,0),
             (beacon,beacon_type,corp,30000143,0),(generator,portal_type,pilot,ship_id,27)] {
-            fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES ($1,$2,$3,$4,$5,1,1)"#,&[&id,&typ,&owner,&location,&flag]).await.unwrap();
+            insert(&fixture, "entity", &[("itemID", int(id)), ("typeID", int(typ)), ("ownerID", int(owner)), ("locationID", int(location)),
+                ("flag", int(flag)), ("quantity", int(1)), ("singleton", int(1))]);
         }
-        fixture.db.execute(r#"INSERT INTO "posStructures" ("itemID",state) VALUES ($1,4)"#,&[&beacon]).await.unwrap();
-        let mut session = crate::session::Session { char_id:Some(i64::from(pilot)),ship_id:Some(i64::from(ship_id)),
-            solar_system_id:Some(30000142),corp_id:Some(i64::from(corp)),alliance_id:Some(i64::from(alliance)),..Default::default() };
-        assert!(alliance_field_at(&fixture.ctx(&session),30000143,i64::from(beacon)).await.is_ok());
-        session.alliance_id = Some(i64::from(alliance)+1);
-        assert!(alliance_field_at(&fixture.ctx(&session),30000143,i64::from(beacon)).await.is_err());
-        session.alliance_id = Some(i64::from(alliance));
-        assert!(alliance_field_at(&fixture.ctx(&session),30000144,i64::from(beacon)).await.is_err());
-        fixture.db.execute(r#"UPDATE "posStructures" SET state=1 WHERE "itemID"=$1"#,&[&beacon]).await.unwrap();
-        assert!(alliance_field_at(&fixture.ctx(&session),30000143,i64::from(beacon)).await.is_err());
-        fixture.db.execute(r#"UPDATE "posStructures" SET state=4 WHERE "itemID"=$1"#,&[&beacon]).await.unwrap();
+        insert(&fixture, "posStructures", &[("itemID", int(beacon)), ("state", int(4))]);
+        let mut session = crate::session::Session { char_id:Some(pilot),ship_id:Some(ship_id),
+            solar_system_id:Some(30000142),corp_id:Some(corp),alliance_id:Some(alliance),..Default::default() };
+        assert!(alliance_field_at(&fixture.ctx(&session),30000143,beacon).await.is_ok());
+        session.alliance_id = Some(alliance+1);
+        assert!(alliance_field_at(&fixture.ctx(&session),30000143,beacon).await.is_err());
+        session.alliance_id = Some(alliance);
+        assert!(alliance_field_at(&fixture.ctx(&session),30000144,beacon).await.is_err());
+        set(&fixture, "posStructures", beacon, &[("state", int(1))]);
+        assert!(alliance_field_at(&fixture.ctx(&session),30000143,beacon).await.is_err());
+        set(&fixture, "posStructures", beacon, &[("state", int(4))]);
         let ctx = fixture.ctx(&session);
-        let d = drive(&ctx,i64::from(pilot),i64::from(ship_id)).await.unwrap();
-        let profile = super::super::inflight::profile(&fixture.db,&fixture.dogma,i64::from(pilot),i64::from(ship_id),&Default::default(),crate::combat::now_ms()).await.unwrap().unwrap();
-        let mut ship = Ship::new(i64::from(ship_id),1,profile.stats,profile.pilot,Vec3::ZERO,Vec3::ZERO);
+        let d = drive(&ctx,pilot,ship_id).await.unwrap();
+        let profile = fixture.store.read(|db| super::super::inflight::profile(db,&fixture.dogma,pilot,ship_id,&Default::default(),crate::combat::now_ms())).unwrap().unwrap();
+        let mut ship = Ship::new(ship_id,1,profile.stats,profile.pilot,Vec3::ZERO,Vec3::ZERO);
         ship.fight = Some(profile.fighter);
         ship.fight.as_mut().unwrap().vitals.capacitor.recharge_ms = 0.0;
         let mut park = Park::new(30000142,Vec::new(),0);
-        park.ships.insert(i64::from(ship_id),ship);
+        park.ships.insert(ship_id,ship);
         fixture.world.lock().parks.insert(30000142,park);
-        let capacitor = || fixture.world.lock().parks[&30000142].ships[&i64::from(ship_id)].fight.as_ref().unwrap().vitals.capacitor.at(crate::combat::now_ms());
+        let capacitor = || fixture.world.lock().parks[&30000142].ships[&ship_id].fight.as_ref().unwrap().vitals.capacitor.at(crate::combat::now_ms());
         let before = capacitor();
-        assert!(prepare_alliance_jump(&ctx,i64::from(pilot),i64::from(ship_id),30000142,i64::from(beacon),30000143).await.is_err());
+        assert!(prepare_alliance_jump(&ctx,pilot,ship_id,30000142,beacon,30000143).await.is_err());
         assert_eq!(capacitor(),before,"insufficient fuel never reserves capacitor");
-        fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity)
-            VALUES ($1,$2,$3,$4,5,100000)"#,&[&fuel_id,&(d.fuel as i32),&pilot,&ship_id]).await.unwrap();
-        let quote=prepare_alliance_jump(&ctx,i64::from(pilot),i64::from(ship_id),30000142,i64::from(beacon),30000143).await.unwrap();
-        let fuel_left:i32 = fixture.db.query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#,&[&fuel_id]).await.unwrap().get(0);
+        insert(&fixture, "entity", &[("itemID", int(fuel_id)), ("typeID", int(d.fuel)), ("ownerID", int(pilot)), ("locationID", int(ship_id)),
+            ("flag", int(5)), ("quantity", int(100000))]);
+        let quote=prepare_alliance_jump(&ctx,pilot,ship_id,30000142,beacon,30000143).await.unwrap();
+        let fuel_left = quantity(&fixture, fuel_id);
         assert_eq!(fuel_left,100000,"preparation leaves payment for the arrival transaction");
         assert_eq!(capacitor(),before);
         assert!(quote.capacitor>0.0 && quote.fuel.quantity>0);
-        assert!(open_bridge_structure(&ctx,i64::from(beacon),30000143).await.is_err(),"offline portal cannot activate");
-        fixture.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,2,1)"#,&[&generator]).await.unwrap();
-        let (_,portal_fuel,quantity) = portal_generator(&ctx,i64::from(pilot),i64::from(ship_id)).await.unwrap();
-        let portal_fuel_id = fixture.id().await;
-        fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity)
-            VALUES ($1,$2,$3,$4,5,$5)"#,&[&portal_fuel_id,&(portal_fuel as i32),&pilot,&ship_id,&((quantity+100) as i32)]).await.unwrap();
-        open_bridge_structure(&ctx,i64::from(beacon),30000143).await.unwrap();
-        assert_eq!(fixture.world.lock().bridges[&i64::from(ship_id)].member,None);
-        assert!(open_bridge_structure(&ctx,i64::from(beacon),30000143).await.is_err(),"opening twice cannot reset a portal");
-        let traveler = fixture.id().await;
-        let traveler_ship = fixture.id().await;
+        assert!(open_bridge_structure(&ctx,beacon,30000143).await.is_err(),"offline portal cannot activate");
+        insert(&fixture, "entity_attributes", &[("itemID", int(generator)), ("attributeID", int(2)), ("valueInt", int(1))]);
+        let (_,portal_fuel,portal_quantity) = portal_generator(&ctx,pilot,ship_id).await.unwrap();
+        let portal_fuel_id = i64::from(fixture.id().await);
+        insert(&fixture, "entity", &[("itemID", int(portal_fuel_id)), ("typeID", int(portal_fuel)), ("ownerID", int(pilot)), ("locationID", int(ship_id)),
+            ("flag", int(5)), ("quantity", int(portal_quantity+100))]);
+        open_bridge_structure(&ctx,beacon,30000143).await.unwrap();
+        assert_eq!(fixture.world.lock().bridges[&ship_id].member,None);
+        assert!(open_bridge_structure(&ctx,beacon,30000143).await.is_err(),"opening twice cannot reset a portal");
+        let traveler = i64::from(fixture.id().await);
+        let traveler_ship = i64::from(fixture.id().await);
         {
             let mut w=fixture.world.lock();
             let park=w.parks.get_mut(&30000142).unwrap();
-            park.ships.get_mut(&i64::from(ship_id)).unwrap().pilot.alliance_id=Some(i64::from(alliance));
-            park.ships.insert(i64::from(traveler_ship),Ship::new(i64::from(traveler_ship),1,
+            park.ships.get_mut(&ship_id).unwrap().pilot.alliance_id=Some(alliance);
+            park.ships.insert(traveler_ship,Ship::new(traveler_ship,1,
                 ShipStats::new(100.0,1_000_000.0,1.0,300.0,1.0),Pilot { type_id:587,group_id:25,name:"Traveler".into(),
-                    char_id:i64::from(traveler),corp_id:i64::from(corp),alliance_id:Some(i64::from(alliance)),security:0.0,bounty:0.0 },Vec3::ZERO,Vec3::ZERO));
+                    char_id:traveler,corp_id:corp,alliance_id:Some(alliance),security:0.0,bounty:0.0 },Vec3::ZERO,Vec3::ZERO));
         }
         let mut passenger=session.clone();
-        passenger.char_id=Some(i64::from(traveler));
-        passenger.ship_id=Some(i64::from(traveler_ship));
-        let (_,quote)=prepare_jump_through(&fixture.ctx(&passenger),i64::from(traveler),i64::from(traveler_ship),30000142,i64::from(pilot),i64::from(ship_id),true).await.unwrap();
-        let transit_left:i32=fixture.db.query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#,&[&fuel_id]).await.unwrap().get(0);
-        assert_eq!(transit_left,fuel_left,"transit preparation has no side effects");
+        passenger.char_id=Some(traveler);
+        passenger.ship_id=Some(traveler_ship);
+        let (_,quote)=prepare_jump_through(&fixture.ctx(&passenger),traveler,traveler_ship,30000142,pilot,ship_id,true).await.unwrap();
+        assert_eq!(quantity(&fixture, fuel_id),fuel_left,"transit preparation has no side effects");
         assert_eq!(quote.fuel.type_id,d.fuel,"transit quotes the titan's drive isotope fuel");
-        assert_eq!(quote.fuel.cargo,i64::from(ship_id));
+        assert_eq!(quote.fuel.cargo,ship_id);
         assert!(quote.fuel.quantity>0);
-        let activation_left:i32=fixture.db.query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#,&[&portal_fuel_id]).await.unwrap().get(0);
-        assert_eq!(activation_left,100,"transit does not consume portal activation fuel");
-        passenger.alliance_id=Some(i64::from(alliance)+1);
-        assert!(prepare_jump_through(&fixture.ctx(&passenger),i64::from(traveler),i64::from(traveler_ship),30000142,i64::from(pilot),i64::from(ship_id),true).await.is_err());
-        fixture.world.lock().bridges.get_mut(&i64::from(ship_id)).unwrap().until_ms=0;
-        passenger.alliance_id=Some(i64::from(alliance));
-        assert!(prepare_jump_through(&fixture.ctx(&passenger),i64::from(traveler),i64::from(traveler_ship),30000142,i64::from(pilot),i64::from(ship_id),true).await.is_err());
-        fixture.db.execute(r#"DELETE FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![pilot,ship_id,beacon,fuel_id,generator,portal_fuel_id]]).await.unwrap();
-        fixture.db.execute(r#"DELETE FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap();
+        assert_eq!(quantity(&fixture, portal_fuel_id),100,"transit does not consume portal activation fuel");
+        passenger.alliance_id=Some(alliance+1);
+        assert!(prepare_jump_through(&fixture.ctx(&passenger),traveler,traveler_ship,30000142,pilot,ship_id,true).await.is_err());
+        fixture.world.lock().bridges.get_mut(&ship_id).unwrap().until_ms=0;
+        passenger.alliance_id=Some(alliance);
+        assert!(prepare_jump_through(&fixture.ctx(&passenger),traveler,traveler_ship,30000142,pilot,ship_id,true).await.is_err());
     }
 
     #[test]
@@ -610,7 +646,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn map_counts_online_fixed_beacons_without_loading_their_system() {
         let f=crate::test_support::Database::load().await;
         let session=crate::session::Session::default();
@@ -625,14 +660,15 @@ mod tests {
             }).unwrap_or((0,0))
         };
         let baseline=counts(beacon_count(&ctx).await);
-        let id=f.id().await;
-        let ty=f.db.query_one(r#"SELECT "typeID" FROM "invTypes" WHERE "groupID"=838 ORDER BY "typeID" LIMIT 1"#,&[]).await.unwrap().get::<_,i32>(0);
-        f.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,flag,singleton) VALUES ($1,$2,1000002,30000143,1,0,1)"#,&[&id,&ty]).await.unwrap();
-        f.db.execute(r#"INSERT INTO "posStructures" ("itemID",state) VALUES ($1,4)"#,&[&id]).await.unwrap();
+        let id=i64::from(f.id().await);
+        let ty=i64::from(crate::sde::get().types_in_group(838)[0]);
+        let int=store::Value::Int;
+        insert(&f, "entity", &[("itemID", int(id)), ("typeID", int(ty)), ("ownerID", int(1000002)), ("locationID", int(30000143)),
+            ("quantity", int(1)), ("flag", int(0)), ("singleton", int(1))]);
+        insert(&f, "posStructures", &[("itemID", int(id)), ("state", int(4))]);
         assert!(f.world.lock().parks.is_empty());
         assert_eq!(counts(beacon_count(&ctx).await),(baseline.0,baseline.1+1));
-        f.db.execute(r#"UPDATE "posStructures" SET state=1 WHERE "itemID"=$1"#,&[&id]).await.unwrap();
+        set(&f, "posStructures", id, &[("state", int(1))]);
         assert_eq!(counts(beacon_count(&ctx).await),baseline);
-        f.db.execute(r#"DELETE FROM entity WHERE "itemID"=$1"#,&[&id]).await.unwrap();
     }
 }

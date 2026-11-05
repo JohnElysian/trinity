@@ -1,20 +1,14 @@
+use std::collections::HashMap;
+
 use eve_marshal::Value;
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::svc::{agent_missions, bound};
-use crate::svc::rows::{int, key_val};
+use crate::svc::rows::{key_val, rowset};
 
 const HEADER: &[&str] =
     &["agentID", "divisionID", "corporationID", "stationID", "level", "quality", "agentTypeID",
       "bloodlineID"];
-
-// An agent is also a character; its bloodline lives on that character row
-// (the agent window reads a.bloodlineID, agents.py:289).
-const SQL: &str = r#"SELECT a."agentID",a."divisionID",a."corporationID",a."stationID",
-                            a."level",a."quality",a."agentTypeID",c."bloodlineID"
-                       FROM "agtAgents" a
-                       LEFT JOIN "character_" c ON c."characterID" = a."agentID"
-                      ORDER BY a."agentID""#;
 
 pub async fn agent_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
@@ -51,14 +45,13 @@ fn action_id(call: &Call) -> Option<i64> {
 /// The agent's Show Info panel (infosvc.py:1404-1429). Effective quality is the
 /// plain quality: the skill and standing adjustments are not modelled.
 async fn info_service_details(ctx: &Ctx<'_>, agent_id: i64) -> Value {
-    let sql = r#"SELECT "stationID","level","quality","corporationID" FROM "agtAgents" WHERE "agentID" = $1"#;
-    let Some(r) = ctx.query_one(sql, &[&(agent_id as i32)]).await else { return Value::None };
-    let quality = Value::int_or_none(int(&r, 2));
+    let Some(r) = crate::sde::table("agtAgents").get("agentID", (agent_id as i32).into()) else { return Value::None };
+    let quality = Value::int_or_none(r.int("quality"));
     let me = ctx.session.char_id.unwrap_or(0) as i32;
-    let lp = crate::svc::lp::lp(ctx, me, int(&r, 3).unwrap_or(0) as i32).await;
+    let lp = crate::svc::lp::lp(ctx, me, r.int("corporationID").unwrap_or(0) as i32).await;
     key_val(vec![
-        ("stationID", Value::int_or_none(int(&r, 0))),
-        ("level", Value::int_or_none(int(&r, 1))),
+        ("stationID", Value::int_or_none(r.int("stationID"))),
+        ("level", Value::int_or_none(r.int("level"))),
         ("quality", quality.clone()),
         ("effectiveQuality", quality),
         // The pilot's LP with the agent's corporation.
@@ -69,7 +62,29 @@ async fn info_service_details(ctx: &Ctx<'_>, agent_id: i64) -> Value {
 }
 
 async fn get_agents(ctx: &Ctx<'_>) -> Value {
-    ctx.rowset(HEADER, SQL, &[]).await
+    let mut agents: Vec<crate::sde::Row> = crate::sde::table("agtAgents").rows().collect();
+    agents.sort_by_key(|a| a.int("agentID"));
+    // An agent is also a character; its bloodline lives on that character
+    // row (the agent window reads a.bloodlineID, agents.py:289).
+    let bloodlines: HashMap<i64, Value> = ctx.store.read(|db| {
+        let characters = db.table("character_");
+        agents
+            .iter()
+            .filter_map(|a| a.int("agentID"))
+            .filter_map(|id| Some((id, characters.get_id(id)?.cell("bloodlineID"))))
+            .collect()
+    });
+    let lines = agents
+        .iter()
+        .map(|a| {
+            // The agent's own columns, then its character's bloodline (None
+            // for an agent without a character row).
+            let mut line = a.line(&HEADER[..7]);
+            line.push(a.int("agentID").and_then(|id| bloodlines.get(&id)).cloned().unwrap_or(Value::None));
+            Value::List(line)
+        })
+        .collect();
+    rowset(HEADER, lines)
 }
 
 #[cfg(test)]

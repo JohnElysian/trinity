@@ -74,9 +74,9 @@ pub fn init(level: &str, file: Option<&std::path::Path>) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// An error followed by its causes. Needed for database errors: a
-/// `tokio_postgres::Error` displays only as "db error" and keeps what actually
-/// went wrong (`relation "x" does not exist`) in its source.
+/// An error followed by its causes. Many errors display only as a summary
+/// and keep what actually went wrong in their source, so every link of the
+/// chain is written out.
 pub fn chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut source = e.source();

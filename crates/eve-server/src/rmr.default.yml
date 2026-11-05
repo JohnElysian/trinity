@@ -8,8 +8,12 @@ server:
   # The web dashboard; empty turns it off (RMR_WEB). It has no login, so
   # keep it off the open internet.
   web: 0.0.0.0:8080
-  # The PostgreSQL database (RMR_DATABASE).
-  database: postgres://rmr:rmr@127.0.0.1:55432/rmr
+  # Where the live data is kept: snapshots and the write-ahead log
+  # (RMR_DATA). An empty folder starts a fresh world.
+  data: data
+  # A pg_dump of an older PostgreSQL database to start from instead,
+  # when the data folder is empty (RMR_IMPORT).
+  # import: trinity.sql
   # This node's machoNet ID (RMR_NODE_ID); leave it at 1.
   nodeId: 1
   # Logging in with an unknown username makes that account, with the

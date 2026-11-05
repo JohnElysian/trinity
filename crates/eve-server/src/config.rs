@@ -15,8 +15,12 @@ pub const GM_ROLES: i64 = 8 | 16 | 256 | 262_144;
 pub struct Config {
     /// `RMR_BIND`: the address the client connects to.
     pub bind: String,
-    /// `RMR_DATABASE`: a PostgreSQL connection URL.
-    pub database: String,
+    /// `RMR_DATA`: the folder the live data is kept in (snapshots and the
+    /// write-ahead log).
+    pub data: PathBuf,
+    /// `RMR_IMPORT`: a `pg_dump` of a PostgreSQL database to start the data
+    /// from when the data folder is empty, instead of a fresh world.
+    pub import: Option<PathBuf>,
     /// `RMR_NODE_ID`: this node's machoNet ID, also the low digits of every clientID.
     pub node_id: i64,
     /// `RMR_STRINGS`: the client's shared marshal string table.
@@ -125,7 +129,8 @@ impl Default for LogSection {
 struct ServerSection {
     bind: String,
     web: String,
-    database: String,
+    data: PathBuf,
+    import: Option<PathBuf>,
     node_id: i64,
     auto_create_accounts: bool,
     strings: Option<PathBuf>,
@@ -157,7 +162,8 @@ impl Default for ServerSection {
         ServerSection {
             bind: "0.0.0.0:26000".into(),
             web: "0.0.0.0:8080".into(),
-            database: "postgres://rmr:rmr@127.0.0.1:55432/rmr".into(),
+            data: "data".into(),
+            import: None,
             node_id: 1,
             auto_create_accounts: false,
             strings: None,
@@ -187,7 +193,8 @@ impl Config {
         let (file, note) = read(&path)?;
         let mut c = Config {
             bind: file.server.bind,
-            database: file.server.database,
+            data: file.server.data,
+            import: file.server.import,
             node_id: file.server.node_id,
             strings: file.server.strings.unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../eve-marshal/data/strings.txt").into()),
             dump_dir: file.server.dump_dir,
@@ -216,8 +223,11 @@ impl Config {
         if let Some(v) = var("RMR_BIND") {
             c.bind = v;
         }
-        if let Some(v) = var("RMR_DATABASE") {
-            c.database = v;
+        if let Some(v) = var("RMR_DATA") {
+            c.data = v.into();
+        }
+        if let Some(v) = var("RMR_IMPORT") {
+            c.import = Some(v.into());
         }
         if let Some(v) = var("RMR_STRINGS") {
             c.strings = v.into();
@@ -252,19 +262,6 @@ impl Config {
             return Err(format!("{}: every account needs a username and a password (see {:?})", path.display(), a.username));
         }
         Ok((c, note))
-    }
-
-    /// The database URL with any password masked, for logging.
-    pub fn database_redacted(&self) -> String {
-        let url = &self.database;
-        let (Some(scheme_end), Some(at)) = (url.find("://"), url.rfind('@')) else {
-            return url.clone();
-        };
-        let creds = &url[scheme_end + 3..at];
-        match creds.split_once(':') {
-            Some((user, _)) => format!("{}{user}:***{}", &url[..scheme_end + 3], &url[at..]),
-            None => url.clone(),
-        }
     }
 }
 
@@ -347,10 +344,11 @@ pub fn auto_create_accounts() -> bool {
 mod tests {
     use super::*;
 
-    fn with_db(url: &str) -> Config {
+    fn with_data(dir: &str) -> Config {
         Config {
             bind: String::new(),
-            database: url.to_string(),
+            data: dir.into(),
+            import: None,
             node_id: 1,
             strings: PathBuf::new(),
             dump_dir: PathBuf::new(),
@@ -373,15 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn the_password_is_masked_in_the_logged_url() {
-        assert_eq!(
-            with_db("postgres://rmr:secret@127.0.0.1:5432/rmr").database_redacted(),
-            "postgres://rmr:***@127.0.0.1:5432/rmr"
-        );
-        assert_eq!(
-            with_db("postgres://127.0.0.1/rmr").database_redacted(),
-            "postgres://127.0.0.1/rmr"
-        );
+    fn the_data_folder_is_where_the_store_is_kept() {
+        assert_eq!(with_data("saves").data, PathBuf::from("saves"));
     }
 
     #[test]
@@ -403,7 +394,7 @@ mod tests {
         let file = parse(DEFAULT_FILE).unwrap();
         let none = File::default();
         assert_eq!(file.server.bind, none.server.bind);
-        assert_eq!(file.server.database, none.server.database);
+        assert_eq!(file.server.data, none.server.data);
         assert_eq!(file.log.level, none.log.level);
         assert_eq!(file.game.starting_isk, none.game.starting_isk);
         assert_eq!(file.game.sov_claim_delay_seconds, none.game.sov_claim_delay_seconds);

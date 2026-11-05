@@ -11,7 +11,6 @@
 use std::collections::BTreeSet;
 
 use eve_marshal::Value;
-use tokio_postgres::{Client, GenericClient};
 use tracing::{error, info, warn};
 
 use crate::ballpark::{Ship, Vec3};
@@ -19,6 +18,7 @@ use crate::combat::{self, attr};
 use crate::conn::Server;
 use crate::items::{self, ItemTxn, NewItem};
 use crate::loot::{self, Stash};
+use crate::store::{self, Db, Store, StoreError, Tx};
 use crate::svc::medical::{GROUP_CLONE, TYPE_CLONE_ALPHA};
 use crate::svc::{inflight, space};
 use crate::world::Move;
@@ -30,9 +30,9 @@ pub use docked::ArrivalDisposition;
 
 const TYPE_CAPSULE: i64 = 670;
 const FLAG_HANGAR: i64 = 4;
-const FLAG_IMPLANT: i32 = 89;
-const FLAG_SKILL: i32 = 7;
-const FLAG_SKILL_IN_TRAINING: i32 = 61;
+const FLAG_IMPLANT: i64 = 89;
+const FLAG_SKILL: i64 = 7;
+const FLAG_SKILL_IN_TRAINING: i64 = 61;
 /// A ship in space sits in its solar system with no flag.
 const FLAG_IN_SPACE: i64 = 0;
 const ATTR_SKILL_TIME_CONSTANT: i32 = 275;
@@ -122,113 +122,162 @@ impl Loss {
     }
 }
 
-pub async fn handle(server: &Server, db: &mut Client, loss: Loss) {
-    journal::handle(server,db,loss).await;
+pub async fn handle(server: &Server, store: &Store, loss: Loss) {
+    journal::handle(server,store,loss).await;
 }
 
 /// A bot's ship destroyed: the kill log and the killmail, as for a player.
 /// The rest (a new ship, waking at home) is the bot simulation's.
-pub async fn bot_lost(server: &Server, db: &mut Client, loss: Loss) {
-    let report = report_text(db, &loss).await;
+pub async fn bot_lost(server: &Server, store: &Store, loss: Loss) {
+    let report = store.read(|db| report_text(db, &loss));
     let mut destroyed = Vec::new();
     for (t, n) in &loss.items {
-        let name = type_name(&*db, *t).await;
+        let name = type_name(*t);
         destroyed.push(if *n > 1 { format!("{name}, Qty: {n}") } else { name });
     }
     let items = format!("<items>{}</items>", loss.items.iter().map(|(ty, quantity)| format!(r#"<i t="{ty}" f="0" d="0" x="{quantity}"/>"#)).collect::<String>());
-    record(server, db, &loss, report, destroyed, items).await;
+    record(server, store, &loss, report, destroyed, items).await;
 }
 
-pub async fn ensure(db: &Client) -> Result<(), tokio_postgres::Error> {
-    db.batch_execute(r#"ALTER TABLE "killLog" ADD COLUMN IF NOT EXISTS "killBlob" text NOT NULL DEFAULT '';
-        ALTER TABLE "killLogParticipants" ADD COLUMN IF NOT EXISTS "securityStatus" double precision"#).await
+/// `killLog."killBlob"` and `killLogParticipants."securityStatus"` are in the
+/// store's schema.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// Why a write that settles custody kept nothing: the store refused a
+/// change, or custody was not as the settlement needs it (the reason the
+/// caller is given).
+enum Refused {
+    Store(StoreError),
+    Because(String),
+}
+
+impl From<StoreError> for Refused {
+    fn from(error: StoreError) -> Self {
+        Refused::Store(error)
+    }
+}
+
+impl From<&str> for Refused {
+    fn from(reason: &str) -> Self {
+        Refused::Because(reason.into())
+    }
+}
+
+impl From<String> for Refused {
+    fn from(reason: String) -> Self {
+        Refused::Because(reason)
+    }
+}
+
+impl Refused {
+    /// The reason, with a store's refusal put as `failed` puts it.
+    fn reason(self, failed: fn(StoreError) -> String) -> String {
+        match self {
+            Refused::Store(error) => failed(error),
+            Refused::Because(reason) => reason,
+        }
+    }
+}
+
+/// Whether the character sits in `ship_id` in space in `system`.
+fn aboard(db: &Db, char_id: i64, ship_id: i64, system: i64) -> bool {
+    db.table("character_").get_id(char_id).is_some_and(|c| {
+        c.int("shipID") == Some(ship_id) && c.int("solarSystemID") == Some(system) && c.int("stationID").unwrap_or(0) == 0
+    })
+}
+
+/// Set columns of the row of `table` whose key is `id` (nothing if there is
+/// none, as an UPDATE matching no row did).
+fn update_id(tx: &mut Tx<'_>, table: &str, id: i64, sets: store::Sets) -> Result<(), StoreError> {
+    match tx.table(table).get_id(id).map(|r| r.id) {
+        Some(row) => tx.update(table, row, sets),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug)]
-struct LostItem { id: i32, type_id: i32, flag: i32, quantity: i32, parent: i32 }
+struct LostItem { id: i64, type_id: i64, flag: i64, quantity: i64, parent: i64 }
 
-async fn item_snapshot(db: &impl GenericClient, loss: &Loss) -> Result<Vec<LostItem>, tokio_postgres::Error> {
+/// Everything in and on the lost hull at any depth (for a capsule, what is in
+/// the pilot's head), never the pilot.
+fn item_snapshot(db: &Db, loss: &Loss) -> Vec<LostItem> {
     let pod = loss.capsule && !loss.unpiloted;
-    let root = if pod { loss.char_id } else { loss.ship_id } as i32;
-    let sql = r#"WITH RECURSIVE contents AS (
-        SELECT "itemID","typeID",flag,quantity,"locationID" FROM entity
-        WHERE "locationID"=$1 AND "itemID"<>$2 AND (NOT $3 OR flag=89)
-        UNION SELECT e."itemID",e."typeID",e.flag,e.quantity,e."locationID" FROM entity e
-            JOIN contents c ON e."locationID"=c."itemID" WHERE e."itemID"<>$2)
-        SELECT * FROM contents"#;
-    let rows = db.query(sql, &[&root, &(loss.char_id as i32), &pod]).await?;
-    Ok(rows.iter().map(|r| LostItem { id:r.get(0), type_id:r.get(1), flag:r.get(2), quantity:r.get(3), parent:r.get(4) }).collect())
+    let root = if pod { loss.char_id } else { loss.ship_id };
+    let entity = db.table("entity");
+    let lost = |e: store::Row| LostItem {
+        id: e.int("itemID").unwrap_or(0),
+        type_id: e.int("typeID").unwrap_or(0),
+        flag: e.int("flag").unwrap_or(0),
+        quantity: e.int("quantity").unwrap_or(0),
+        parent: e.int("locationID").unwrap_or(0),
+    };
+    let mut out: Vec<LostItem> = entity
+        .find(&["locationID"], &[store::Value::Int(root)])
+        .filter(|e| e.int("itemID") != Some(loss.char_id) && (!pod || e.int("flag") == Some(FLAG_IMPLANT)))
+        .map(lost)
+        .collect();
+    let mut seen: std::collections::HashSet<i64> = out.iter().map(|i| i.id).collect();
+    let mut next = 0;
+    while next < out.len() {
+        let parent = out[next].id;
+        next += 1;
+        for e in entity.find(&["locationID"], &[store::Value::Int(parent)]) {
+            let id = e.int("itemID").unwrap_or(0);
+            if id != loss.char_id && seen.insert(id) {
+                out.push(lost(e));
+            }
+        }
+    }
+    out
 }
 
-async fn item_blob(db: &impl GenericClient, before: &[LostItem]) -> Result<String, tokio_postgres::Error> {
+fn item_blob(db: &Db, before: &[LostItem]) -> String {
     let ids = before.iter().map(|i| i.id).collect::<Vec<_>>();
-    let rows = db.query(r#"SELECT "itemID",quantity FROM entity WHERE "itemID"=ANY($1)"#, &[&ids]).await?;
-    let survivors = rows.iter().map(|r| (r.get::<_,i32>(0),r.get::<_,i32>(1))).collect::<std::collections::BTreeMap<_,_>>();
-    fn xml(item: &LostItem, all: &[LostItem], survivors: &std::collections::BTreeMap<i32,i32>, depth: usize) -> String {
+    let entity = db.table("entity");
+    let survivors = ids.iter().filter_map(|id| Some((*id, entity.get_id(*id)?.int("quantity")?))).collect::<std::collections::BTreeMap<_,_>>();
+    fn xml(item: &LostItem, all: &[LostItem], survivors: &std::collections::BTreeMap<i64,i64>, depth: usize) -> String {
         if depth > 32 { return String::new(); }
         let dropped = survivors.get(&item.id).copied().unwrap_or(0).clamp(0,item.quantity.max(0));
         let children = all.iter().filter(|i| i.parent == item.id).map(|i| xml(i,all,survivors,depth+1)).collect::<String>();
         format!(r#"<i t="{}" f="{}" d="{}" x="{}">{children}</i>"#,item.type_id,item.flag,dropped,item.quantity.max(0)-dropped)
     }
-    Ok(format!("<items>{}</items>",before.iter().filter(|i| !ids.contains(&i.parent)).map(|i|xml(i,before,&survivors,0)).collect::<String>()))
-}
-
-/// Freeze the contents before reading the loss snapshot. Read it again after
-/// acquiring the locks so items that moved while we waited are not included.
-/// The XML is calculated before commit and before publishing the loot can.
-async fn lock_loss_contents(tx: &tokio_postgres::Transaction<'_>, loss: &Loss) -> Result<(), tokio_postgres::Error> {
-    let pod = loss.capsule && !loss.unpiloted;
-    let root = if pod { loss.char_id } else { loss.ship_id } as i32;
-    tx.query(r#"WITH RECURSIVE contents AS (
-        SELECT "itemID" FROM entity WHERE "locationID"=$1 AND "itemID"<>$2 AND (NOT $3 OR flag=89)
-        UNION SELECT e."itemID" FROM entity e JOIN contents c ON e."locationID"=c."itemID" WHERE e."itemID"<>$2)
-        SELECT e."itemID" FROM entity e JOIN contents c ON c."itemID"=e."itemID" ORDER BY e."itemID" FOR UPDATE OF e"#,
-        &[&root,&(loss.char_id as i32),&pod]).await?;
-    Ok(())
+    format!("<items>{}</items>",before.iter().filter(|i| !ids.contains(&i.parent)).map(|i|xml(i,before,&survivors,0)).collect::<String>())
 }
 
 // ---- the ship -----------------------------------------------------------------------------
 
 /// A destroyed fitting or container takes its loaded charges and cargo with
 /// it. ItemTxn::destroy intentionally operates on one item, so loss handling
-/// locks and revalidates each descendant before recording its notification.
-async fn destroy_tree(txn: &mut ItemTxn<'_>, id: i64, parent:i64, pilot: i64) -> Result<(), tokio_postgres::Error> {
-    txn.destroy_tree(id,Some(parent),&[pilot]).await
+/// revalidates each descendant before recording its notification.
+fn destroy_tree(txn: &mut ItemTxn<'_, '_>, id: i64, parent:i64, pilot: i64) -> Result<(), StoreError> {
+    txn.destroy_tree(id,Some(parent),&[pilot])
 }
 
 /// Returns what was destroyed, by type name, for the killmail.
-async fn ship_lost(server: &Server, db: &mut Client, loss: &Loss) -> Option<(Vec<String>, String)> {
+async fn ship_lost(server: &Server, store: &Store, loss: &Loss) -> Option<(Vec<String>, String)> {
     let (char_id, ship_id) = (loss.char_id, loss.ship_id);
     let mut rng = combat::Rng::seeded(combat::now_ms() as u64 ^ ship_id as u64);
-    let result = async {
-        let mut txn = ItemTxn::begin(db).await?;
-        // Boarding/ejection lock character lifecycle, character row, then hull.
-        // Keep that order, and do not redirect an owner who already left this
-        // ship before the delayed destruction callback reached the database.
-        let occupied = if loss.unpiloted {
-            false
-        } else if crate::svc::login::lock_character_lifecycle(txn.tx(),char_id as i32).await? {
-            txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2
-                AND "solarSystemID"=$3 AND COALESCE("stationID",0)=0 FOR UPDATE"#,
-                &[&(char_id as i32),&(ship_id as i32),&(loss.custody_system() as i32)]).await?.is_some()
-        } else { false };
+    let result = store.write(|tx| -> Result<_, StoreError> {
+        let mut txn = ItemTxn::new(tx);
+        // Do not redirect an owner who already left this ship before the
+        // delayed destruction callback reached the store.
+        let occupied = !loss.unpiloted && aboard(txn.db(), char_id, ship_id, loss.custody_system());
         // A repeated heartbeat callback must not create another capsule,
         // charge the same loss twice, or pay its insurance again.
-        let Some(hull)=txn.item(ship_id).await? else {return Ok(None);};
+        let Some(hull)=txn.item(ship_id)? else {return Ok(None);};
         if hull.owner_id!=char_id || hull.type_id!=loss.ship_type || hull.location_id!=loss.custody_system()
             || hull.flag!=FLAG_IN_SPACE || hull.quantity!=1 || !hull.singleton || hull.category_id!=6 {return Ok(None);}
-        lock_loss_contents(txn.tx(), loss).await?;
-        let before = item_snapshot(txn.tx(), loss).await?;
+        let before = item_snapshot(txn.db(), loss);
+        // An item of a type the static data does not know is left out, as
+        // joining on it did.
         let contents: Vec<(i64, String)> = txn
-            .tx()
-            .query(
-                r#"SELECT e."itemID", COALESCE(t."typeName", '') FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                    WHERE e."locationID" = $1 AND e."itemID" <> $2"#,
-                &[&(ship_id as i32), &(char_id as i32)],
-            )
-            .await?
-            .iter()
-            .map(|r| (r.get::<_, i32>(0) as i64, r.get(1)))
+            .db()
+            .table("entity")
+            .find(&["locationID"], &[store::Value::Int(ship_id)])
+            .filter(|e| e.int("itemID") != Some(char_id))
+            .filter_map(|e| Some((e.int("itemID")?, known_type_name(e.int("typeID")?)?)))
             .collect();
         let mut survivors = Vec::new();
         let mut destroyed = Vec::new();
@@ -236,37 +285,38 @@ async fn ship_lost(server: &Server, db: &mut Client, loss: &Loss) -> Option<(Vec
             if rng.unit() < SURVIVING_SHARE {
                 survivors.push(id);
             } else {
-                destroy_tree(&mut txn, id, ship_id, char_id).await?;
+                destroy_tree(&mut txn, id, ship_id, char_id)?;
                 destroyed.push(name);
             }
         }
         // Save the can and its complete contents in the same transaction as
         // destruction, so a failed can creation preserves the original ship.
         let stash: Vec<_> = survivors.into_iter().map(Stash::Existing).collect();
-        let can = loot::stage_can(&mut txn, loss.custody_system(), loss.custody_position(), char_id, &stash).await?;
-        txn.destroy(ship_id).await?;
-        crate::svc::clones::ship_destroyed(txn.tx(), ship_id).await?;
+        let can = loot::stage_can(&mut txn, loss.custody_system(), loss.custody_position(), char_id, &stash)?;
+        txn.destroy(ship_id)?;
+        crate::svc::clones::ship_destroyed(txn.tx(), ship_id)?;
         let capsule = if occupied {
             let capsule = txn
-                .create(NewItem { type_id: TYPE_CAPSULE, owner_id: char_id, location_id: loss.custody_system(), flag: FLAG_IN_SPACE, quantity: 1, singleton: true })
-                .await?;
-            txn.set_position(capsule,loss.custody_position().tuple()).await?;
-            txn.tx().execute(r#"UPDATE "character_" SET "shipID"=$2 WHERE "characterID"=$1"#,
-                &[&(char_id as i32),&(capsule as i32)]).await?;
+                .create(NewItem { type_id: TYPE_CAPSULE, owner_id: char_id, location_id: loss.custody_system(), flag: FLAG_IN_SPACE, quantity: 1, singleton: true })?;
+            txn.set_position(capsule,loss.custody_position().tuple())?;
+            update_id(txn.tx(), "character_", char_id, &[("shipID", store::Value::Int(capsule))])?;
             // Pilot inventory location follows the same system/station
             // convention as normal travel; character_.shipID is the cockpit.
-            txn.tx().execute(r#"UPDATE entity SET "locationID"=$2,x=$3,y=$4,z=$5 WHERE "itemID"=$1"#,
-                &[&(char_id as i32),&(loss.custody_system() as i32),&loss.custody_position().x,&loss.custody_position().y,&loss.custody_position().z]).await?;
+            let at = loss.custody_position();
+            update_id(txn.tx(), "entity", char_id, &[
+                ("locationID", store::Value::Int(loss.custody_system())),
+                ("x", store::Value::Float(at.x)),
+                ("y", store::Value::Float(at.y)),
+                ("z", store::Value::Float(at.z)),
+            ])?;
             Some(capsule)
         } else { None };
-        let insurance = claim_insurance(txn.tx(), ship_id, crate::bulkdata::filetime_now()).await?;
-        let blob = item_blob(txn.tx(), &before).await?;
-        let report=report_text(txn.tx(),loss).await;
-        let record=stage_record(txn.tx(),loss,report,destroyed.clone(),blob.clone()).await?;
-        let events = txn.commit().await?;
-        Ok::<_, tokio_postgres::Error>(Some((capsule, events, can, destroyed, insurance, blob,record)))
-    }
-    .await;
+        let insurance = claim_insurance(txn.tx(), ship_id, crate::bulkdata::filetime_now())?;
+        let blob = item_blob(txn.db(), &before);
+        let report=report_text(txn.db(),loss);
+        let record=stage_record(txn.tx(),loss,report,destroyed.clone(),blob.clone())?;
+        Ok(Some((capsule, txn.events(), can, destroyed, insurance, blob,record)))
+    });
     let (capsule_id, events, can, destroyed, insurance, blob,record) = match result {
         Ok(Some(v)) => v,
         Ok(None) => return None,
@@ -281,38 +331,38 @@ async fn ship_lost(server: &Server, db: &mut Client, loss: &Loss) -> Option<(Vec
     } else { items::notify(&server.world, loss.client_id, events); }
     if let Some(payout) = insurance { notify_insurance(server, loss, payout); }
     if let Some(can) = can { loot::show_can(&server.world, loss.custody_system(), can); }
-    deliver_record(server,db,record).await;
+    deliver_record(server,store,record).await;
 
     let Some(capsule_id)=capsule_id else {
         info!("unoccupied ship {ship_id} of {char_id} destroyed");
         return Some((destroyed,blob));
     };
 
-    if let Err(error)=publish_capsule(server,db,loss,capsule_id).await {
+    if let Err(error)=publish_capsule(server,store,loss,capsule_id).await {
         error!("publishing replacement capsule {capsule_id}: {}",crate::logging::chain(&error));
     }
     info!("{char_id} lost ship {ship_id}; now in capsule {capsule_id}");
     Some((destroyed, blob))
 }
 
-/// Settlement is already committed. Lock the character again before loading
+/// Settlement is already committed. Read the character again before loading
 /// and publishing, since reconnect/boarding may have won during notification
 /// delivery. An existing live capsule owns its motion and connection identity.
-async fn publish_capsule(server:&Server,db:&mut Client,loss:&Loss,capsule_id:i64)->Result<(),tokio_postgres::Error> {
-    let tx=db.transaction().await?;
-    if !crate::svc::login::lock_character_lifecycle(&tx,loss.char_id as i32).await? {return Ok(());}
-    if tx.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2 AND "solarSystemID"=$3
-        AND COALESCE("stationID",0)=0 FOR UPDATE"#,&[&(loss.char_id as i32),&(capsule_id as i32),&(loss.custody_system() as i32)]).await?.is_none(){return Ok(());}
-    let Some(row)=tx.query_opt(r#"SELECT x,y,z FROM entity WHERE "itemID"=$1 AND "ownerID"=$2 AND "locationID"=$3
-        AND "typeID"=670 AND flag=0 AND quantity=1 AND singleton<>0 FOR UPDATE"#,
-        &[&(capsule_id as i32),&(loss.char_id as i32),&(loss.custody_system() as i32)]).await? else{return Ok(());};
-    let Some(profile)=inflight::profile(&tx,&server.dogma,loss.char_id,capsule_id,&BTreeSet::new(),combat::now_ms()).await? else{return Ok(());};
-    let pos=Vec3::new(row.get(0),row.get(1),row.get(2));
-    {
+async fn publish_capsule(server:&Server,store:&Store,loss:&Loss,capsule_id:i64)->Result<(),StoreError> {
+    // The capsule is put in space while the store is held, so no boarding
+    // can come between the check and the publication.
+    store.read(|db| {
+        if !aboard(db,loss.char_id,capsule_id,loss.custody_system()) {return Ok(());}
+        let capsule=db.table("entity").get_id(capsule_id).filter(|e| e.int("ownerID")==Some(loss.char_id)
+            && e.int("locationID")==Some(loss.custody_system()) && e.int("typeID")==Some(TYPE_CAPSULE) && e.int("flag")==Some(FLAG_IN_SPACE)
+            && e.int("quantity")==Some(1) && e.int("singleton").is_some_and(|s| s!=0));
+        let Some(row)=capsule else{return Ok(());};
+        let Some(profile)=inflight::profile(db,&server.dogma,loss.char_id,capsule_id,&BTreeSet::new(),combat::now_ms())? else{return Ok(());};
+        let pos=Vec3::new(row.float("x").unwrap_or(0.0),row.float("y").unwrap_or(0.0),row.float("z").unwrap_or(0.0));
         let mut w=server.world.lock();
         if w.parks.get(&loss.custody_system()).is_some_and(|p|p.ships.contains_key(&capsule_id)){return Ok(());}
         // Never send an old completion to a new connection. A reconnect loads
-        // its authoritative capsule itself while holding the same lifecycle.
+        // its authoritative capsule itself.
         let client=if w.clients_of(loss.char_id).contains(&loss.client_id){loss.client_id}else{0};
         let mut capsule=Ship::new(capsule_id,client,profile.stats,profile.pilot,pos,Vec3::ZERO);capsule.fight=Some(profile.fighter);
         if let Some(park)=w.parks.get_mut(&loss.custody_system()) {
@@ -320,35 +370,34 @@ async fn publish_capsule(server:&Server,db:&mut Client,loss:&Loss,capsule_id:i64
             let entries=space::add_ball_entries(park,capsule_id);space::broadcast(&w,loss.custody_system(),None,entries);
         }
         if client!=0 {w.push_move(client,Move::ShipLost {ship_id:capsule_id});}
-    }
-    tx.commit().await
+        Ok(())
+    })
 }
 
 struct InsurancePayout { owner: i64, payout: f64, balance: f64 }
 
 /// Consuming the policy and crediting its wallet are part of the ship's loss
-/// transaction. The caller holds the ship lock before acquiring this one.
-async fn claim_insurance(tx: &tokio_postgres::Transaction<'_>, ship: i64, now: i64) -> Result<Option<InsurancePayout>, tokio_postgres::Error> {
+/// transaction.
+fn claim_insurance(tx: &mut Tx<'_>, ship: i64, now: i64) -> Result<Option<InsurancePayout>, StoreError> {
     use crate::svc::wallet::{post, Entry, Transfer};
-    let Some(r) = tx.query_opt(r#"SELECT "contractID", "payout", "ownerID", "startDate", "endDate"
-        FROM "insuranceContracts" WHERE "shipID"=$1 FOR UPDATE"#, &[&(ship as i32)]).await? else { return Ok(None); };
-    let (contract, payout, owner) = (r.get::<_,i32>(0), r.get::<_,f64>(1), i64::from(r.get::<_,i32>(2)));
-    if r.get::<_,i64>(4) <= now {
-        tx.execute(r#"DELETE FROM "insuranceContracts" WHERE "contractID"=$1"#, &[&contract]).await?;
+    let Some(r) = tx.table("insuranceContracts").find_one(&["shipID"], &[store::Value::Int(ship)]) else { return Ok(None); };
+    let (contract, payout, owner) = (r.id, r.float("payout").unwrap_or(0.0), r.int("ownerID").unwrap_or(0));
+    let (start, end) = (r.int("startDate").unwrap_or(0), r.int("endDate").unwrap_or(0));
+    if end <= now {
+        tx.delete("insuranceContracts", contract)?;
         return Ok(None);
     }
-    if r.get::<_,i64>(3) > now || !payout.is_finite() || payout <= 0.0 { return Ok(None); }
+    if start > now || !payout.is_finite() || payout <= 0.0 { return Ok(None); }
     let arg = ship.to_string();
-    let entry = Entry { ref_type: REF_INSURANCE, payer: OWNER_SYSTEM, payee: owner, arg_id1: &arg, reason: "" };
-    let balance = match post(tx, owner, payout, &entry).await {
+    let entry = Entry { ref_type: REF_INSURANCE.into(), payer: OWNER_SYSTEM, payee: owner, arg_id1: &arg, reason: "" };
+    let balance = match post(tx, owner, payout, &entry) {
         Ok(balance) => balance,
         Err(Transfer::Db(e)) => return Err(e),
         Err(_) => { warn!("insurance for {ship}: no payable wallet for {owner}"); return Ok(None); }
     };
-    tx.execute(r#"DELETE FROM "insuranceContracts" WHERE "contractID"=$1"#, &[&contract]).await?;
+    tx.delete("insuranceContracts", contract)?;
     Ok(Some(InsurancePayout { owner, payout, balance }))
 }
-
 fn notify_insurance(server: &Server, loss: &Loss, paid: InsurancePayout) {
     let InsurancePayout { owner, payout, balance } = paid;
     info!("insurance paid {payout} ISK to {owner} for ship {}", loss.ship_id);
@@ -363,78 +412,70 @@ fn notify_insurance(server: &Server, loss: &Loss, paid: InsurancePayout) {
 
 // ---- the capsule --------------------------------------------------------------------------
 
-async fn podded(server: &Server, db: &mut Client, loss: &Loss) -> Option<(Vec<String>, String)> {
+/// Where a podded pilot wakes: the station chosen, else where they last
+/// docked, else their corporation's; with its system, constellation and
+/// region. None if that is no station.
+fn wake_station(db: &Db, char_id: i64, chosen: Option<i64>) -> Option<(i64, i64, i64, i64)> {
+    let c = db.table("character_").get_id(char_id)?;
+    let station = chosen
+        .or_else(|| c.int("stationID").filter(|s| *s != 0))
+        .or_else(|| db.table("corporation").get_id(c.int("corporationID")?)?.int("stationID"))?;
+    let s = db.table("staStations").get_id(station)?;
+    Some((station, s.int("solarSystemID").unwrap_or(0), s.int("constellationID").unwrap_or(0), s.int("regionID").unwrap_or(0)))
+}
+
+async fn podded(server: &Server, store: &Store, loss: &Loss) -> Option<(Vec<String>, String)> {
     let (char_id, capsule_id) = (loss.char_id, loss.ship_id);
-    let result = async {
-        let mut txn = ItemTxn::begin(db).await?;
-        if !crate::svc::login::lock_character_lifecycle(txn.tx(),char_id as i32).await? {return Ok(None);}
-        if txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2
-            AND "solarSystemID"=$3 AND COALESCE("stationID",0)=0 FOR UPDATE"#,
-            &[&(char_id as i32),&(capsule_id as i32),&(loss.custody_system() as i32)]).await?.is_none(){return Ok(None);}
-        let Some(hull)=txn.item(capsule_id).await? else {return Ok(None);};
+    // Err(None): the loss no longer applies, and nothing it did is kept.
+    let result = store.write(|tx| -> Result<_, Option<StoreError>> {
+        let mut txn = ItemTxn::new(tx);
+        if !aboard(txn.db(),char_id,capsule_id,loss.custody_system()) {return Err(None);}
+        let Some(hull)=txn.item(capsule_id)? else {return Err(None);};
         if hull.owner_id!=char_id || hull.type_id!=TYPE_CAPSULE || hull.location_id!=loss.custody_system()
-            || hull.flag!=FLAG_IN_SPACE || hull.quantity!=1 || !hull.singleton {return Ok(None);}
-        lock_loss_contents(txn.tx(), loss).await?;
-        let before = item_snapshot(txn.tx(), loss).await?;
+            || hull.flag!=FLAG_IN_SPACE || hull.quantity!=1 || !hull.singleton {return Err(None);}
+        let before = item_snapshot(txn.db(), loss);
         let mut bounty_balance = None;
         if let Some(killer) = loss.final_blow.filter(|id| *id >= 100_000_000 && *id != char_id) {
-            if pay_player_bounty(txn.tx(), char_id, killer).await? > 0.0 {
-                let balance = txn.tx().query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#, &[&(killer as i32)]).await?.get::<_,f64>(0);
+            if pay_player_bounty(txn.tx(), char_id, killer)? > 0.0 {
+                let balance = txn.db().table("character_").get_id(killer).and_then(|c| c.float("balance")).unwrap_or(0.0);
                 bounty_balance = Some((killer, balance));
             }
         }
-        txn.destroy_tree(capsule_id,Some(loss.custody_system()),&[char_id]).await?;
-        let implants = lose_implants(&mut txn, char_id).await?;
-        let skill_loss = lose_skill_points(&txn, char_id).await?;
+        txn.destroy_tree(capsule_id,Some(loss.custody_system()),&[char_id])?;
+        let implants = lose_implants(&mut txn, char_id)?;
+        let skill_loss = lose_skill_points(&mut txn, char_id)?;
         // The clone's station, else where they last docked, else their corporation's.
-        let chosen = crate::svc::medical::home_station(txn.tx(), char_id).await?;
-        crate::svc::medical::replace_clone(txn.tx(), char_id, TYPE_CLONE_ALPHA, chosen).await?;
-        let home = txn
-            .tx()
-            .query_opt(
-                r#"SELECT s."stationID", s."solarSystemID", s."constellationID", s."regionID"
-                     FROM "character_" c
-                     JOIN "staStations" s ON s."stationID" = COALESCE($2, NULLIF(c."stationID", 0),
-                          (SELECT co."stationID" FROM corporation co WHERE co."corporationID" = c."corporationID"))
-                    WHERE c."characterID" = $1"#,
-                &[&(char_id as i32), &chosen.map(|s| s as i32)],
-            )
-            .await?;
-        let Some(home) = home else { return Ok(None) };
-        let station = home.get::<_, i32>(0) as i64;
+        let chosen = crate::svc::medical::home_station(txn.db(), char_id)?;
+        crate::svc::medical::replace_clone(txn.tx(), char_id, TYPE_CLONE_ALPHA, chosen)?;
+        let Some((station, system, constellation, region)) = wake_station(txn.db(), char_id, chosen) else { return Err(None) };
         let pod = txn
-            .create(NewItem { type_id: TYPE_CAPSULE, owner_id: char_id, location_id: station, flag: FLAG_HANGAR, quantity: 1, singleton: true })
-            .await?;
-        txn.tx()
-            .execute(
-                r#"UPDATE "character_" SET "shipID" = $2, "stationID" = $3, "solarSystemID" = $4,
-                          "constellationID" = $5, "regionID" = $6
-                    WHERE "characterID" = $1"#,
-                &[&(char_id as i32), &(pod as i32), &(station as i32), &home.get::<_, i32>(1), &home.get::<_, i32>(2), &home.get::<_, i32>(3)],
-            )
-            .await?;
-        txn.tx()
-            .execute(r#"UPDATE entity SET "locationID" = $2 WHERE "itemID" = $1"#, &[&(char_id as i32), &(station as i32)])
-            .await?;
-        let blob = item_blob(txn.tx(), &before).await?;
-        let report=report_text(txn.tx(),loss).await;
-        let record=stage_record(txn.tx(),loss,report,implants.clone(),blob.clone()).await?;
-        let events = txn.commit().await?;
+            .create(NewItem { type_id: TYPE_CAPSULE, owner_id: char_id, location_id: station, flag: FLAG_HANGAR, quantity: 1, singleton: true })?;
+        update_id(txn.tx(), "character_", char_id, &[
+            ("shipID", store::Value::Int(pod)),
+            ("stationID", store::Value::Int(station)),
+            ("solarSystemID", store::Value::Int(system)),
+            ("constellationID", store::Value::Int(constellation)),
+            ("regionID", store::Value::Int(region)),
+        ])?;
+        update_id(txn.tx(), "entity", char_id, &[("locationID", store::Value::Int(station))])?;
+        let blob = item_blob(txn.db(), &before);
+        let report=report_text(txn.db(),loss);
+        let record=stage_record(txn.tx(),loss,report,implants.clone(),blob.clone())?;
+        let events = txn.events();
         let m = Move::Podded {
             station_id: station,
-            solar_system_id: home.get::<_, i32>(1) as i64,
-            constellation_id: home.get::<_, i32>(2) as i64,
-            region_id: home.get::<_, i32>(3) as i64,
+            solar_system_id: system,
+            constellation_id: constellation,
+            region_id: region,
             ship_id: Some(pod),
         };
-        Ok::<_, tokio_postgres::Error>(Some((m, events, implants, skill_loss, bounty_balance, blob,record)))
-    }
-    .await;
+        Ok((m, events, implants, skill_loss, bounty_balance, blob,record))
+    });
     match result {
-        Ok(Some((m, events, implants, skill_loss, bounty_balance, blob,record))) => {
+        Ok((m, events, implants, skill_loss, bounty_balance, blob,record)) => {
             info!("{char_id} podded; waking at {m:?}");
             items::notify(&server.world, loss.client_id, events);
-            deliver_record(server,db,record).await;
+            deliver_record(server,store,record).await;
             let w = server.world.lock();
             if let Some((killer, balance)) = bounty_balance {
                 w.notify(&w.clients_of(killer), "OnAccountChange", Value::Tuple(vec![Value::bytes("cash"), Value::Int(killer), Value::Double(balance)]));
@@ -451,11 +492,11 @@ async fn podded(server: &Server, db: &mut Client, loss: &Loss) -> Option<(Vec<St
             w.push_move(loss.client_id, m);
             Some((implants, blob))
         }
-        Ok(None) => {
+        Err(None) => {
             error!("{char_id} podded with no station to wake in");
             None
         }
-        Err(e) => {
+        Err(Some(e)) => {
             error!("podding {char_id}: {}", crate::logging::chain(&e));
             None
         }
@@ -464,40 +505,40 @@ async fn podded(server: &Server, db: &mut Client, loss: &Loss) -> Option<(Vec<St
 
 /// A player's bounty is claimed on capsule destruction, in the same transaction
 /// as the loss. Clearing both the aggregate and contributions prevents repeats.
-pub(crate) async fn pay_player_bounty(tx: &tokio_postgres::Transaction<'_>, victim: i64, killer: i64) -> Result<f64, tokio_postgres::Error> {
+pub(crate) fn pay_player_bounty(tx: &mut Tx<'_>, victim: i64, killer: i64) -> Result<f64, StoreError> {
     use crate::svc::wallet::{post, Entry, Transfer};
     if victim == killer || killer < 100_000_000 { return Ok(0.0); }
-    let people = tx.query(r#"SELECT "characterID", bounty FROM "character_" WHERE "characterID"=ANY($1)
-        ORDER BY "characterID" FOR UPDATE"#, &[&vec![victim as i32,killer as i32]]).await?;
-    if !people.iter().any(|r| r.get::<_,i32>(0) as i64 == killer) { return Ok(0.0); }
-    let bounty = people.iter().find(|r| r.get::<_,i32>(0) as i64 == victim).map_or(0.0,|r| r.get::<_,f64>(1));
+    let people = tx.table("character_");
+    if people.get_id(killer).is_none() { return Ok(0.0); }
+    let bounty = people.get_id(victim).and_then(|r| r.float("bounty")).unwrap_or(0.0);
     if !bounty.is_finite() || bounty <= 0.0 { return Ok(0.0); }
     let arg = victim.to_string();
     let entry = Entry {ref_type:17,payer:1,payee:killer,arg_id1:&arg,reason:"Player bounty prize"};
-    match post(tx,killer,bounty,&entry).await {
+    match post(tx,killer,bounty,&entry) {
         Ok(_) => {},
         Err(Transfer::Db(e)) => return Err(e),
         Err(_) => return Ok(0.0),
     }
-    tx.execute(r#"UPDATE "character_" SET bounty=0 WHERE "characterID"=$1"#, &[&(victim as i32)]).await?;
-    tx.execute(r#"DELETE FROM bounties WHERE "characterID"=$1"#, &[&(victim as i32)]).await?;
+    update_id(tx, "character_", victim, &[("bounty", store::Value::Float(0.0))])?;
+    tx.delete_where("bounties", &["characterID"], &[store::Value::Int(victim)])?;
     Ok(bounty)
 }
 
 /// Destroys the implants in the pilot's head; returns their names.
-async fn lose_implants(txn: &mut ItemTxn<'_>, char_id: i64) -> Result<Vec<String>, tokio_postgres::Error> {
-    let rows = txn
-        .tx()
-        .query(
-            r#"SELECT e."itemID", COALESCE(t."typeName", '') FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                WHERE e."locationID" = $1 AND e."flag" = $2"#,
-            &[&(char_id as i32), &FLAG_IMPLANT],
-        )
-        .await?;
+fn lose_implants(txn: &mut ItemTxn<'_, '_>, char_id: i64) -> Result<Vec<String>, StoreError> {
+    let implants: Vec<(i64, i64)> = txn
+        .db()
+        .table("entity")
+        .find(&["locationID", "flag"], &[store::Value::Int(char_id), store::Value::Int(FLAG_IMPLANT)])
+        .filter_map(|e| Some((e.int("itemID")?, e.int("typeID")?)))
+        .collect();
     let mut names = Vec::new();
-    for r in &rows {
-        txn.destroy_tree(r.get::<_, i32>(0) as i64,Some(char_id),&[char_id]).await?;
-        names.push(r.get(1));
+    for (id, type_id) in implants {
+        // An implant of a type the static data does not know stays, as
+        // joining on it left it out.
+        let Some(name) = known_type_name(type_id) else { continue };
+        txn.destroy_tree(id,Some(char_id),&[char_id])?;
+        names.push(name);
     }
     Ok(names)
 }
@@ -514,61 +555,57 @@ fn level_of(time_constant: f64, points: f64) -> i64 {
 
 /// What the clone keeps; anything over comes off the biggest skill. Returns
 /// (skill, points lost) if anything was.
-async fn lose_skill_points(txn: &ItemTxn<'_>, char_id: i64) -> Result<Option<(String, f64)>, tokio_postgres::Error> {
-    let saved: Option<f64> = txn
-        .tx()
-        .query_opt(
-            r#"SELECT coalesce(a."valueFloat", a."valueInt"::float8)
-                 FROM entity e
-                 JOIN "invTypes" t ON t."typeID" = e."typeID"
-                 JOIN "dgmTypeAttributes" a ON a."typeID" = e."typeID" AND a."attributeID" = $3
-                WHERE e."ownerID" = $1 AND t."groupID" = $2
-                ORDER BY 1 DESC LIMIT 1"#,
-            &[&(char_id as i32), &GROUP_CLONE, &attr::SKILL_POINTS_SAVED],
-        )
-        .await?
-        .and_then(|r| r.get::<_, Option<f64>>(0));
-    let saved = match saved {
-        Some(s) => s,
-        None => txn
-            .tx()
-            .query_opt(
-                r#"SELECT coalesce("valueFloat", "valueInt"::float8) FROM "dgmTypeAttributes" WHERE "typeID" = $1 AND "attributeID" = $2"#,
-                &[&(TYPE_CLONE_ALPHA as i32), &attr::SKILL_POINTS_SAVED],
-            )
-            .await?
-            .and_then(|r| r.get::<_, Option<f64>>(0))
-            .unwrap_or(f64::MAX),
-    };
-    let skills = txn
-        .tx()
-        .query(
-            r#"SELECT e."itemID", COALESCE(t."typeName", ''),
-                      COALESCE((SELECT coalesce(a."valueFloat", a."valueInt"::float8) FROM entity_attributes a
-                                 WHERE a."itemID" = e."itemID" AND a."attributeID" = $4), 0),
-                      COALESCE((SELECT coalesce(d."valueFloat", d."valueInt"::float8) FROM "dgmTypeAttributes" d
-                                 WHERE d."typeID" = e."typeID" AND d."attributeID" = $5), 250)
-                 FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                WHERE e."locationID" = $1 AND e."flag" IN ($2, $3)"#,
-            &[&(char_id as i32), &FLAG_SKILL, &FLAG_SKILL_IN_TRAINING, &ATTR_SKILL_POINTS, &ATTR_SKILL_TIME_CONSTANT],
-        )
-        .await?;
-    let total: f64 = skills.iter().map(|r| r.get::<_, f64>(2)).sum();
+fn lose_skill_points(txn: &mut ItemTxn<'_, '_>, char_id: i64) -> Result<Option<(String, f64)>, StoreError> {
+    let sde = crate::sde::get();
+    let db = txn.db();
+    let entity = db.table("entity");
+    // The best clone the pilot owns that says what it keeps.
+    let clones = sde.types_in_group(GROUP_CLONE as i64);
+    let saved: Option<f64> = entity
+        .find(&["ownerID"], &[store::Value::Int(char_id)])
+        .filter_map(|e| e.int("typeID"))
+        .filter(|t| clones.contains(&(*t as i32)))
+        .collect::<BTreeSet<i64>>()
+        .into_iter()
+        .filter_map(|t| sde.type_attribute(t, attr::SKILL_POINTS_SAVED))
+        .max_by(f64::total_cmp);
+    let saved = saved.or_else(|| sde.type_attribute(TYPE_CLONE_ALPHA, attr::SKILL_POINTS_SAVED)).unwrap_or(f64::MAX);
+    let attributes = db.table("entity_attributes");
+    let skills: Vec<(i64, String, f64, f64)> = entity
+        .find(&["locationID"], &[store::Value::Int(char_id)])
+        .filter(|e| matches!(e.int("flag"), Some(FLAG_SKILL | FLAG_SKILL_IN_TRAINING)))
+        .filter_map(|e| {
+            let id = e.int("itemID")?;
+            let type_id = e.int("typeID")?;
+            let name = known_type_name(type_id)?;
+            let stc = sde.type_attribute(type_id, ATTR_SKILL_TIME_CONSTANT).unwrap_or(250.0);
+            let points = attributes
+                .get(&[store::Value::Int(id), store::Value::Int(ATTR_SKILL_POINTS.into())])
+                .and_then(|a| a.float("valueFloat").or_else(|| a.float("valueInt")))
+                .unwrap_or(0.0);
+            Some((id, name, points, stc))
+        })
+        .collect();
+    let total: f64 = skills.iter().map(|s| s.2).sum();
     if total <= saved {
         return Ok(None);
     }
-    let Some(biggest) = skills.iter().max_by(|a, b| a.get::<_, f64>(2).total_cmp(&b.get::<_, f64>(2))) else { return Ok(None) };
-    let (id, name, points, stc): (i32, String, f64, f64) = (biggest.get(0), biggest.get(1), biggest.get(2), biggest.get(3));
+    let Some(biggest) = skills.iter().max_by(|a, b| a.2.total_cmp(&b.2)) else { return Ok(None) };
+    let (id, name, points, stc) = biggest.clone();
     let lost = (total - saved).min(points);
     let left = points - lost;
     for (a, value) in [(ATTR_SKILL_POINTS, left), (ATTR_SKILL_LEVEL, level_of(stc, left) as f64)] {
-        txn.tx()
-            .execute(
-                r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt","valueFloat") VALUES ($1, $2, NULL, $3)
-                   ON CONFLICT ("itemID","attributeID") DO UPDATE SET "valueInt" = NULL, "valueFloat" = $3"#,
-                &[&id, &a, &value],
-            )
-            .await?;
+        txn.tx().upsert(
+            "entity_attributes",
+            &["itemID", "attributeID"],
+            &[
+                ("itemID", store::Value::Int(id)),
+                ("attributeID", store::Value::Int(a.into())),
+                ("valueInt", store::Value::Null),
+                ("valueFloat", store::Value::Float(value)),
+            ],
+            &[("valueInt", store::Value::Null), ("valueFloat", store::Value::Float(value))],
+        )?;
     }
     info!("{char_id} lost {lost} skill points of {name} (clone keeps {saved}, had {total})");
     Ok(Some((name, lost)))
@@ -585,37 +622,29 @@ struct Named {
     security: f64,
 }
 
-async fn who(db: &impl GenericClient, char_id: i64) -> Named {
-    let row = db
-        .query_opt(
-            r#"SELECT COALESCE(c."characterName", ''), c."corporationID", COALESCE(co."corporationName", ''),
-                      COALESCE(co."allianceID", 0), COALESCE(al."allianceName", ''), c."securityRating"
-                 FROM "character_" c
-                 LEFT JOIN corporation co ON co."corporationID" = c."corporationID"
-                 LEFT JOIN alliances al ON al."allianceID" = co."allianceID"
-                WHERE c."characterID" = $1"#,
-            &[&(char_id as i32)],
-        )
-        .await;
-    match row {
-        Ok(Some(r)) => Named {
-            name: r.get(0),
-            corp_id: r.get::<_, i32>(1) as i64,
-            corp: r.get(2),
-            alliance_id: r.get::<_, i32>(3) as i64,
-            alliance: r.get(4),
-            security: r.get(5),
-        },
-        _ => Named { name: format!("character {char_id}"), corp_id: 0, corp: String::new(), alliance_id: 0, alliance: String::new(), security: 0.0 },
+fn who(db: &Db, char_id: i64) -> Named {
+    let Some(c) = db.table("character_").get_id(char_id) else {
+        return Named { name: format!("character {char_id}"), corp_id: 0, corp: String::new(), alliance_id: 0, alliance: String::new(), security: 0.0 };
+    };
+    let corp = c.int("corporationID").and_then(|id| db.table("corporation").get_id(id));
+    let alliance = corp.and_then(|co| db.table("alliances").get_id(co.int("allianceID")?));
+    Named {
+        name: c.text("characterName").unwrap_or_default().to_string(),
+        corp_id: c.int("corporationID").unwrap_or(0),
+        corp: corp.and_then(|co| co.text("corporationName")).unwrap_or_default().to_string(),
+        alliance_id: corp.and_then(|co| co.int("allianceID")).unwrap_or(0),
+        alliance: alliance.and_then(|al| al.text("allianceName")).unwrap_or_default().to_string(),
+        security: c.float("securityRating").unwrap_or(0.0),
     }
 }
 
-async fn type_name(db: &impl GenericClient, type_id: i64) -> String {
-    db.query_opt(r#"SELECT COALESCE("typeName", '') FROM "invTypes" WHERE "typeID" = $1"#, &[&(type_id as i32)])
-        .await
-        .ok()
-        .flatten()
-        .map_or_else(|| format!("type {type_id}"), |r| r.get(0))
+/// A type's name, if the static data knows the type.
+fn known_type_name(type_id: i64) -> Option<String> {
+    crate::sde::get().type_(type_id).map(|t| t.name.to_string())
+}
+
+fn type_name(type_id: i64) -> String {
+    known_type_name(type_id).unwrap_or_else(|| format!("type {type_id}"))
 }
 
 fn or_none(s: &str) -> &str {
@@ -623,21 +652,19 @@ fn or_none(s: &str) -> &str {
 }
 
 /// The killmail, up to its "Destroyed items" list (which only the loss knows).
-async fn report_text(db: &impl GenericClient, loss: &Loss) -> String {
-    let victim = who(db, loss.char_id).await;
+fn report_text(db: &Db, loss: &Loss) -> String {
+    let victim = who(db, loss.char_id);
     let (system, security) = db
-        .query_opt(r#"SELECT "solarSystemName", "security" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#, &[&(loss.system as i32)])
-        .await
-        .ok()
-        .flatten()
-        .map_or((String::new(), 0.0), |r| (r.get::<_, Option<String>>(0).unwrap_or_default(), r.get::<_, Option<f64>>(1).unwrap_or(0.0)));
+        .table("mapSolarSystems")
+        .get_id(loss.system)
+        .map_or((String::new(), 0.0), |r| (r.text("solarSystemName").unwrap_or_default().to_string(), r.float("security").unwrap_or(0.0)));
     let mut text = format!(
         "{}\n\nVictim: {}\nAlliance: {}\nCorp: {}\nDestroyed: {}\nSystem: {}\nSecurity: {:.1}\n\nInvolved parties:\n",
         killmail_time(),
         victim.name,
         or_none(&victim.alliance),
         victim.corp,
-        type_name(db, loss.ship_type).await,
+        type_name(loss.ship_type),
         system,
         security
     );
@@ -646,23 +673,22 @@ async fn report_text(db: &impl GenericClient, loss: &Loss) -> String {
     for a in &attackers {
         let final_blow = if Some(a.who) == loss.final_blow { " (laid the final blow)" } else { "" };
         if a.who > 0 {
-            let p = who(db, a.who).await;
+            let p = who(db, a.who);
             text.push_str(&format!(
                 "\nName: {}{final_blow}\nSecurity: {:.1}\nAlliance: {}\nCorp: {}\nShip: {}\nWeapon: {}\n",
                 p.name,
                 p.security,
                 or_none(&p.alliance),
                 p.corp,
-                type_name(db, a.ship_type).await,
-                type_name(db, a.weapon_type).await
+                type_name(a.ship_type),
+                type_name(a.weapon_type)
             ));
         } else {
-            text.push_str(&format!("\nName: {}{final_blow}\n", type_name(db, -a.who).await));
+            text.push_str(&format!("\nName: {}{final_blow}\n", type_name(-a.who)));
         }
     }
     text
 }
-
 fn killmail_time() -> String {
     // FILETIME to a calendar date, without a date library: days since 1601.
     let secs = crate::bulkdata::filetime_now() / 10_000_000 - 11_644_473_600;
@@ -687,57 +713,53 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 struct RecordedLoss { subject: String, text: String, recipients: Vec<i64> }
 
 /// Callers that settle custody can include the kill record in that transaction.
-async fn stage_record(tx: &tokio_postgres::Transaction<'_>, loss: &Loss, mut text: String, destroyed: Vec<String>, items: String)
-    -> Result<RecordedLoss,tokio_postgres::Error> {
+fn stage_record(tx: &mut Tx<'_>, loss: &Loss, mut text: String, destroyed: Vec<String>, items: String)
+    -> Result<RecordedLoss,StoreError> {
     text.push_str("\nDestroyed items:\n\n");
     for item in &destroyed {
         text.push_str(item);
         text.push('\n');
     }
-    let victim = who(tx, loss.char_id).await;
+    let victim = who(tx.db(), loss.char_id);
     let total: f64 = loss.attackers.iter().map(|a| a.damage).sum();
-    let ship_name = type_name(tx, loss.ship_type).await;
+    let ship_name = type_name(loss.ship_type);
     let subject = format!("Kill: {} ({ship_name})", victim.name);
         let final_char = loss.final_blow.filter(|w| *w > 0).unwrap_or(0);
-        let kill_id: i64 = tx.query_one(
-            r#"INSERT INTO "killLog" ("killTime","victimCharID","victimCorpID","victimAllianceID","victimShipTypeID",
-                                      "victimItemID","solarSystemID","locationID","finalBlowID","totalDamage","isPodKill","killBlob")
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11) RETURNING "killID""#,
+        let kill_id = tx.nextval("killLog_killID_seq")?;
+        tx.insert(
+            "killLog",
             &[
-                &crate::bulkdata::filetime_now(),
-                &(loss.char_id as i32),
-                &(victim.corp_id as i32),
-                &(victim.alliance_id as i32),
-                &(loss.ship_type as i32),
-                &(loss.ship_id as i32),
-                &(loss.system as i32),
-                &(loss.final_blow.unwrap_or(0) as i32),
-                &total,
-                &i16::from(loss.capsule && !loss.unpiloted),
-                &items,
+                ("killID", store::Value::Int(kill_id)),
+                ("killTime", store::Value::Int(crate::bulkdata::filetime_now())),
+                ("victimCharID", store::Value::Int(loss.char_id)),
+                ("victimCorpID", store::Value::Int(victim.corp_id)),
+                ("victimAllianceID", store::Value::Int(victim.alliance_id)),
+                ("victimShipTypeID", store::Value::Int(loss.ship_type)),
+                ("victimItemID", store::Value::Int(loss.ship_id)),
+                ("solarSystemID", store::Value::Int(loss.system)),
+                ("locationID", store::Value::Int(loss.system)),
+                ("finalBlowID", store::Value::Int(loss.final_blow.unwrap_or(0))),
+                ("totalDamage", store::Value::Float(total)),
+                ("isPodKill", store::Value::Int(i64::from(loss.capsule && !loss.unpiloted))),
+                ("killBlob", store::Value::Text(items.into())),
             ],
-        )
-        .await?
-        .get(0);
+        )?;
         for a in loss.attackers.iter().filter(|a| a.who != 0) {
-            let p = who(tx, a.who).await;
-            tx.execute(
-                r#"INSERT INTO "killLogParticipants" ("killID","ownerID","corporationID","allianceID","shipTypeID",
-                                                      "weaponTypeID","damageDone","finalBlow","securityStatus")
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"#,
+            let p = who(tx.db(), a.who);
+            tx.insert(
+                "killLogParticipants",
                 &[
-                    &kill_id,
-                    &(a.who as i32),
-                    &(p.corp_id as i32),
-                    &(p.alliance_id as i32),
-                    &(a.ship_type as i32),
-                    &(a.weapon_type as i32),
-                    &a.damage,
-                    &i16::from(Some(a.who) == loss.final_blow),
-                    &if a.who > 0 { Some(p.security) } else { None },
+                    ("killID", store::Value::Int(kill_id)),
+                    ("ownerID", store::Value::Int(a.who)),
+                    ("corporationID", store::Value::Int(p.corp_id)),
+                    ("allianceID", store::Value::Int(p.alliance_id)),
+                    ("shipTypeID", store::Value::Int(a.ship_type)),
+                    ("weaponTypeID", store::Value::Int(a.weapon_type)),
+                    ("damageDone", store::Value::Float(a.damage)),
+                    ("finalBlow", store::Value::Int(i64::from(Some(a.who) == loss.final_blow))),
+                    ("securityStatus", if a.who > 0 { store::Value::Float(p.security) } else { store::Value::Null }),
                 ],
-            )
-            .await?;
+            )?;
         }
     tracing::debug!("staged kill {kill_id}: {} lost a {ship_name}", victim.name);
     let mut recipients = vec![loss.char_id];
@@ -747,197 +769,321 @@ async fn stage_record(tx: &tokio_postgres::Transaction<'_>, loss: &Loss, mut tex
     Ok(RecordedLoss {subject,text,recipients})
 }
 
-async fn deliver_record(server:&Server,db:&mut Client,record:RecordedLoss) {
+async fn deliver_record(server:&Server,store:&Store,record:RecordedLoss) {
     for to in record.recipients {
-        mail(server,db,to,&record.subject,&record.text).await;
+        mail(server,store,to,&record.subject,&record.text).await;
     }
 }
 
 /// The kill log rows, and the killmail to the victim and the final blow.
-async fn record(server: &Server, db: &mut Client, loss: &Loss, text: String, destroyed: Vec<String>, items: String) {
-    let result=async {
-        let tx=db.transaction().await?;
-        let record=stage_record(&tx,loss,text,destroyed,items).await?;
-        tx.commit().await?;
-        Ok::<_,tokio_postgres::Error>(record)
-    }.await;
-    match result {
-        Ok(record)=>deliver_record(server,db,record).await,
+async fn record(server: &Server, store: &Store, loss: &Loss, text: String, destroyed: Vec<String>, items: String) {
+    match store.write(|tx| stage_record(tx,loss,text,destroyed,items)) {
+        Ok(record)=>deliver_record(server,store,record).await,
         Err(e)=>error!("logging the loss of {}: {}",loss.ship_id,crate::logging::chain(&e)),
     }
 }
 
 /// An EVE mail from the system to `to`.
-async fn mail(server: &Server, db: &mut Client, to: i64, subject: &str, body: &str) {
+async fn mail(server: &Server, store: &Store, to: i64, subject: &str, body: &str) {
     let body = body.replace('\n', "<br>");
-    if let Err(e) = crate::svc::chat::deliver(&*db, &server.world, OWNER_SYSTEM, &[to], subject, &body).await {
+    if let Err(e) = store.write(|tx| crate::svc::chat::deliver(tx, &server.world, OWNER_SYSTEM, &[to], subject, &body)) {
         error!("mailing {to}: {}", crate::logging::chain(&e));
+    }
+}
+
+/// Test fixtures shared by the loss tests.
+#[cfg(test)]
+mod fixture {
+    use super::*;
+
+    /// A server around a test store.
+    pub(super) fn server(f: crate::test_support::Database) -> Server {
+        Server {
+            table: Default::default(),
+            store: f.store,
+            node_id: 1,
+            bulk: f.bulk,
+            dogma: f.dogma,
+            services: crate::svc::registry(),
+            world: f.world,
+            dump_dir: Default::default(),
+            alliance_join_delay_secs: 0,
+            sov_claim_delay_secs: 0,
+        }
+    }
+
+    pub(super) fn int(v: impl Into<i64>) -> store::Value {
+        store::Value::Int(v.into())
+    }
+
+    /// An item row: (id, type, owner, location, flag, quantity), a
+    /// singleton or not, at a position.
+    pub(super) fn item(tx: &mut Tx<'_>, (id, type_id, owner, location, flag, quantity): (i64, i64, i64, i64, i64, i64), singleton: bool, at: (f64, f64, f64)) -> Result<(), StoreError> {
+        tx.insert(
+            "entity",
+            &[
+                ("itemID", int(id)),
+                ("typeID", int(type_id)),
+                ("ownerID", int(owner)),
+                ("locationID", int(location)),
+                ("flag", int(flag)),
+                ("quantity", int(quantity)),
+                ("singleton", int(singleton)),
+                ("x", store::Value::Float(at.0)),
+                ("y", store::Value::Float(at.1)),
+                ("z", store::Value::Float(at.2)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A character with a balance, wherever `place` puts it: (ship, station,
+    /// solar system, constellation, region).
+    pub(super) fn character(tx: &mut Tx<'_>, id: i64, name: &str, corp: i64, (ship, station, system, constellation, region): (i64, i64, i64, i64, i64), balance: f64) -> Result<(), StoreError> {
+        tx.insert(
+            "character_",
+            &[
+                ("characterID", int(id)),
+                ("characterName", store::Value::Text(format!("{name} {id}").into())),
+                ("corporationID", int(corp)),
+                ("shipID", int(ship)),
+                ("stationID", int(station)),
+                ("solarSystemID", int(system)),
+                ("constellationID", int(constellation)),
+                ("regionID", int(region)),
+                ("balance", store::Value::Float(balance)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A policy on `ship` paying 500 ISK to `owner`, in force from `start` to
+    /// `end`.
+    pub(super) fn insure(tx: &mut Tx<'_>, contract: i64, ship: i64, owner: i64, start: i64, end: i64) -> Result<(), StoreError> {
+        tx.insert(
+            "insuranceContracts",
+            &[
+                ("contractID", int(contract)),
+                ("shipID", int(ship)),
+                ("ownerID", int(owner)),
+                ("startDate", int(start)),
+                ("endDate", int(end)),
+                ("fraction", store::Value::Float(0.5)),
+                ("amount", store::Value::Float(100.0)),
+                ("payout", store::Value::Float(500.0)),
+                ("isCorp", int(0)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Make the next kill record fail (its ID is already taken), as a store
+    /// refusal partway through a settlement would; the settlement after it
+    /// gets the next ID.
+    pub(super) fn refuse_next_kill(store: &Store) {
+        store
+            .write(|tx| {
+                let next = tx.db().sequence("killLog_killID_seq").map_or(1, |v| v + 1);
+                tx.insert("killLog", &[("killID", int(next)), ("killTime", int(0)), ("solarSystemID", int(0))])
+            })
+            .unwrap();
+    }
+
+    /// An entity column of `id`, if the item is there.
+    pub(super) fn entity_int(store: &Store, id: i64, column: &str) -> Option<i64> {
+        store.read(|db| db.table("entity").get_id(id).and_then(|e| e.int(column)))
+    }
+
+    pub(super) fn exists(store: &Store, id: i64) -> bool {
+        store.read(|db| db.table("entity").get_id(id).is_some())
+    }
+
+    /// A character column read as a number.
+    pub(super) fn character_float(store: &Store, id: i64, column: &str) -> Option<f64> {
+        store.read(|db| db.table("character_").get_id(id).and_then(|c| c.float(column)))
+    }
+
+    pub(super) fn character_int(store: &Store, id: i64, column: &str) -> Option<i64> {
+        store.read(|db| db.table("character_").get_id(id).and_then(|c| c.int(column)))
+    }
+
+    /// Set columns of the row of `table` whose key is `id`.
+    pub(super) fn set(store: &Store, table: &str, id: i64, sets: store::Sets) {
+        store.write(|tx| update_id(tx, table, id, sets)).unwrap();
+    }
+
+    /// The fixture station's (station, system, constellation, region).
+    pub(super) fn station(store: &Store) -> (i64, i64, i64, i64) {
+        store.read(|db| {
+            let s = db.table("staStations").get_id(60014659).unwrap();
+            (60014659, s.int("solarSystemID").unwrap(), s.int("constellationID").unwrap(), s.int("regionID").unwrap())
+        })
+    }
+
+    /// The kill records of a hull.
+    pub(super) fn kills(store: &Store, ship: i64) -> usize {
+        store.read(|db| db.table("killLog").rows().filter(|k| k.int("victimItemID") == Some(ship)).count())
+    }
+
+    /// A fresh item ID.
+    pub(super) fn id(store: &Store) -> i64 {
+        store.write(|tx| tx.nextval("dyn_id_seq")).unwrap()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::fixture::{exists, int, kills};
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn derelict_losses_preserve_the_owner_and_occupied_losses_persist_capsule_position() {
-        let fixture=crate::test_support::Database::load().await;
-        let mut db=crate::db::connect(&fixture.url).await.unwrap();
-        let server=Server { table:Default::default(),db:crate::db::Shared::new(fixture.db,fixture.url.clone()),db_url:fixture.url,node_id:1,
-            bulk:fixture.bulk,dogma:fixture.dogma,services:crate::svc::registry(),world:fixture.world,
-            dump_dir:Default::default(),alliance_join_delay_secs:0,sov_claim_delay_secs:0 };
-        let system=30004971i32;
-        server.world.lock().parks.insert(system as i64,crate::ballpark::Park::new(system as i64,vec![],crate::destiny::tick_now()));
+        let server=fixture::server(crate::test_support::Database::load().await);
+        let store=server.store.clone();
+        let system=30004971i64;
+        server.world.lock().parks.insert(system,crate::ballpark::Park::new(system,vec![],crate::destiny::tick_now()));
         // Explicitly empty hull, stale occupied snapshot after owner left,
         // and a genuinely occupied hull all share the same loss transaction.
         for (case,unpiloted,elsewhere) in [(0,true,true),(1,false,true),(2,false,false)] {
-            let ids=server.db.snapshot().query("SELECT nextval('dyn_id_seq')::integer FROM generate_series(1,4)",&[]).await.unwrap();
-            let (owner,hull,old_pod,cargo)=(ids[0].get::<_,i32>(0),ids[1].get::<_,i32>(0),ids[2].get::<_,i32>(0),ids[3].get::<_,i32>(0));
+            let (owner,hull,old_pod,cargo)=(fixture::id(&store),fixture::id(&store),fixture::id(&store),fixture::id(&store));
             let client=case+1;
             let current=if elsewhere {old_pod} else {hull};
-            let current_system=if elsewhere {30000142i32} else {system};
-            server.db.snapshot().execute(r#"INSERT INTO "character_"("characterID","characterName","shipID","solarSystemID","stationID","corporationID",balance)
-                VALUES($1,$2,$3,$4,0,1000002,1000)"#,&[&owner,&format!("Loss fixture {owner}"),&current,&current_system]).await.unwrap();
-            for (id,kind,location,flag,quantity) in [(owner,1373,current_system,57,1),(hull,587,system,0,1),(cargo,34,hull,5,2)] {
-                server.db.snapshot().execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton,x,y,z)
-                    VALUES($1,$2,$3,$4,$5,$6,1,11,22,33)"#,&[&id,&kind,&owner,&location,&flag,&quantity]).await.unwrap();
-            }
-            if elsewhere {
-                server.db.snapshot().execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton,x,y,z)
-                    VALUES($1,670,$2,$3,0,1,1,11,22,33)"#,&[&old_pod,&owner,&current_system]).await.unwrap();
-            }
-            if unpiloted {
-                let now=crate::bulkdata::filetime_now();
-                server.db.snapshot().execute(r#"INSERT INTO "insuranceContracts"("contractID","shipID","ownerID","startDate","endDate",fraction,amount,payout,"isCorp")
-                    VALUES($1,$1,$2,$3,$4,0.5,100,500,0)"#,&[&hull,&owner,&(now-1),&(now+100_000_000)]).await.unwrap();
-            }
+            let current_system=if elsewhere {30000142i64} else {system};
+            store.write(|tx| {
+                tx.insert("character_",&[("characterID",int(owner)),("characterName",store::Value::Text(format!("Loss fixture {owner}").into())),
+                    ("shipID",int(current)),("solarSystemID",int(current_system)),("stationID",int(0)),("corporationID",int(1000002)),("balance",store::Value::Float(1000.0))])?;
+                for (id,kind,location,flag,quantity) in [(owner,1373,current_system,57,1),(hull,587,system,0,1),(cargo,34,hull,5,2)] {
+                    fixture::item(tx,(id,kind,owner,location,flag,quantity),true,(11.0,22.0,33.0))?;
+                }
+                if elsewhere {
+                    fixture::item(tx,(old_pod,670,owner,current_system,0,1),true,(11.0,22.0,33.0))?;
+                }
+                if unpiloted {
+                    let now=crate::bulkdata::filetime_now();
+                    fixture::insure(tx,hull,hull,owner,now-1,now+100_000_000)?;
+                }
+                Ok::<_,StoreError>(())
+            }).unwrap();
             let pos=Vec3::new(987654321.25,-7654321.5,54321.75);
-            let mut ship=Ship::new(hull as i64,client,crate::ballpark::ShipStats::new(37.0,1.1e6,3.1,320.0,2.0),
-                crate::ballpark::Pilot{type_id:587,group_id:25,name:"Lost hull".into(),char_id:owner as i64,
+            let mut ship=Ship::new(hull,client,crate::ballpark::ShipStats::new(37.0,1.1e6,3.1,320.0,2.0),
+                crate::ballpark::Pilot{type_id:587,group_id:25,name:"Lost hull".into(),char_id:owner,
                     corp_id:1000002,alliance_id:None,security:0.0,bounty:0.0},pos,Vec3::ZERO);
             ship.unpiloted=unpiloted;
-            let loss=Loss::of(&ship,system as i64,false);
+            let loss=Loss::of(&ship,system,false);
             assert_eq!(loss.unpiloted,unpiloted);
             let mut receiver={
                 let mut world=server.world.lock();
                 let rx=world.connect(client);
-                world.set_presence(client,Some(crate::world::Presence{char_id:owner as i64,corp_id:1000002,
-                    solar_system_id:current_system as i64,docked:false,station_id:None,role:0}));
-                world.sees(client,current_system as i64);
+                world.set_presence(client,Some(crate::world::Presence{char_id:owner,corp_id:1000002,
+                    solar_system_id:current_system,docked:false,station_id:None,role:0}));
+                world.sees(client,current_system);
                 rx
             };
-            handle(&server,&mut db,loss.clone()).await;
-            let row=server.db.snapshot().query_one(r#"SELECT "shipID","solarSystemID",balance FROM "character_" WHERE "characterID"=$1"#,&[&owner]).await.unwrap();
-            let after=row.get::<_,i32>(0);
-            assert_eq!(row.get::<_,i32>(1),current_system);
-            assert_eq!(row.get::<_,f64>(2),if unpiloted {1500.0} else {1000.0});
-            let position=server.db.snapshot().query_one(r#"SELECT "locationID",x,y,z FROM entity WHERE "itemID"=$1"#,&[&owner]).await.unwrap();
-            let pilot_pos=(position.get::<_,f64>(1),position.get::<_,f64>(2),position.get::<_,f64>(3));
+            handle(&server,&store,loss.clone()).await;
+            let after=fixture::character_int(&store,owner,"shipID").unwrap();
+            assert_eq!(fixture::character_int(&store,owner,"solarSystemID"),Some(current_system));
+            assert_eq!(fixture::character_float(&store,owner,"balance"),Some(if unpiloted {1500.0} else {1000.0}));
+            let (location,pilot_pos)=store.read(|db| {
+                let e=db.table("entity").get_id(owner).unwrap();
+                (e.int("locationID").unwrap(),(e.float("x").unwrap(),e.float("y").unwrap(),e.float("z").unwrap()))
+            });
             let mut moves=Vec::new();
             while let Ok(push)=receiver.try_recv() { if let crate::world::Push::Move(m)=push { moves.push(m); } }
             if elsewhere {
                 assert_eq!(after,old_pod,"owner's current cockpit is untouched");
-                assert_eq!(position.get::<_,i32>(0),current_system);
+                assert_eq!(location,current_system);
                 assert_eq!(pilot_pos,(11.0,22.0,33.0));
                 assert!(moves.is_empty(),"an abandoned hull cannot change its owner's session");
             } else {
                 assert_ne!(after,hull);
-                assert_eq!(position.get::<_,i32>(0),system);
+                assert_eq!(location,system);
                 assert_eq!(pilot_pos,pos.tuple());
-                assert_eq!(moves,vec![Move::ShipLost{ship_id:after as i64}]);
-                let capsule=server.db.snapshot().query_one(r#"SELECT "typeID","locationID",x,y,z FROM entity WHERE "itemID"=$1"#,&[&after]).await.unwrap();
-                assert_eq!(capsule.get::<_,i32>(0),670);
-                assert_eq!(capsule.get::<_,i32>(1),system);
-                assert_eq!((capsule.get::<_,f64>(2),capsule.get::<_,f64>(3),capsule.get::<_,f64>(4)),pos.tuple());
-                assert_eq!(server.world.lock().parks[&(system as i64)].ships[&(after as i64)].pos,pos);
+                assert_eq!(moves,vec![Move::ShipLost{ship_id:after}]);
+                let capsule=store.read(|db| {
+                    let e=db.table("entity").get_id(after).unwrap();
+                    (e.int("typeID").unwrap(),e.int("locationID").unwrap(),(e.float("x").unwrap(),e.float("y").unwrap(),e.float("z").unwrap()))
+                });
+                assert_eq!(capsule,(670,system,pos.tuple()));
+                assert_eq!(server.world.lock().parks[&system].ships[&after].pos,pos);
             }
-            assert_eq!(server.db.snapshot().query_one(r#"SELECT count(*) FROM entity WHERE "ownerID"=$1 AND "typeID"=670"#,&[&owner]).await.unwrap().get::<_,i64>(0),1);
-            assert!(server.db.snapshot().query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&hull]).await.unwrap().is_none());
-            let blob=server.db.snapshot().query_one(r#"SELECT "killBlob" FROM "killLog" WHERE "victimItemID"=$1"#,&[&hull]).await.unwrap().get::<_,String>(0);
+            let capsules=store.read(|db| db.table("entity").find(&["ownerID"],&[int(owner)]).filter(|e| e.int("typeID")==Some(670)).count());
+            assert_eq!(capsules,1);
+            assert!(!exists(&store,hull));
+            let blob=store.read(|db| db.table("killLog").rows().find(|k| k.int("victimItemID")==Some(hull)).and_then(|k| k.text("killBlob").map(str::to_string))).unwrap();
             assert!(blob.contains(r#"<i t="34" f="5""#),"cargo remains in the destruction report: {blob}");
-            handle(&server,&mut db,loss).await;
-            assert_eq!(server.db.snapshot().query_one(r#"SELECT count(*) FROM "killLog" WHERE "victimItemID"=$1"#,&[&hull]).await.unwrap().get::<_,i64>(0),1);
+            handle(&server,&store,loss).await;
+            assert_eq!(kills(&store,hull),1);
             assert!(receiver.try_recv().is_err(),"duplicate destruction has no repeated effects");
         }
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn insurance_payout_rolls_back_expires_and_settles_once() {
-        let fixture = crate::test_support::Database::load().await;
-        let owner = fixture.id().await;
-        let ship = fixture.id().await;
+        let store = crate::test_support::store();
+        let (owner, ship) = (fixture::id(&store), fixture::id(&store));
         let now = crate::bulkdata::filetime_now();
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,1000)"#, &[&owner,&format!("Insured {owner}")]).await.unwrap();
-        let fixture_ref = &fixture;
-        let add = |id: i32, target: i32, recipient: i32, end: i64| async move {
-            let db = crate::db::connect(&fixture_ref.url).await.unwrap();
-            db.execute(r#"INSERT INTO "insuranceContracts" ("contractID","shipID","ownerID","startDate","endDate",fraction,amount,payout,"isCorp")
-                VALUES ($1,$2,$3,$4,$5,0.5,100,500,0)"#, &[&id,&target,&recipient,&(now-100),&end]).await.unwrap();
+        let add = |contract: i64, target: i64, recipient: i64, end: i64| {
+            store.write(|tx| fixture::insure(tx, contract, target, recipient, now - 100, end)).unwrap();
         };
-        add(fixture.id().await,ship,owner,now+100_000_000).await;
-        let mut first = crate::db::connect(&fixture.url).await.unwrap();
-        let tx = first.transaction().await.unwrap();
-        assert_eq!(claim_insurance(&tx,ship as i64,now).await.unwrap().unwrap().payout,500.0);
-        tx.rollback().await.unwrap();
-        assert_eq!(fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&owner]).await.unwrap().get::<_,f64>(0),1000.0);
-        let claim = || async {
-            let mut db = crate::db::connect(&fixture.url).await.unwrap();
-            let tx = db.transaction().await.unwrap();
-            let paid = claim_insurance(&tx,ship as i64,now).await.unwrap().is_some();
-            tx.commit().await.unwrap();
-            paid
-        };
-        let (a,b) = tokio::join!(claim(),claim());
-        assert_ne!(a,b);
-        assert_eq!(fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&owner]).await.unwrap().get::<_,f64>(0),1500.0);
-        let expired = fixture.id().await;
-        add(fixture.id().await,expired,owner,now).await;
-        let tx = first.transaction().await.unwrap();
-        assert!(claim_insurance(&tx,expired as i64,now).await.unwrap().is_none());
-        tx.commit().await.unwrap();
-        assert!(fixture.db.query_opt(r#"SELECT 1 FROM "insuranceContracts" WHERE "shipID"=$1"#,&[&expired]).await.unwrap().is_none());
-        let missing_owner = fixture.id().await;
-        add(fixture.id().await,missing_owner,missing_owner,now+100_000_000).await;
-        let tx = first.transaction().await.unwrap();
-        assert!(claim_insurance(&tx,missing_owner as i64,now).await.unwrap().is_none());
-        tx.commit().await.unwrap();
-        assert!(fixture.db.query_opt(r#"SELECT 1 FROM "insuranceContracts" WHERE "shipID"=$1"#,&[&missing_owner]).await.unwrap().is_some());
+        store.write(|tx| tx.insert("character_", &[("characterID", int(owner)), ("characterName", store::Value::Text(format!("Insured {owner}").into())), ("balance", store::Value::Float(1000.0))])).unwrap();
+        let balance = || fixture::character_float(&store, owner, "balance");
+        let policy = |target: i64| store.read(|db| db.table("insuranceContracts").find_one(&["shipID"], &[int(target)]).is_some());
+        add(fixture::id(&store), ship, owner, now + 100_000_000);
+        // A claim in a transaction that fails is not kept.
+        let undone = store.write(|tx| -> Result<(), StoreError> {
+            assert_eq!(claim_insurance(tx, ship, now)?.unwrap().payout, 500.0);
+            Err(StoreError { code: store::DATA_EXCEPTION, message: "the loss failed".into() })
+        });
+        assert!(undone.is_err());
+        assert_eq!(balance(), Some(1000.0));
+        let claim = || store.write(|tx| claim_insurance(tx, ship, now)).unwrap().is_some();
+        let (a, b) = (claim(), claim());
+        assert_ne!(a, b);
+        assert_eq!(balance(), Some(1500.0));
+        let expired = fixture::id(&store);
+        add(fixture::id(&store), expired, owner, now);
+        assert!(store.write(|tx| claim_insurance(tx, expired, now)).unwrap().is_none());
+        assert!(!policy(expired));
+        let missing_owner = fixture::id(&store);
+        add(fixture::id(&store), missing_owner, missing_owner, now + 100_000_000);
+        assert!(store.write(|tx| claim_insurance(tx, missing_owner, now)).unwrap().is_none());
+        assert!(policy(missing_owner));
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn nested_loss_destroys_contents_and_records_actual_survivors() {
-        let mut fixture = crate::test_support::Database::load().await;
-        let pilot = i64::from(fixture.id().await);
-        let mut txn = ItemTxn::begin(&mut fixture.db).await.unwrap();
-        let ship = txn.create(NewItem {type_id:606,owner_id:pilot,location_id:30004971,flag:0,quantity:1,singleton:true}).await.unwrap();
-        let doomed = txn.create(NewItem {type_id:3293,owner_id:pilot,location_id:ship,flag:5,quantity:1,singleton:true}).await.unwrap();
-        let nested = txn.create(NewItem {type_id:3293,owner_id:pilot,location_id:doomed,flag:5,quantity:1,singleton:true}).await.unwrap();
-        let cargo = txn.create(NewItem {type_id:34,owner_id:pilot,location_id:nested,flag:5,quantity:12,singleton:false}).await.unwrap();
-        let module = txn.create(NewItem {type_id:484,owner_id:pilot,location_id:ship,flag:27,quantity:1,singleton:true}).await.unwrap();
-        let charge = txn.create(NewItem {type_id:230,owner_id:pilot,location_id:module,flag:0,quantity:20,singleton:false}).await.unwrap();
-        txn.tx().execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,3,1)"#,&[&(cargo as i32)]).await.unwrap();
-        txn.commit().await.unwrap();
+        let store = crate::test_support::store();
+        let pilot = fixture::id(&store);
+        let (ship, doomed, nested, cargo, module, charge) = store
+            .write(|tx| {
+                let mut txn = ItemTxn::new(tx);
+                let ship = txn.create(NewItem {type_id:606,owner_id:pilot,location_id:30004971,flag:0,quantity:1,singleton:true})?;
+                let doomed = txn.create(NewItem {type_id:3293,owner_id:pilot,location_id:ship,flag:5,quantity:1,singleton:true})?;
+                let nested = txn.create(NewItem {type_id:3293,owner_id:pilot,location_id:doomed,flag:5,quantity:1,singleton:true})?;
+                let cargo = txn.create(NewItem {type_id:34,owner_id:pilot,location_id:nested,flag:5,quantity:12,singleton:false})?;
+                let module = txn.create(NewItem {type_id:484,owner_id:pilot,location_id:ship,flag:27,quantity:1,singleton:true})?;
+                let charge = txn.create(NewItem {type_id:230,owner_id:pilot,location_id:module,flag:0,quantity:20,singleton:false})?;
+                txn.tx().insert("entity_attributes", &[("itemID", int(cargo)), ("attributeID", int(3)), ("valueInt", int(1))])?;
+                Ok::<_, StoreError>((ship, doomed, nested, cargo, module, charge))
+            })
+            .unwrap();
         let loss = Loss {client_id:1,char_id:pilot,ship_id:ship,ship_type:606,system:30004971,pos:Vec3::ZERO,arrival_custody:None,capsule:false,unpiloted:false,final_blow:None,attackers:vec![],items:vec![]};
-        let mut txn = ItemTxn::begin(&mut fixture.db).await.unwrap();
-        lock_loss_contents(txn.tx(),&loss).await.unwrap();
-        let before = item_snapshot(txn.tx(),&loss).await.unwrap();
-        assert_eq!(before.len(),5);
-        destroy_tree(&mut txn,doomed,ship,pilot).await.unwrap();
-        txn.move_to(module,30004971,0).await.unwrap();
-        let xml = item_blob(txn.tx(),&before).await.unwrap();
-        txn.commit().await.unwrap();
-        let remaining = fixture.db.query(r#"SELECT "itemID" FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![doomed as i32,nested as i32,cargo as i32,module as i32,charge as i32]]).await.unwrap();
-        assert_eq!(remaining.len(),2);
-        assert!(remaining.iter().all(|r| [module,charge].contains(&i64::from(r.get::<_,i32>(0)))));
-        assert_eq!(fixture.db.query_one(r#"SELECT count(*) FROM entity_attributes WHERE "itemID"=$1"#,&[&(cargo as i32)]).await.unwrap().get::<_,i64>(0),0);
+        let xml = store
+            .write(|tx| {
+                let mut txn = ItemTxn::new(tx);
+                let before = item_snapshot(txn.db(),&loss);
+                assert_eq!(before.len(),5);
+                destroy_tree(&mut txn,doomed,ship,pilot)?;
+                txn.move_to(module,30004971,0)?;
+                Ok::<_, StoreError>(item_blob(txn.db(),&before))
+            })
+            .unwrap();
+        let remaining: Vec<i64> = [doomed,nested,cargo,module,charge].into_iter().filter(|id| exists(&store,*id)).collect();
+        assert_eq!(remaining,vec![module,charge]);
+        assert_eq!(store.read(|db| db.table("entity_attributes").find(&["itemID"],&[int(cargo)]).count()),0);
         // A looter may immediately merge this dropped stack into another.
         // The already captured report must retain the actual drop outcome.
-        let mut txn = ItemTxn::begin(&mut fixture.db).await.unwrap();
-        txn.destroy(charge).await.unwrap();
-        txn.commit().await.unwrap();
+        store.write(|tx| ItemTxn::new(tx).destroy(charge)).unwrap();
         assert!(xml.contains(r#"<i t="3293" f="5" d="0" x="1"><i t="3293" f="5" d="0" x="1"><i t="34" f="5" d="0" x="12">"#),"{xml}");
         assert!(xml.contains(r#"<i t="484" f="27" d="1" x="0"><i t="230" f="0" d="20" x="0">"#),"{xml}");
     }

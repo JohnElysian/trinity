@@ -16,16 +16,14 @@
 //!   cleared, the Overseer's Belongings (a can of loot worth its rating)
 //!   appear there.
 
-#[cfg(test)]
 use std::collections::BTreeMap;
 
-use tokio_postgres::Client;
 use tracing::{error, info};
 
 use crate::ballpark::{Park, Vec3};
 use crate::beacons::{self, Beacon, Kind};
 use crate::heartbeat::{Job, Out};
-use crate::svc::rows::{float, int};
+use crate::store::{Db, Store, StoreError, Value};
 
 pub const TYPE_COMPLEX_BEACON: i64 = 10124;
 pub const TYPE_ACCELERATION_GATE: i64 = 17831;
@@ -77,40 +75,77 @@ impl Complex {
 }
 
 /// Keeps New Eden supplied with complexes: the expired go, new ones appear.
-pub async fn seed(db: &Client) {
-    let result = async {
-        let now = crate::bulkdata::filetime_now();
-        let gone = db.execute(r#"DELETE FROM "deadspaceComplexes" WHERE "expires" < $1"#, &[&now]).await?;
-        let have: i64 = db.query_one(r#"SELECT count(*) FROM "deadspaceComplexes""#, &[]).await?.get(0);
+pub async fn seed(store: &Store) {
+    let now = crate::bulkdata::filetime_now();
+    let mut rng = crate::combat::Rng::seeded(crate::combat::now_ms() as u64);
+    let result = store.write(|tx| {
+        let expired: Vec<_> = tx.table("deadspaceComplexes").rows().filter(|r| r.int("expires").is_some_and(|e| e < now)).map(|r| r.id).collect();
+        for id in &expired {
+            tx.delete("deadspaceComplexes", *id)?;
+        }
+        let gone = expired.len();
+        let have = tx.table("deadspaceComplexes").len() as i64;
         let want = (TARGET - have).clamp(0, NEW_PER_RUN);
         if want > 0 {
             // Systems with planets to hide behind, low- and null-sec three times as likely.
-            db.execute(
-                r#"INSERT INTO "deadspaceComplexes" ("solarSystemID","level","seed","x","y","z","rooms","cleared","spawnedAt","expires")
-                   SELECT s."solarSystemID", 0, (random() * 2147483647)::bigint,
-                          p."x" + (random() - 0.5) * 4e11, p."y" + (random() - 0.5) * 4e10, p."z" + (random() - 0.5) * 4e11,
-                          0, 0, $2, $2 + ((random() * $4 + $3) * $5)::bigint
-                     FROM "mapSolarSystems" s
-                     JOIN LATERAL (SELECT d."x", d."y", d."z" FROM "mapDenormalize" d WHERE d."solarSystemID" = s."solarSystemID" AND d."groupID" = 7
-                                    ORDER BY random() LIMIT 1) p ON true
-                    ORDER BY random() * CASE WHEN s."security" >= 0.45 THEN 3 ELSE 1 END
-                    LIMIT $1"#,
-                &[&want, &now, &(LIFETIME_DAYS.0 as f64), &((LIFETIME_DAYS.1 - LIFETIME_DAYS.0) as f64), &(DAY_FT as f64)],
-            )
-            .await?;
+            let mut planets: BTreeMap<i64, Vec<Vec3>> = BTreeMap::new();
+            for d in tx.table("mapDenormalize").rows().filter(|d| d.int("groupID") == Some(7)) {
+                if let Some(system) = d.int("solarSystemID") {
+                    let at = Vec3::new(d.float("x").unwrap_or(0.0), d.float("y").unwrap_or(0.0), d.float("z").unwrap_or(0.0));
+                    planets.entry(system).or_default().push(at);
+                }
+            }
+            let mut picks: Vec<(f64, i64, Vec3)> = Vec::new();
+            for s in tx.table("mapSolarSystems").rows() {
+                let Some(system) = s.int("solarSystemID") else { continue };
+                let Some(near) = planets.get(&system) else { continue };
+                let p = near[rng.below(near.len())];
+                let weight = if s.float("security").is_some_and(|v| v >= 0.45) { 3.0 } else { 1.0 };
+                picks.push((rng.unit() * weight, system, p));
+            }
+            picks.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, system, p) in picks.into_iter().take(want as usize) {
+                let seed = (rng.unit() * 2147483647.0).round() as i64;
+                let days = rng.unit() * (LIFETIME_DAYS.1 - LIFETIME_DAYS.0) as f64 + LIFETIME_DAYS.0 as f64;
+                tx.insert(
+                    "deadspaceComplexes",
+                    &[
+                        ("solarSystemID", Value::Int(system)),
+                        ("level", Value::Int(0)),
+                        ("seed", Value::Int(seed)),
+                        ("x", Value::Float(p.x + (rng.unit() - 0.5) * 4e11)),
+                        ("y", Value::Float(p.y + (rng.unit() - 0.5) * 4e10)),
+                        ("z", Value::Float(p.z + (rng.unit() - 0.5) * 4e11)),
+                        ("rooms", Value::Int(0)),
+                        ("cleared", Value::Int(0)),
+                        ("spawnedAt", Value::Int(now)),
+                        ("expires", Value::Int(now + (days * DAY_FT as f64).round() as i64)),
+                    ],
+                )?;
+            }
             // Their rating and rooms, from the system's security and the seed.
-            db.execute(
-                r#"UPDATE "deadspaceComplexes" c SET
-                       "level" = LEAST(10, GREATEST(1, round(CASE WHEN s."security" >= 0.45 THEN 1 WHEN s."security" > 0 THEN 3 ELSE 5 END + (c."seed" % 1000) / 1000.0 * 5)))::smallint,
-                       "rooms" = (2 + c."seed" % 3)::smallint
-                  FROM "mapSolarSystems" s WHERE s."solarSystemID" = c."solarSystemID" AND c."level" = 0"#,
-                &[],
-            )
-            .await?;
+            let unrated: Vec<_> = tx
+                .table("deadspaceComplexes")
+                .rows()
+                .filter(|r| r.int("level") == Some(0))
+                .filter_map(|r| Some((r.id, r.int("solarSystemID")?, r.int("seed")?)))
+                .collect();
+            for (id, system, seed) in unrated {
+                let Some(security) = tx.table("mapSolarSystems").get_id(system).map(|s| s.float("security")) else { continue };
+                let base = match security {
+                    Some(v) if v >= 0.45 => 1,
+                    Some(v) if v > 0.0 => 3,
+                    _ => 5,
+                };
+                // round(base + (seed % 1000) / 1000 * 5), in two-hundredths
+                // so the halves round as exactly as they did in SQL.
+                let n = base * 200 + seed % 1000;
+                let level = if n >= 0 { (n + 100) / 200 } else { (n - 100) / 200 };
+                tx.update("deadspaceComplexes", id, &[("level", Value::Int(level.clamp(1, 10))), ("rooms", Value::Int(2 + seed % 3))])?;
+            }
         }
-        Ok::<_, tokio_postgres::Error>((gone, want))
-    }
-    .await;
+        Ok::<_, StoreError>((gone, want))
+    });
     match result {
         Ok((gone, made)) if gone > 0 || made > 0 => info!("deadspace complexes: {gone} gone, {made} new"),
         Ok(_) => {}
@@ -119,28 +154,22 @@ pub async fn seed(db: &Client) {
 }
 
 /// The complexes of a system, for its park when it is made.
-pub async fn load(db: &Client, system: i64) -> Vec<(i64, u8, i64, Vec3, u8, bool)> {
-    let sql = r#"SELECT "complexID", "level", "seed", "x", "y", "z", "rooms", "cleared" FROM "deadspaceComplexes"
-                  WHERE "solarSystemID" = $1 AND "expires" > $2"#;
-    match db.query(sql, &[&(system as i32), &crate::bulkdata::filetime_now()]).await {
-        Ok(rows) => rows
-            .iter()
-            .map(|r| {
-                (
-                    int(r, 0).unwrap_or(0),
-                    int(r, 1).unwrap_or(1) as u8,
-                    int(r, 2).unwrap_or(0),
-                    Vec3::new(float(r, 3).unwrap_or(0.0), float(r, 4).unwrap_or(0.0), float(r, 5).unwrap_or(0.0)),
-                    int(r, 6).unwrap_or(2) as u8,
-                    int(r, 7).unwrap_or(0) != 0,
-                )
-            })
-            .collect(),
-        Err(e) => {
-            error!("loading the complexes of {system}: {}", crate::logging::chain(&e));
-            Vec::new()
-        }
-    }
+pub fn load(db: &Db, system: i64) -> Vec<(i64, u8, i64, Vec3, u8, bool)> {
+    let now = crate::bulkdata::filetime_now();
+    db.table("deadspaceComplexes")
+        .rows()
+        .filter(|r| r.int("solarSystemID") == Some(system) && r.int("expires").is_some_and(|e| e > now))
+        .map(|r| {
+            (
+                r.int("complexID").unwrap_or(0),
+                r.int("level").unwrap_or(1) as u8,
+                r.int("seed").unwrap_or(0),
+                Vec3::new(r.float("x").unwrap_or(0.0), r.float("y").unwrap_or(0.0), r.float("z").unwrap_or(0.0)),
+                r.int("rooms").unwrap_or(2) as u8,
+                r.int("cleared").unwrap_or(0) != 0,
+            )
+        })
+        .collect()
 }
 
 /// Lays a system's complexes out in its park: beacons for the visible,
@@ -278,11 +307,12 @@ pub fn gate_landing(park: &Park, ship_id: i64, gate: i64) -> Result<Vec3, String
 }
 
 /// Marks a complex cleared, so it goes after a while.
-pub async fn cleared(db: &Client, complex_id: i64) {
+pub async fn cleared(store: &Store, complex_id: i64) {
     let now = crate::bulkdata::filetime_now();
-    let result = db
-        .execute(r#"UPDATE "deadspaceComplexes" SET "cleared" = 1, "expires" = LEAST("expires", $2) WHERE "complexID" = $1"#, &[&(complex_id as i32), &(now + CLEARED_LINGER_FT)])
-        .await;
+    let result = store.write(|tx| {
+        let Some((row, expires)) = tx.table("deadspaceComplexes").get_id(complex_id).map(|r| (r.id, r.int("expires").unwrap_or(0))) else { return Ok(()) };
+        tx.update("deadspaceComplexes", row, &[("cleared", Value::Int(1)), ("expires", Value::Int(expires.min(now + CLEARED_LINGER_FT)))])
+    });
     if let Err(e) = result {
         error!("clearing complex {complex_id}: {}", crate::logging::chain(&e));
     }
@@ -290,23 +320,18 @@ pub async fn cleared(db: &Client, complex_id: i64) {
 
 /// map.GetDeadspaceComplexMap: (solarSystemID, dungeonID, difficulty, name)
 /// of the complexes not hidden.
-pub async fn map(db: &Client) -> Vec<(i64, i64, i64, String)> {
-    let sql = r#"SELECT "solarSystemID", "complexID", "level", "seed" FROM "deadspaceComplexes" WHERE "expires" > $1 AND "seed" % 3 <> 0 AND "cleared" = 0"#;
-    match db.query(sql, &[&crate::bulkdata::filetime_now()]).await {
-        Ok(rows) => rows
-            .iter()
-            .map(|r| {
-                let seed = int(r, 3).unwrap_or(0);
-                let mut rng = crate::combat::Rng::seeded(seed as u64);
-                let name = format!("Deadspace {}", NAMES[rng.below(NAMES.len())]);
-                (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0), int(r, 2).unwrap_or(1), name)
-            })
-            .collect(),
-        Err(e) => {
-            error!("the deadspace map: {}", crate::logging::chain(&e));
-            Vec::new()
-        }
-    }
+pub fn map(db: &Db) -> Vec<(i64, i64, i64, String)> {
+    let now = crate::bulkdata::filetime_now();
+    db.table("deadspaceComplexes")
+        .rows()
+        .filter(|r| r.int("expires").is_some_and(|e| e > now) && r.int("seed").is_some_and(|s| s % 3 != 0) && r.int("cleared") == Some(0))
+        .map(|r| {
+            let seed = r.int("seed").unwrap_or(0);
+            let mut rng = crate::combat::Rng::seeded(seed as u64);
+            let name = format!("Deadspace {}", NAMES[rng.below(NAMES.len())]);
+            (r.int("solarSystemID").unwrap_or(0), r.int("complexID").unwrap_or(0), r.int("level").unwrap_or(1), name)
+        })
+        .collect()
 }
 
 /// The rooms of a park's complexes, for tests and inspection.

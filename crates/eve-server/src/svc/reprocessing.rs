@@ -11,52 +11,54 @@
 use std::collections::HashMap;
 
 use eve_marshal::Value;
-use tokio_postgres::types::ToSql;
 use tracing::{error, info};
 
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Store, StoreError};
 use crate::svc::bound;
 use crate::items::{self, DbResult, ItemTxn, NewItem};
 use crate::svc::inventory::FLAG_HANGAR;
-use crate::svc::rows::{float, int, key_val, row};
+use crate::svc::rows::{key_val, row};
 
-const SKILL_REFINING: i32 = 3385;
-const SKILL_REFINERY_EFFICIENCY: i32 = 3389;
-const SKILL_SCRAPMETAL_PROCESSING: i32 = 12196;
-const FLAG_SKILL: i32 = 7;
-const ATTR_SKILL_LEVEL: i32 = 280;
+const SKILL_REFINING: i64 = 3385;
+const SKILL_REFINERY_EFFICIENCY: i64 = 3389;
+const SKILL_SCRAPMETAL_PROCESSING: i64 = 12196;
+const FLAG_SKILL: i64 = 7;
+const ATTR_SKILL_LEVEL: i64 = 280;
 
-const CATEGORY_BLUEPRINT: i32 = 9;
-const CATEGORY_REACTION: i32 = 24;
+const CATEGORY_BLUEPRINT: i64 = 9;
+const CATEGORY_REACTION: i64 = 24;
 const CATEGORY_ASTEROID: i32 = 25;
-const GROUP_MINERAL: i32 = 18;
-const GROUP_ROOKIESHIP: i32 = 237;
-const TYPE_CREDITS: i32 = 29;
-const TYPE_BOOKMARK: i32 = 51;
+const GROUP_MINERAL: i64 = 18;
+const GROUP_ROOKIESHIP: i64 = 237;
+const TYPE_CREDITS: i64 = 29;
+const TYPE_BOOKMARK: i64 = 51;
 
-/// The same materials config.BulkData.ramtypematerials gives the client.
-const MATERIALS_SQL: &str = r#"SELECT "typeID","requiredTypeID","quantity"
-                                 FROM "TL2MaterialsForTypeWithActivity"
-                                WHERE "activity" = 6 AND "damagePerJob" = 1
-                                  AND "typeID" = ANY($1)"#;
+/// A type's reprocessing materials, in the data's order: the same materials
+/// config.BulkData.ramtypematerials gives the client.
+fn reprocessing_materials(type_id: i64) -> impl Iterator<Item = crate::sde::Row<'static>> {
+    crate::sde::table("TL2MaterialsForTypeWithActivity")
+        .find("typeID", type_id)
+        .filter(|m| m.int("activity") == Some(6) && m.float("damagePerJob") == Some(1.0))
+}
 
 pub async fn reprocessing_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let station = bound::parse(&call.service)
         .and_then(|b| b.params.first().copied())
         .or(ctx.session.station_id)?;
     let value = match call.method.as_str() {
-        "GetReprocessingInfo" => reprocessing_info(&terms(ctx, station).await?),
+        "GetReprocessingInfo" => reprocessing_info(&terms(ctx, station)?),
         // GetOptionsForItemTypes({typeID: 0}) -> {typeID: option row}.
         "GetOptionsForItemTypes" => {
             let types: Vec<i32> = match call.args.first() {
                 Some(Value::Dict(d)) => d.iter().filter_map(|(k, _)| k.as_i64()).map(|t| t as i32).collect(),
                 _ => Vec::new(),
             };
-            options(ctx, &types).await
+            options(&types)
         }
         "GetQuotes" => {
-            let terms = terms(ctx, station).await?;
-            let quotes = quotes(ctx, &terms, station, &item_ids(call)).await;
+            let terms = terms(ctx, station)?;
+            let quotes = quotes(ctx, &terms, station, &item_ids(call));
             Value::Dict(quotes.into_iter().map(|q| (Value::Int(q.item_id), q.to_value())).collect())
         }
         "Reprocess" => return Some(reprocess(ctx, station, &item_ids(call)).await),
@@ -91,35 +93,37 @@ impl Terms {
     }
 }
 
-async fn terms(ctx: &Ctx<'_>, station: i64) -> Option<Terms> {
+/// The highest level of `skill` among the character's trained skills (0
+/// when it has none).
+fn skill_level(db: &Db, char_id: i64, skill: i64) -> f64 {
+    let attributes = db.table("entity_attributes");
+    db.table("entity")
+        .find(&["ownerID", "typeID"], &[store::Value::Int(char_id), store::Value::Int(skill)])
+        .filter(|e| e.int("flag") == Some(FLAG_SKILL))
+        .filter_map(|e| attributes.get(&[store::Value::Int(e.int("itemID")?), store::Value::Int(ATTR_SKILL_LEVEL)]))
+        // A float level is rounded to the integer it is, as `::bigint` did.
+        .filter_map(|a| a.int("valueInt").or_else(|| a.float("valueFloat").map(|f| f.round_ties_even() as i64)))
+        .max()
+        .unwrap_or(0) as f64
+}
+
+fn terms(ctx: &Ctx<'_>, station: i64) -> Option<Terms> {
     let char_id = ctx.session.char_id?;
-    let sql = r#"
-        WITH skill AS (
-            SELECT e."typeID", coalesce(a."valueInt", a."valueFloat"::bigint) AS level
-              FROM entity e
-              JOIN entity_attributes a ON a."itemID" = e."itemID" AND a."attributeID" = $3
-             WHERE e."ownerID" = $2 AND e."flag" = $4
-        )
-        SELECT st."reprocessingEfficiency", st."reprocessingStationsTake",
-               coalesce((SELECT n."standing" FROM "chrNPCStandings" n
-                          WHERE n."characterID" = $2 AND n."fromID" = st."corporationID"), 0),
-               coalesce((SELECT max(level) FROM skill WHERE "typeID" = $5), 0)::float8,
-               coalesce((SELECT max(level) FROM skill WHERE "typeID" = $6), 0)::float8,
-               coalesce((SELECT max(level) FROM skill WHERE "typeID" = $7), 0)::float8
-          FROM "staStations" st WHERE st."stationID" = $1"#;
-    let params: [&(dyn ToSql + Sync); 7] = [
-        &(station as i32),
-        &(char_id as i32),
-        &ATTR_SKILL_LEVEL,
-        &FLAG_SKILL,
-        &SKILL_REFINING,
-        &SKILL_REFINERY_EFFICIENCY,
-        &SKILL_SCRAPMETAL_PROCESSING,
-    ];
-    let r = ctx.query_one(sql, &params).await?;
-    let f = |i: usize| float(&r, i).unwrap_or(0.0);
-    let (station_yield, take, standing) = (f(0), f(1), f(2));
-    let (refining, efficiency, scrapmetal) = (f(3), f(4), f(5));
+    let (station_yield, take, standing, refining, efficiency, scrapmetal) = ctx.store.read(|db| {
+        let st = db.table("staStations").get_id(station)?;
+        let standing = st
+            .int("corporationID")
+            .and_then(|corp| db.table("chrNPCStandings").get(&[store::Value::Int(char_id), store::Value::Int(corp)]))
+            .and_then(|n| n.float("standing"));
+        Some((
+            st.float("reprocessingEfficiency").unwrap_or(0.0),
+            st.float("reprocessingStationsTake").unwrap_or(0.0),
+            standing.unwrap_or(0.0),
+            skill_level(db, char_id, SKILL_REFINING),
+            skill_level(db, char_id, SKILL_REFINERY_EFFICIENCY),
+            skill_level(db, char_id, SKILL_SCRAPMETAL_PROCESSING),
+        ))
+    })?;
     let combined =
         (station_yield + 0.375 * (1.0 + 0.02 * refining) * (1.0 + 0.04 * efficiency)).min(1.0);
     Some(Terms {
@@ -146,26 +150,22 @@ fn reprocessing_info(t: &Terms) -> Value {
 /// The client's own rule (cfg.py GetReprocessingOptions): a type with materials
 /// is refinable if it is ore and recyclable otherwise; money, bookmarks,
 /// minerals, rookie ships, blueprints and reactions are neither.
-async fn options(ctx: &Ctx<'_>, types: &[i32]) -> Value {
+fn options(types: &[i32]) -> Value {
     const HEADER: &[&str] = &["typeID", "isRecyclable", "isRefinable"];
-    let sql = r#"
-        SELECT t."typeID", g."categoryID",
-               t."typeID" <> ALL($2) AND t."groupID" <> ALL($3) AND g."categoryID" <> ALL($4)
-               AND EXISTS (SELECT 1 FROM "TL2MaterialsForTypeWithActivity" m
-                            WHERE m."typeID" = t."typeID" AND m."activity" = 6
-                              AND m."damagePerJob" = 1)
-          FROM "invTypes" t JOIN "invGroups" g ON g."groupID" = t."groupID"
-         WHERE t."typeID" = ANY($1)"#;
-    let excluded_types = vec![TYPE_CREDITS, TYPE_BOOKMARK];
-    let excluded_groups = vec![GROUP_MINERAL, GROUP_ROOKIESHIP];
-    let excluded_categories = vec![CATEGORY_BLUEPRINT, CATEGORY_REACTION];
-    let rows = ctx.query(sql, &[&types, &excluded_types, &excluded_groups, &excluded_categories]).await;
-    let out = rows
-        .iter()
-        .map(|r| {
-            let type_id = int(r, 0).unwrap_or(0);
-            let asteroid = int(r, 1) == Some(CATEGORY_ASTEROID as i64);
-            let usable = r.get::<_, Option<bool>>(2).unwrap_or(false);
+    let sde = crate::sde::get();
+    // Each known type once, in the data's (typeID) order.
+    let mut types: Vec<i64> = types.iter().map(|t| *t as i64).collect();
+    types.sort_unstable();
+    types.dedup();
+    let out = types
+        .into_iter()
+        .filter_map(|type_id| Some((type_id, sde.group_and_category(type_id)?)))
+        .map(|(type_id, (group, category))| {
+            let asteroid = category == CATEGORY_ASTEROID as i64;
+            let usable = ![TYPE_CREDITS, TYPE_BOOKMARK].contains(&type_id)
+                && ![GROUP_MINERAL, GROUP_ROOKIESHIP].contains(&group)
+                && ![CATEGORY_BLUEPRINT, CATEGORY_REACTION].contains(&category)
+                && reprocessing_materials(type_id).next().is_some();
             let flags = (usable && !asteroid, usable && asteroid);
             let line = vec![Value::Int(type_id), Value::Int(flags.0.into()), Value::Int(flags.1.into())];
             (Value::Int(type_id), row(HEADER, line))
@@ -214,37 +214,47 @@ impl Quote {
 /// Quotes for those of `item_ids` the character can reprocess here: its own
 /// items in the station hangar or in a ship of its docked here, holding at
 /// least one portion. The active ship is never offered.
-async fn quotes(ctx: &Ctx<'_>, t: &Terms, station: i64, item_ids: &[i64]) -> Vec<Quote> {
-    let ids: Vec<i32> = item_ids.iter().map(|i| *i as i32).collect();
-    let sql = r#"
-        SELECT e."itemID", e."typeID", e."quantity", t."portionSize", g."categoryID"
-          FROM entity e
-          JOIN "invTypes" t ON t."typeID" = e."typeID"
-          JOIN "invGroups" g ON g."groupID" = t."groupID"
-         WHERE e."itemID" = ANY($1) AND e."ownerID" = $2
-           AND e."itemID" IS DISTINCT FROM $4
-           AND (e."locationID" = $3
-                OR e."locationID" IN (SELECT s."itemID" FROM entity s
-                                       WHERE s."ownerID" = $2 AND s."locationID" = $3))"#;
-    let active_ship = ctx.session.ship_id.map(|s| s as i32);
-    let items = ctx.query(sql, &[&ids, &(t.char_id as i32), &(station as i32), &active_ship]).await;
-    let types: Vec<i32> = items.iter().filter_map(|r| int(r, 1)).map(|v| v as i32).collect();
+fn quotes(ctx: &Ctx<'_>, t: &Terms, station: i64, item_ids: &[i64]) -> Vec<Quote> {
+    let mut ids = item_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let active_ship = ctx.session.ship_id;
+    let items: Vec<[Option<i64>; 3]> = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        // In the hangar, or in a container (a ship) of the character's there.
+        let here = |location: i64| {
+            location == station
+                || entity.get_id(location).is_some_and(|s| s.int("ownerID") == Some(t.char_id) && s.int("locationID") == Some(station))
+        };
+        ids.iter()
+            .filter(|id| Some(**id) != active_ship)
+            .filter_map(|id| entity.get_id(*id))
+            .filter(|e| e.int("ownerID") == Some(t.char_id) && e.int("locationID").is_some_and(here))
+            .map(|e| [e.int("itemID"), e.int("typeID"), e.int("quantity")])
+            .collect()
+    });
+    let sde = crate::sde::get();
     let mut materials: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
-    for r in ctx.query(MATERIALS_SQL, &[&types]).await {
-        let (Some(product), Some(material), Some(qty)) = (int(&r, 0), int(&r, 1), int(&r, 2)) else { continue };
-        materials.entry(product).or_default().push((material, qty));
+    for type_id in items.iter().filter_map(|r| r[1]) {
+        let mats: Vec<(i64, i64)> =
+            reprocessing_materials(type_id).filter_map(|m| Some((m.int("requiredTypeID")?, m.int("quantity")?))).collect();
+        if !mats.is_empty() {
+            materials.insert(type_id, mats);
+        }
     }
 
     let mut out = Vec::new();
     for r in &items {
-        let (Some(item_id), Some(type_id), Some(quantity)) = (int(r, 0), int(r, 1), int(r, 2)) else { continue };
-        let portion = int(r, 3).unwrap_or(1).max(1);
+        let [Some(item_id), Some(type_id), Some(quantity)] = *r else { continue };
+        // An item of a type the data does not know is not reprocessed.
+        let Some((_, category)) = sde.group_and_category(type_id) else { continue };
+        let portion = sde.table("invTypes").get("typeID", type_id).and_then(|t| t.int("portionSize")).unwrap_or(1).max(1);
         let portions = quantity / portion;
         let Some(mats) = materials.get(&type_id) else { continue };
         if portions == 0 {
             continue;
         }
-        let yield_ = t.yield_for(int(r, 4).unwrap_or(0) as i32);
+        let yield_ = t.yield_for(category as i32);
         let recoverables = mats
             .iter()
             .map(|&(material, per_portion)| {
@@ -268,12 +278,12 @@ async fn quotes(ctx: &Ctx<'_>, t: &Terms, station: i64, item_ids: &[i64]) -> Vec
 /// portion stays), whatever it held goes to the hangar, and the character's
 /// share of the materials is stacked in the hangar.
 async fn reprocess(ctx: &Ctx<'_>, station: i64, item_ids: &[i64]) -> Outcome {
-    let Some(terms) = terms(ctx, station).await else { return Outcome::custom("You are not docked here.") };
-    let quotes = quotes(ctx, &terms, station, item_ids).await;
+    let Some(terms) = terms(ctx, station) else { return Outcome::custom("You are not docked here.") };
+    let quotes = quotes(ctx, &terms, station, item_ids);
     if quotes.is_empty() {
         return Outcome::custom("None of those items can be reprocessed here.");
     }
-    match apply(ctx.db_url, terms.char_id, station, &quotes).await {
+    match apply(ctx.store, terms.char_id, station, &quotes).await {
         Ok(events) => {
             items::notify(ctx.world, ctx.client_id, events);
             info!("reprocessed {} item(s) at station {station}", quotes.len());
@@ -286,38 +296,37 @@ async fn reprocess(ctx: &Ctx<'_>, station: i64, item_ids: &[i64]) -> Outcome {
     }
 }
 
-async fn apply(db_url: &str, char_id: i64, station: i64, quotes: &[Quote]) -> DbResult<Vec<Value>> {
-    let mut client = crate::db::connect(db_url).await?;
-    let mut txn = ItemTxn::begin(&mut client).await?;
-    let mut gained: HashMap<i64, i64> = HashMap::new();
+async fn apply(store: &Store, char_id: i64, station: i64, quotes: &[Quote]) -> DbResult<Vec<Value>> {
+    store.write(|tx| -> Result<_, StoreError> {
+        let mut txn = ItemTxn::new(tx);
+        let mut gained: HashMap<i64, i64> = HashMap::new();
 
-    for q in quotes {
-        if q.leftover > 0 {
-            txn.set_quantity(q.item_id, q.leftover).await?;
-        } else {
-            let held = txn
-                .tx()
-                .query(r#"SELECT "itemID" FROM entity WHERE "locationID" = $1"#, &[&(q.item_id as i32)])
-                .await?;
-            for r in &held {
-                txn.move_to(r.get::<_, i32>(0).into(), station, FLAG_HANGAR.into()).await?;
+        for q in quotes {
+            if q.leftover > 0 {
+                txn.set_quantity(q.item_id, q.leftover)?;
+            } else {
+                let held: Vec<i64> =
+                    txn.db().table("entity").find(&["locationID"], &[store::Value::Int(q.item_id)]).filter_map(|r| r.int("itemID")).collect();
+                for id in held {
+                    txn.move_to(id, station, FLAG_HANGAR.into())?;
+                }
+                txn.destroy(q.item_id)?;
             }
-            txn.destroy(q.item_id).await?;
+            for m in q.recoverables.iter().filter(|m| m.client > 0) {
+                *gained.entry(m.type_id).or_default() += m.client;
+            }
         }
-        for m in q.recoverables.iter().filter(|m| m.client > 0) {
-            *gained.entry(m.type_id).or_default() += m.client;
+        for (type_id, quantity) in gained {
+            let stack = NewItem {
+                type_id,
+                owner_id: char_id,
+                location_id: station,
+                flag: FLAG_HANGAR.into(),
+                quantity,
+                singleton: false,
+            };
+            txn.stack_onto(stack)?;
         }
-    }
-    for (type_id, quantity) in gained {
-        let stack = NewItem {
-            type_id,
-            owner_id: char_id,
-            location_id: station,
-            flag: FLAG_HANGAR.into(),
-            quantity,
-            singleton: false,
-        };
-        txn.stack_onto(stack).await?;
-    }
-    txn.commit().await
+        Ok(txn.events())
+    })
 }

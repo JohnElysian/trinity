@@ -8,57 +8,72 @@
 use eve_marshal::Value;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{float, int};
+use crate::store::{self, Db};
+use crate::svc::rows::rowset;
 
-const CATEGORY_SKILL: i32 = 16;
-const ACTIVITY_MANUFACTURING: i32 = 1;
+const CATEGORY_SKILL: i64 = 16;
+const ACTIVITY_MANUFACTURING: i64 = 1;
 
 pub async fn factory(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
         "GetBlueprintAttributes" => blueprint_attributes(ctx, call.arg_id(0)).await,
         // (blueprintTypeID, activity); activity -1 means every activity.
         "GetMaterialsForTypeWithActivity" => {
-            let activity = call.arg_i64(1).unwrap_or(-1) as i32;
-            let sql = r#"SELECT "activity","requiredTypeID","quantity","damagePerJob"
-                           FROM "TL2MaterialsForTypeWithActivity"
-                          WHERE "typeID" = $1 AND ($2 = -1 OR "activity" = $2)
-                          ORDER BY "activity","requiredTypeID""#;
+            let activity = call.arg_i64(1).unwrap_or(-1) as i32 as i64;
             let header = ["activity", "requiredTypeID", "quantity", "damagePerJob"];
-            ctx.rowset(&header, sql, &[&(call.arg_id(0) as i32), &activity]).await
+            let mut rows: Vec<_> = crate::sde::table("TL2MaterialsForTypeWithActivity")
+                .find("typeID", call.arg_id(0) as i32 as i64)
+                .filter(|m| activity == -1 || m.int("activity") == Some(activity))
+                .collect();
+            // ORDER BY "activity","requiredTypeID", NULLs last.
+            rows.sort_by_key(|m| (m.int("activity").is_none(), m.int("activity"), m.int("requiredTypeID").is_none(), m.int("requiredTypeID")));
+            rowset(&header, rows.iter().map(|m| Value::List(m.line(&header))).collect())
         }
         // What an item is built from: the consumed manufacturing inputs of the
         // blueprint that produces it (no skills, no reusable tools).
         "GetMaterialCompositionOfItemType" => {
-            let sql = r#"SELECT m."requiredTypeID" AS "typeID", m."quantity"
-                           FROM "invBlueprintTypes" b
-                           JOIN "TL2MaterialsForTypeWithActivity" m
-                             ON m."typeID" = b."blueprintTypeID" AND m."activity" = $2
-                           JOIN "invTypes" t ON t."typeID" = m."requiredTypeID"
-                           JOIN "invGroups" g ON g."groupID" = t."groupID"
-                          WHERE b."productTypeID" = $1 AND m."damagePerJob" >= 1
-                            AND m."quantity" > 0 AND g."categoryID" <> $3
-                          ORDER BY m."requiredTypeID""#;
-            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
-                [&(call.arg_id(0) as i32), &ACTIVITY_MANUFACTURING, &CATEGORY_SKILL];
-            ctx.rowset(&["typeID", "quantity"], sql, &params).await
+            let sde = crate::sde::get();
+            let materials = sde.table("TL2MaterialsForTypeWithActivity");
+            let mut rows: Vec<_> = sde
+                .table("invBlueprintTypes")
+                .find("productTypeID", call.arg_id(0) as i32 as i64)
+                .filter_map(|b| b.int("blueprintTypeID"))
+                .flat_map(|blueprint| materials.find("typeID", blueprint))
+                .filter(|m| {
+                    m.int("activity") == Some(ACTIVITY_MANUFACTURING)
+                        && m.float("damagePerJob").is_some_and(|d| d >= 1.0)
+                        && m.int("quantity").is_some_and(|q| q > 0)
+                        && m.int("requiredTypeID").and_then(|t| sde.group_and_category(t)).is_some_and(|(_, c)| c != CATEGORY_SKILL)
+                })
+                .collect();
+            rows.sort_by_key(|m| m.int("requiredTypeID"));
+            rowset(&["typeID", "quantity"], rows.iter().map(|m| Value::List(m.line(&["requiredTypeID", "quantity"]))).collect())
         }
         // (locationID, flag, isCorp): the blueprints in one hangar.
         "GetBlueprintInformationAtLocationWithFlag" => {
-            let sql = r#"SELECT e."itemID", e."typeID", e."quantity", e."singleton",
-                                COALESCE(i."copy", 0), COALESCE(i."materialLevel", 0),
-                                COALESCE(i."productivityLevel", 0), COALESCE(i."licensedProductionRunsRemaining", -1)
-                           FROM entity e
-                           JOIN "invBlueprintTypes" b ON b."blueprintTypeID" = e."typeID"
-                           LEFT JOIN "invBlueprints" i ON i."itemID" = e."itemID"
-                          WHERE e."locationID" = $1 AND e."flag" = $2
-                          ORDER BY e."itemID""#;
             let header = [
                 "itemID", "typeID", "quantity", "singleton", "copy", "materialLevel", "productivityLevel",
                 "licensedProductionRunsRemaining",
             ];
-            let location = call.arg_id(0) as i32;
-            let flag = call.arg_id(1) as i32;
-            ctx.rowset(&header, sql, &[&location, &flag]).await
+            let (location, flag) = (call.arg_id(0), call.arg_id(1));
+            let blueprints = crate::sde::table("invBlueprintTypes");
+            let lines = ctx.store.read(|db| {
+                let mut rows: Vec<_> = db
+                    .table("entity")
+                    .find(&["locationID", "flag"], &[store::Value::Int(location), store::Value::Int(flag)])
+                    .filter(|e| e.int("typeID").is_some_and(|t| blueprints.get("blueprintTypeID", t).is_some()))
+                    .collect();
+                rows.sort_by_key(|e| e.int("itemID"));
+                rows.iter()
+                    .map(|e| {
+                        let (copy, material, productivity, runs) = research(db, e.int("itemID").unwrap_or(0));
+                        let mut line = e.line(&header[..4]);
+                        line.extend([copy, material, productivity, runs].map(Value::Int));
+                        Value::List(line)
+                    })
+                    .collect()
+            });
+            rowset(&header, lines)
         }
         _ => return None,
     };
@@ -67,27 +82,34 @@ pub async fn factory(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 /// infosvc reads these keys from the dict (has_key) for a blueprint item.
 async fn blueprint_attributes(ctx: &Ctx<'_>, item_id: i64) -> Value {
-    let sql = r#"SELECT b."productionTime", b."researchMaterialTime", b."researchCopyTime",
-                        b."researchProductivityTime", b."wasteFactor", b."productTypeID",
-                        COALESCE(i."materialLevel", 0), COALESCE(i."productivityLevel", 0),
-                        COALESCE(i."copy", 0), COALESCE(i."licensedProductionRunsRemaining", -1)
-                   FROM entity e
-                   JOIN "invBlueprintTypes" b ON b."blueprintTypeID" = e."typeID"
-                   LEFT JOIN "invBlueprints" i ON i."itemID" = e."itemID"
-                  WHERE e."itemID" = $1"#;
-    let Some(r) = ctx.query_one(sql, &[&(item_id as i32)]).await else { return Value::None };
-    let num = |i: usize| Value::Int(int(&r, i).unwrap_or(0));
+    let found = ctx.store.read(|db| {
+        let type_id = db.table("entity").get_id(item_id)?.int("typeID");
+        Some((type_id, research(db, item_id)))
+    });
+    let Some((type_id, (copy, material, productivity, runs))) = found else { return Value::None };
+    // Only a blueprint has these: an item of any other type has no answer.
+    let Some(b) = type_id.and_then(|t| crate::sde::table("invBlueprintTypes").get("blueprintTypeID", t)) else { return Value::None };
+    let num = Value::Int;
+    let static_num = |c: &str| Value::Int(b.int(c).unwrap_or(0));
     let pairs = [
-        ("manufacturingTime", num(0)),
-        ("researchMaterialTime", num(1)),
-        ("researchCopyTime", num(2)),
-        ("researchProductivityTime", num(3)),
-        ("wastageFactor", Value::Double(float(&r, 4).unwrap_or(0.0) / 100.0)),
-        ("productTypeID", num(5)),
-        ("materialLevel", num(6)),
-        ("productivityLevel", num(7)),
-        ("copy", num(8)),
-        ("licensedProductionRunsRemaining", num(9)),
+        ("manufacturingTime", static_num("productionTime")),
+        ("researchMaterialTime", static_num("researchMaterialTime")),
+        ("researchCopyTime", static_num("researchCopyTime")),
+        ("researchProductivityTime", static_num("researchProductivityTime")),
+        ("wastageFactor", Value::Double(b.float("wasteFactor").unwrap_or(0.0) / 100.0)),
+        ("productTypeID", static_num("productTypeID")),
+        ("materialLevel", num(material)),
+        ("productivityLevel", num(productivity)),
+        ("copy", num(copy)),
+        ("licensedProductionRunsRemaining", num(runs)),
     ];
     Value::Dict(pairs.into_iter().map(|(k, v)| (Value::bytes(k), v)).collect())
+}
+
+/// A blueprint item's copy flag, material and productivity levels and runs
+/// left: its invBlueprints row, else an original's (0, 0, 0, unlimited).
+fn research(db: &Db, item_id: i64) -> (i64, i64, i64, i64) {
+    let row = db.table("invBlueprints").get_id(item_id);
+    let col = |c: &str, default: i64| row.and_then(|r| r.int(c)).unwrap_or(default);
+    (col("copy", 0), col("materialLevel", 0), col("productivityLevel", 0), col("licensedProductionRunsRemaining", -1))
 }

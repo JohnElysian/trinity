@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use tokio_postgres::Client;
 use tracing::info;
 
 use super::behaviour::{self, Activity, Atlas, Bot};
@@ -18,6 +17,7 @@ use super::presence::{Identity, Presence};
 use super::relations::{self, Stance};
 use super::ships::{self, Shipyard};
 use crate::combat::{Lock, Rng};
+use crate::store::Store;
 use crate::world::World;
 
 const HOUR: Duration = Duration::from_secs(3_600);
@@ -58,8 +58,7 @@ fn refusal(why: &str) -> String {
 pub async fn run(
     hires: &mut Hires,
     world: &World,
-    db: &Client,
-    db_url: &str,
+    store: &Store,
     atlas: &Atlas,
     bots: &mut [Bot],
     ids: &[Identity],
@@ -100,7 +99,7 @@ pub async fn run(
         };
         let paid = match &why {
             Some(_) => false,
-            None => charge(db, db_url, world, player, b.id, fee).await,
+            None => charge(store, world, player, b.id, fee).await,
         };
         let gang = world.lock().gangs.of(player);
         match (why, paid, gang) {
@@ -118,12 +117,12 @@ pub async fn run(
                     "Glad to fly with you. My rate is {} ISK an hour, paid at the start of each hour; I've taken the first. I'll stay on your wing, follow you through gates, and shoot whatever shoots you or whatever you lock. Kick me from the gang when you're done.",
                     whole(fee)
                 );
-                letter(db, world, b_id(bots, i), player, "On your wing", &body).await;
+                letter(store, world, b_id(bots, i), player, "On your wing", &body).await;
             }
             (why, _, _) => {
                 let why = why.unwrap_or_else(|| format!("you can't cover my rate of {} ISK an hour.", whole(fee)));
                 crate::svc::gang::bot_declines(&mut world.lock(), bot_char);
-                letter(db, world, b_id(bots, i), player, "Your offer", &refusal(&why)).await;
+                letter(store, world, b_id(bots, i), player, "Your offer", &refusal(&why)).await;
             }
         }
     }
@@ -143,7 +142,7 @@ pub async fn run(
             continue;
         }
         if Instant::now() >= hire.paid_until {
-            if charge(db, db_url, world, hire.player, bot_char as i32, hire.rate).await {
+            if charge(store, world, hire.player, bot_char as i32, hire.rate).await {
                 hire.paid_until += HOUR;
             } else {
                 ended.push((i, Some("Your wallet's run dry, so I'm off. Fly safe.")));
@@ -166,7 +165,7 @@ pub async fn run(
             touched.push((i, wait));
         }
         if let Some(why) = why {
-            letter(db, world, bot_char as i32, hire.player, "Contract over", why).await;
+            letter(store, world, bot_char as i32, hire.player, "Contract over", why).await;
         }
         info!("bots: {}'s contract with {} is over", ids[i as usize].name, hire.player);
     }
@@ -204,18 +203,18 @@ fn whole(amount: f64) -> String {
 }
 
 /// An hour's pay, from the player to the bot. Whether it went through.
-async fn charge(db: &Client, db_url: &str, world: &World, player: i64, bot: i32, amount: f64) -> bool {
+async fn charge(store: &Store, world: &World, player: i64, bot: i32, amount: f64) -> bool {
     use crate::svc::wallet::{move_cash, Payment};
     let payment = Payment { payer: player, payee: Some(bot as i64), amount, ref_type: REF_PLAYER_DONATION, arg_id1: "", reason: "Wingman's hourly rate" };
-    let ok = move_cash(db_url, payment).await.is_ok();
+    let ok = move_cash(store, payment).await.is_ok();
     if ok {
-        relations::tell_balance(db, world, player as i32).await;
+        relations::tell_balance(store, world, player as i32);
     }
     ok
 }
 
-async fn letter(db: &Client, world: &World, from: i32, to: i64, subject: &str, body: &str) {
-    if let Err(e) = crate::svc::chat::deliver(db, world, from as i64, &[to], subject, body).await {
+async fn letter(store: &Store, world: &World, from: i32, to: i64, subject: &str, body: &str) {
+    if let Err(e) = store.write(|tx| crate::svc::chat::deliver(tx, world, from as i64, &[to], subject, body)) {
         tracing::error!("bots: a wingman's mail to {to}: {}", crate::logging::chain(&e));
     }
 }

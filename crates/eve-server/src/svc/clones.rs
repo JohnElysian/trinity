@@ -20,11 +20,11 @@
 //!   pilot agrees (JumpCheckWillLoseExistingClone[AndImplants]).
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::info;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{float, int, key_val, rowset};
+use crate::store::{self, Db, StoreError, Tx};
+use crate::svc::rows::{key_val, rowset};
 use crate::world::Move;
 
 const CLONE_HEADER: &[&str] = &["jumpCloneID", "locationID"];
@@ -35,18 +35,18 @@ const SHIP_CLONE_HEADER: &[&str] = &["jumpCloneID", "ownerID", "locationID"];
 pub const PRICE: f64 = 900_000.0;
 /// One jump a day.
 const COOLDOWN_FT: i64 = 24 * 3_600 * 10_000_000;
-const FLAG_IMPLANT: i32 = 89;
-const FLAG_HANGAR: i32 = 4;
+const FLAG_IMPLANT: i64 = 89;
+const FLAG_HANGAR: i64 = 4;
 const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
 const SERVICE_CLONING: i32 = 512;
 const SERVICE_JUMP_CLONE: i32 = 8_388_608;
 pub const CLONE_VAT_BAYS: [i32; 2] = [23735, 24547];
-const TYPE_CAPSULE: i32 = 670;
+const TYPE_CAPSULE: i64 = 670;
 /// market_refTypes: "Jump Clone Installation Fee" is not in the table of the
 /// time; the clone fee goes as "Clone Activation".
 const REF_CLONE: i32 = 8;
 /// Fitted modules sit in the low, medium and high slots.
-const SLOT_FLAGS: (i32, i32) = (11, 34);
+const SLOT_FLAGS: (i64, i64) = (11, 34);
 
 type Refused<T> = Result<T, Outcome>;
 
@@ -54,9 +54,29 @@ fn refuse<T>(text: &str) -> Refused<T> {
     Err(Outcome::custom(text))
 }
 
-fn db_err(e: tokio_postgres::Error) -> Outcome {
+fn db_err(e: StoreError) -> Outcome {
     tracing::error!("jump clones: {}", crate::logging::chain(&e));
     Outcome::custom("The clone bay could not do that just now.")
+}
+
+/// A refusal inside a store write: returned from it, it undoes what the
+/// write did.
+struct Abort(Outcome);
+
+impl From<Outcome> for Abort {
+    fn from(o: Outcome) -> Self {
+        Abort(o)
+    }
+}
+
+impl From<StoreError> for Abort {
+    fn from(e: StoreError) -> Self {
+        Abort(db_err(e))
+    }
+}
+
+fn abort<T>(text: &str) -> Result<T, Abort> {
+    Err(Abort(Outcome::custom(text)))
 }
 
 pub async fn jump_clone_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
@@ -84,29 +104,27 @@ pub async fn jump_clone_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 /// clonejumpsvc.GetCloneState reads named members, including its cooldown.
 async fn clone_state(ctx: &Ctx<'_>, me: i64) -> Refused<Value> {
-    let clones = ctx
-        .rowset(CLONE_HEADER, r#"SELECT "jumpCloneID", "locationID" FROM "chrJumpClones" WHERE "ownerID" = $1 ORDER BY 1"#, &[&(me as i32)])
-        .await;
-    let implants = ctx
-        .rowset(
-            IMPLANT_HEADER,
-            r#"SELECT j."jumpCloneID", e."typeID" FROM "chrJumpClones" j JOIN entity e ON e."locationID" = j."jumpCloneID"
-                WHERE j."ownerID" = $1 AND e."flag" = $2 ORDER BY 1, 2"#,
-            &[&(me as i32), &FLAG_IMPLANT],
-        )
-        .await;
-    let last = ctx
-        .db
-        .query_opt(
-            r#"SELECT "lastCloneJump" FROM "character_" WHERE "characterID"=$1"#,
-            &[&(me as i32)],
-        )
-        .await
-        .map_err(db_err)?
-        .map_or(0, |r| r.get::<_, i64>(0));
+    let (clones, implants, last) = ctx.store.read(|db| {
+        let mut mine: Vec<_> = db.table("chrJumpClones").find(&["ownerID"], &[store::Value::Int(me)]).collect();
+        mine.sort_by_key(|j| j.int("jumpCloneID"));
+        let clones = mine.iter().map(|j| Value::List(j.line(CLONE_HEADER))).collect();
+        let entity = db.table("entity");
+        let mut implants: Vec<(Option<i64>, Option<i64>, Vec<Value>)> = Vec::new();
+        for j in &mine {
+            let Some(clone) = j.int("jumpCloneID") else { continue };
+            for e in entity.find(&["locationID", "flag"], &[store::Value::Int(clone), store::Value::Int(FLAG_IMPLANT)]) {
+                implants.push((Some(clone), e.int("typeID"), vec![j.cell("jumpCloneID"), e.cell("typeID")]));
+            }
+        }
+        // ORDER BY 1, 2: NULLs last.
+        implants.sort_by_key(|(clone, ty, _)| (clone.is_none(), *clone, ty.is_none(), *ty));
+        let implants = implants.into_iter().map(|(_, _, line)| Value::List(line)).collect();
+        let last = db.table("character_").get_id(me).and_then(|r| r.int("lastCloneJump")).unwrap_or(0);
+        (clones, implants, last)
+    });
     Ok(key_val(vec![
-        ("clones", clones),
-        ("implants", implants),
+        ("clones", rowset(CLONE_HEADER, clones)),
+        ("implants", rowset(IMPLANT_HEADER, implants)),
         ("timeLastJump", Value::Long(last)),
     ]))
 }
@@ -116,53 +134,46 @@ async fn clones_at(ctx: &Ctx<'_>, location: Option<i64>) -> Value {
     let Some(location) = location else {
         return rowset(SHIP_CLONE_HEADER, Vec::new());
     };
-    ctx.rowset(
-        SHIP_CLONE_HEADER,
-        r#"SELECT "jumpCloneID", "ownerID", "locationID" FROM "chrJumpClones" WHERE "locationID" = $1 ORDER BY 1"#,
-        &[&(location as i32)],
-    )
-    .await
+    let lines = ctx.store.read(|db| {
+        let mut here: Vec<_> = db.table("chrJumpClones").find(&["locationID"], &[store::Value::Int(location)]).collect();
+        here.sort_by_key(|j| j.int("jumpCloneID"));
+        here.iter().map(|j| Value::List(j.line(SHIP_CLONE_HEADER))).collect()
+    });
+    rowset(SHIP_CLONE_HEADER, lines)
 }
 
 /// How many clones a pilot may keep: a level of Infomorph Psychology each.
-async fn allowed(db: &impl GenericClient, me: i64) -> Result<i64, tokio_postgres::Error> {
-    Ok(
-        crate::svc::skills::levels(db, me, &[SKILL_INFOMORPH_PSYCHOLOGY])
-            .await?
-            .get(&SKILL_INFOMORPH_PSYCHOLOGY)
-            .copied()
-            .unwrap_or(0),
-    )
+fn allowed(db: &Db, me: i64) -> Result<i64, StoreError> {
+    Ok(crate::svc::skills::levels(db, me, &[SKILL_INFOMORPH_PSYCHOLOGY])?
+        .get(&SKILL_INFOMORPH_PSYCHOLOGY)
+        .copied()
+        .unwrap_or(0))
 }
 
-async fn count(db: &impl GenericClient, me: i64) -> Result<i64, tokio_postgres::Error> {
-    Ok(db
-        .query_one(
-            r#"SELECT count(*) FROM "chrJumpClones" WHERE "ownerID" = $1"#,
-            &[&(me as i32)],
-        )
-        .await?
-        .get(0))
+fn count(db: &Db, me: i64) -> i64 {
+    db.table("chrJumpClones").find(&["ownerID"], &[store::Value::Int(me)]).count() as i64
 }
 
-async fn lock_pilot(
-    tx: &tokio_postgres::Transaction<'_>,
-    ctx: &Ctx<'_>,
-    me: i64,
-) -> Refused<tokio_postgres::Row> {
-    if !super::login::lock_character_lifecycle(tx, me as i32)
-        .await
-        .map_err(db_err)?
-    {
+/// The pilot, still where the session has them and in the ship it has them
+/// in: when they last clone jumped.
+fn pilot_here(db: &Db, ctx: &Ctx<'_>, me: i64) -> Refused<i64> {
+    let Some(pilot) = db.table("character_").get_id(me) else {
         return refuse("That character no longer exists.");
-    }
-    let pilot=tx.query_opt(r#"SELECT "stationID","solarSystemID","shipID","lastCloneJump" FROM "character_" WHERE "characterID"=$1 FOR UPDATE"#,&[&(me as i32)]).await.map_err(db_err)?.ok_or_else(||Outcome::custom("That character no longer exists."))?;
-    if int(&pilot, 0).unwrap_or(0) != ctx.session.station_id.unwrap_or(0)
-        || int(&pilot, 2).filter(|id| *id > 0) != ctx.session.ship_id
+    };
+    if pilot.int("stationID").unwrap_or(0) != ctx.session.station_id.unwrap_or(0)
+        || pilot.int("shipID").filter(|id| *id > 0) != ctx.session.ship_id
     {
         return refuse("Your location or active ship has changed. Refresh the clone bay.");
     }
-    Ok(pilot)
+    Ok(pilot.int("lastCloneJump").unwrap_or(0))
+}
+
+/// The clone `me` has at `location`, if any.
+fn clone_of(db: &Db, me: i64, location: i64) -> Option<i64> {
+    db.table("chrJumpClones")
+        .find(&["ownerID"], &[store::Value::Int(me)])
+        .find(|j| j.int("locationID") == Some(location))
+        .and_then(|j| j.int("jumpCloneID"))
 }
 
 fn invalidated(ctx: &Ctx<'_>, owner: i64, location: i64, station: bool) {
@@ -195,76 +206,62 @@ async fn install(ctx: &Ctx<'_>, me: i64) -> Refused<Value> {
     let Some(station) = ctx.session.station_id else {
         return refuse("You must be docked to install a clone.");
     };
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(db_err)?;
-    let tx = client.transaction().await.map_err(db_err)?;
-    lock_pilot(&tx, ctx, me).await?;
-    let row = tx
-        .query_opt(
-            r#"SELECT s."corporationID", COALESCE((SELECT bit_or(os."serviceID") FROM "staOperationServices" os WHERE os."operationID" = s."operationID"), 0),
-                      COALESCE((SELECT n."standing" FROM "chrNPCStandings" n WHERE n."characterID" = $2 AND n."fromID" = s."corporationID"), 0)::float8,
-                      COALESCE(co."allianceID", 0)
-                 FROM "staStations" s LEFT JOIN "corporation" co ON co."corporationID" = s."corporationID"
-                WHERE s."stationID" = $1"#,
-            &[&(station as i32), &(me as i32)],
-        )
-        .await
-        .map_err(db_err)?;
-    let Some(row) = row else {
-        return refuse("This station has no clone bay.");
-    };
-    let (owner, services, standing, owner_alliance) = (
-        int(&row, 0).unwrap_or(0),
-        int(&row, 1).unwrap_or(0),
-        float(&row, 2).unwrap_or(0.0),
-        int(&row, 3).unwrap_or(0),
-    );
-    let ours = Some(owner) == ctx.session.corp_id
-        || (owner_alliance != 0 && Some(owner_alliance) == ctx.session.alliance_id);
-    if services & (SERVICE_CLONING | SERVICE_JUMP_CLONE) as i64 == 0 {
-        return refuse("This station has no clone bay.");
-    }
-    let need = crate::config::jump_clone_min_standing();
-    if !ours && standing < need {
-        return refuse(&format!("The station's owners install clones only for pilots they stand at {need:.1} or better towards; they stand at {standing:.1} towards you."));
-    }
-    let here = tx
-        .query_opt(
-            r#"SELECT 1 FROM "chrJumpClones" WHERE "ownerID" = $1 AND "locationID" = $2"#,
-            &[&(me as i32), &(station as i32)],
-        )
-        .await
-        .map_err(db_err)?;
-    if here.is_some() {
-        return refuse("You already have a clone at this station.");
-    }
-    let (have, may) = (
-        count(&tx, me).await.map_err(db_err)?,
-        allowed(&tx, me).await.map_err(db_err)?,
-    );
-    if have >= may {
-        return refuse(&format!(
-            "You have {have} jump clone(s), as many as your Infomorph Psychology allows."
-        ));
-    }
-    pay(&tx, me, PRICE).await?;
-    tx.execute(
-        r#"INSERT INTO "chrJumpClones" ("ownerID","locationID","createdAt") VALUES ($1, $2, $3)"#,
-        &[
-            &(me as i32),
-            &(station as i32),
-            &crate::bulkdata::filetime_now(),
-        ],
-    )
-    .await
-    .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    let (operations, masks) = crate::svc::station::service_masks();
+    ctx.store
+        .write(|tx| -> Result<(), Abort> {
+            pilot_here(tx.db(), ctx, me)?;
+            let Some(s) = tx.table("staStations").get_id(station) else {
+                return abort("This station has no clone bay.");
+            };
+            let owner = s.int("corporationID");
+            let services = s
+                .int("operationID")
+                .and_then(|op| operations.iter().position(|o| i64::from(*o) == op))
+                .map_or(0, |i| i64::from(masks[i]));
+            let standing = owner
+                .and_then(|corp| tx.table("chrNPCStandings").get(&[store::Value::Int(me), store::Value::Int(corp)]))
+                .and_then(|n| n.float("standing"))
+                .unwrap_or(0.0);
+            let owner_alliance =
+                owner.and_then(|corp| tx.table("corporation").get_id(corp)).and_then(|co| co.int("allianceID")).unwrap_or(0);
+            let owner = owner.unwrap_or(0);
+            let ours = Some(owner) == ctx.session.corp_id
+                || (owner_alliance != 0 && Some(owner_alliance) == ctx.session.alliance_id);
+            if services & (SERVICE_CLONING | SERVICE_JUMP_CLONE) as i64 == 0 {
+                return abort("This station has no clone bay.");
+            }
+            let need = crate::config::jump_clone_min_standing();
+            if !ours && standing < need {
+                return abort(&format!("The station's owners install clones only for pilots they stand at {need:.1} or better towards; they stand at {standing:.1} towards you."));
+            }
+            if clone_of(tx.db(), me, station).is_some() {
+                return abort("You already have a clone at this station.");
+            }
+            let (have, may) = (count(tx.db(), me), allowed(tx.db(), me)?);
+            if have >= may {
+                return abort(&format!(
+                    "You have {have} jump clone(s), as many as your Infomorph Psychology allows."
+                ));
+            }
+            pay(tx, me, PRICE)?;
+            tx.insert(
+                "chrJumpClones",
+                &[
+                    ("ownerID", store::Value::Int(me)),
+                    ("locationID", store::Value::Int(station)),
+                    ("createdAt", store::Value::Int(crate::bulkdata::filetime_now())),
+                ],
+            )?;
+            Ok(())
+        })
+        .map_err(|Abort(o)| o)?;
     super::wallet::notify_balance(ctx, me).await;
     info!("{me} installed a jump clone at station {station}");
     invalidated(ctx, me, station, true);
     Ok(Value::None)
 }
 
-async fn pay(tx: &tokio_postgres::Transaction<'_>, me: i64, amount: f64) -> Refused<()> {
+fn pay(tx: &mut Tx<'_>, me: i64, amount: f64) -> Refused<()> {
     use crate::svc::wallet::{post, Entry, Transfer};
     let entry = Entry {
         payer: me,
@@ -273,7 +270,7 @@ async fn pay(tx: &tokio_postgres::Transaction<'_>, me: i64, amount: f64) -> Refu
         arg_id1: "",
         reason: "Jump clone installation",
     };
-    match post(tx, me, -amount, &entry).await {
+    match post(tx, me, -amount, &entry) {
         Ok(_) => Ok(()),
         Err(Transfer::NotEnough { need, have }) => Err(Outcome::not_enough_money(need, have)),
         Err(Transfer::NoSuchOwner) => refuse("No wallet."),
@@ -281,65 +278,78 @@ async fn pay(tx: &tokio_postgres::Transaction<'_>, me: i64, amount: f64) -> Refu
     }
 }
 
+/// The items at `locations`, gone with their stored attributes.
+fn remove_items_at(tx: &mut Tx<'_>, locations: &[i64]) -> Result<(), StoreError> {
+    for location in locations {
+        let items: Vec<(store::RowId, Option<i64>)> = tx
+            .table("entity")
+            .find(&["locationID"], &[store::Value::Int(*location)])
+            .map(|e| (e.id, e.int("itemID")))
+            .collect();
+        for (row, item) in items {
+            tx.delete("entity", row)?;
+            if let Some(item) = item {
+                tx.delete_where("entity_attributes", &["itemID"], &[store::Value::Int(item)])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A clone and its implants, gone.
-async fn remove(db: &impl GenericClient, clone: i64) -> Result<(), tokio_postgres::Error> {
-    db.execute(r#"WITH removed AS (DELETE FROM entity WHERE "locationID"=$1 RETURNING "itemID") DELETE FROM entity_attributes WHERE "itemID" IN (SELECT "itemID" FROM removed)"#, &[&(clone as i32)]).await?;
-    db.execute(
-        r#"DELETE FROM "chrJumpClones" WHERE "jumpCloneID" = $1"#,
-        &[&(clone as i32)],
-    )
-    .await?;
+fn remove(tx: &mut Tx<'_>, clone: i64) -> Result<(), StoreError> {
+    remove_items_at(tx, &[clone])?;
+    tx.delete_where("chrJumpClones", &["jumpCloneID"], &[store::Value::Int(clone)])?;
     Ok(())
 }
 
 /// Jump clones carried in a ship, gone with it.
-pub async fn ship_destroyed(
-    db: &impl GenericClient,
-    ship: i64,
-) -> Result<u64, tokio_postgres::Error> {
-    db.execute(r#"WITH removed AS (DELETE FROM entity WHERE "locationID" IN (SELECT "jumpCloneID" FROM "chrJumpClones" WHERE "locationID" = $1) RETURNING "itemID") DELETE FROM entity_attributes WHERE "itemID" IN (SELECT "itemID" FROM removed)"#, &[&(ship as i32)]).await?;
-    db.execute(
-        r#"DELETE FROM "chrJumpClones" WHERE "locationID" = $1"#,
-        &[&(ship as i32)],
-    )
-    .await
+pub fn ship_destroyed(tx: &mut Tx<'_>, ship: i64) -> Result<u64, StoreError> {
+    let clones: Vec<i64> = tx
+        .table("chrJumpClones")
+        .find(&["locationID"], &[store::Value::Int(ship)])
+        .filter_map(|j| j.int("jumpCloneID"))
+        .collect();
+    remove_items_at(tx, &clones)?;
+    Ok(tx.delete_where("chrJumpClones", &["locationID"], &[store::Value::Int(ship)])? as u64)
 }
 
 /// DestroyInstalledClone(cloneID): one's own clone where one is, or anyone's
 /// in the ship one flies.
 async fn destroy(ctx: &Ctx<'_>, me: i64, clone: i64) -> Refused<Value> {
-    let row = ctx
-        .db
-        .query_opt(
-            r#"SELECT "ownerID", "locationID" FROM "chrJumpClones" WHERE "jumpCloneID" = $1"#,
-            &[&(clone as i32)],
-        )
-        .await
-        .map_err(db_err)?;
-    let Some(row) = row else {
+    let row = ctx.store.read(|db| {
+        db.table("chrJumpClones").get_id(clone).map(|r| (r.int("ownerID").unwrap_or(0), r.int("locationID").unwrap_or(0)))
+    });
+    let Some((owner, location)) = row else {
         return refuse("That clone no longer exists.");
     };
-    let (owner, location) = (int(&row, 0).unwrap_or(0), int(&row, 1).unwrap_or(0));
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(db_err)?;
-    let tx = client.transaction().await.map_err(db_err)?;
-    super::login::lock_character_lifecycle(&tx, owner as i32)
-        .await
-        .map_err(db_err)?;
-    let in_my_ship = if ctx.session.ship_id == Some(location) {
-        tx.query_opt(r#"SELECT 1 FROM entity e JOIN "character_" c ON c."shipID"=e."itemID" WHERE e."itemID"=$1 AND e."ownerID"=$2 AND c."characterID"=$2 FOR UPDATE OF e"#,&[&(location as i32),&(me as i32)]).await.map_err(db_err)?.is_some()
-    } else {
-        false
-    };
-    if owner != me && !in_my_ship {
-        return refuse("You can only destroy your own clone, or clones in your current ship.");
-    }
-    if tx.query_opt(r#"SELECT 1 FROM "chrJumpClones" WHERE "jumpCloneID"=$1 AND "ownerID"=$2 AND "locationID"=$3 FOR UPDATE"#,&[&(clone as i32),&(owner as i32),&(location as i32)]).await.map_err(db_err)?.is_none() {return refuse("That clone no longer exists.");}
-    remove(&tx, clone).await.map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    let in_my_ship = ctx
+        .store
+        .write(|tx| -> Result<bool, Abort> {
+            let in_my_ship = ctx.session.ship_id == Some(location)
+                && tx.table("entity").get_id(location).is_some_and(|e| e.int("ownerID") == Some(me))
+                && tx.table("character_").get_id(me).is_some_and(|c| c.int("shipID") == Some(location));
+            if owner != me && !in_my_ship {
+                return abort("You can only destroy your own clone, or clones in your current ship.");
+            }
+            let still = tx
+                .table("chrJumpClones")
+                .get_id(clone)
+                .is_some_and(|j| j.int("ownerID") == Some(owner) && j.int("locationID") == Some(location));
+            if !still {
+                return abort("That clone no longer exists.");
+            }
+            remove(tx, clone)?;
+            Ok(in_my_ship)
+        })
+        .map_err(|Abort(o)| o)?;
     info!("{me} destroyed jump clone {clone} of {owner} at {location}");
     invalidated(ctx, owner, location, !in_my_ship);
     Ok(Value::None)
 }
+
+/// Where a clone jump lands: (station, system, constellation, region, at).
+type Landing = (Option<i64>, i64, i64, i64, crate::ballpark::Vec3);
 
 /// CloneJump(destLocationID, force).
 async fn jump(ctx: &Ctx<'_>, me: i64, dest: i64, force: bool) -> Refused<Value> {
@@ -349,156 +359,118 @@ async fn jump(ctx: &Ctx<'_>, me: i64, dest: i64, force: bool) -> Refused<Value> 
     if dest == here {
         return refuse("You are already at that clone.");
     }
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(db_err)?;
-    let tx = client.transaction().await.map_err(db_err)?;
-    let pilot = lock_pilot(&tx, ctx, me).await?;
     let now = crate::bulkdata::filetime_now();
-    let next = pilot.get::<_, i64>(3).saturating_add(COOLDOWN_FT);
-    if next > now {
-        return refuse(&format!("Your body has not recovered from your last clone jump: you can jump again in {:.1} hours.",(next-now) as f64/36_000_000_000.0));
-    }
-    let target = tx
-        .query_opt(
-            r#"SELECT "jumpCloneID" FROM "chrJumpClones" WHERE "ownerID"=$1 AND "locationID"=$2"#,
-            &[&(me as i32), &(dest as i32)],
-        )
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| Outcome::custom("You have no clone there."))?
-        .get::<_, i32>(0);
-    // Carrier loss locks the carrier before its stored clones. Use the same
-    // order here so its deletion cannot leave an arriving capsule orphaned.
-    let station_row=tx.query_opt(r#"SELECT "stationID","solarSystemID","constellationID","regionID" FROM "staStations" WHERE "stationID"=$1"#,&[&(dest as i32)]).await.map_err(db_err)?;
-    let (station, system, constellation, region, at) = if let Some(place) = station_row {
-        (
-            Some(place.get::<_, i32>(0) as i64),
-            place.get::<_, i32>(1) as i64,
-            place.get::<_, i32>(2) as i64,
-            place.get::<_, i32>(3) as i64,
-            crate::ballpark::Vec3::ZERO,
-        )
-    } else {
-        let place=tx.query_opt(r#"SELECT st."stationID",m."solarSystemID",m."constellationID",m."regionID",e.x,e.y,e.z
-            FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID" JOIN "invGroups" g ON g."groupID"=t."groupID"
-            LEFT JOIN "staStations" st ON st."stationID"=e."locationID"
-            JOIN "mapSolarSystems" m ON m."solarSystemID"=COALESCE(st."solarSystemID",e."locationID")
-            WHERE e."itemID"=$1 AND g."categoryID"=6 FOR UPDATE OF e"#,&[&(dest as i32)]).await.map_err(db_err)?.ok_or_else(||Outcome::custom("The ship carrying your clone is no longer available."))?;
-        if !has_module(&tx, dest, &CLONE_VAT_BAYS)
-            .await
-            .map_err(db_err)?
-        {
-            return refuse("The ship carrying your clone has no clone vat bay.");
-        }
-        if !force {
-            return Err(Outcome::UserError {
-                msg: "JumpCheckIntoShip".into(),
-                args: vec![],
-            });
-        }
-        let station = int(&place, 0).filter(|id| *id > 0);
-        let system = int(&place, 1).unwrap_or(0);
-        let at = if station.is_none() {
-            let mut world = ctx.world.lock();
-            let Some(park) = world.parks.get_mut(&system) else {
-                return refuse("The ship carrying your clone is not available in space.");
+    let ((station, system, constellation, region, _), capsule, live) = ctx
+        .store
+        .write(|tx| -> Result<(Landing, i64, Option<crate::ballpark::Ship>), Abort> {
+            let last = pilot_here(tx.db(), ctx, me)?;
+            let next = last.saturating_add(COOLDOWN_FT);
+            if next > now {
+                return abort(&format!("Your body has not recovered from your last clone jump: you can jump again in {:.1} hours.",(next-now) as f64/36_000_000_000.0));
+            }
+            let Some(target) = clone_of(tx.db(), me, dest) else {
+                return abort("You have no clone there.");
             };
-            park.advance(crate::destiny::tick_now());
-            let Some(carrier) = park
-                .ships
-                .get(&dest)
-                .filter(|ship| ship.is_pilot() && !ship.warping() && !ship.cloaked)
-            else {
-                return refuse("The ship carrying your clone cannot receive a clone jump now.");
-            };
-            carrier.pos + crate::ballpark::Vec3::new(carrier.stats.radius + 2_500.0, 0.0, 0.0)
-        } else {
-            crate::ballpark::Vec3::ZERO
-        };
-        (
-            station,
-            system,
-            int(&place, 2).unwrap_or(0),
-            int(&place, 3).unwrap_or(0),
-            at,
-        )
-    };
-    if tx.query_opt(r#"SELECT 1 FROM "chrJumpClones" WHERE "jumpCloneID"=$1 AND "ownerID"=$2 AND "locationID"=$3 FOR UPDATE"#,&[&target,&(me as i32),&(dest as i32)]).await.map_err(db_err)?.is_none() {
-        return refuse("That clone is no longer available.");
-    }
-    let existing=tx.query_opt(r#"SELECT j."jumpCloneID",(SELECT count(*) FROM entity e WHERE e."locationID"=j."jumpCloneID") FROM "chrJumpClones" j WHERE j."ownerID"=$1 AND j."locationID"=$2 FOR UPDATE OF j"#,&[&(me as i32),&(here as i32)]).await.map_err(db_err)?;
-    if let Some(old) = &existing {
-        if !force {
-            let msg = if old.get::<_, i64>(1) > 0 {
-                "JumpCheckWillLoseExistingCloneAndImplants"
+            let landing = landing(tx.db(), ctx, dest, force)?;
+            let (station, system, constellation, region, at) = landing;
+            let still = tx
+                .table("chrJumpClones")
+                .get_id(target)
+                .is_some_and(|j| j.int("ownerID") == Some(me) && j.int("locationID") == Some(dest));
+            if !still {
+                return abort("That clone is no longer available.");
+            }
+            if let Some(old) = clone_of(tx.db(), me, here) {
+                if !force {
+                    let implants = tx.table("entity").find(&["locationID"], &[store::Value::Int(old)]).count();
+                    let msg = if implants > 0 {
+                        "JumpCheckWillLoseExistingCloneAndImplants"
+                    } else {
+                        "JumpCheckWillLoseExistingClone"
+                    };
+                    return Err(Abort(Outcome::UserError {
+                        msg: msg.into(),
+                        args: vec![],
+                    }));
+                }
+                remove(tx, old)?;
+            }
+            let left = tx.insert(
+                "chrJumpClones",
+                &[("ownerID", store::Value::Int(me)), ("locationID", store::Value::Int(here)), ("createdAt", store::Value::Int(now))],
+            )?;
+            let left = tx.table("chrJumpClones").row(left).and_then(|r| r.int("jumpCloneID")).unwrap_or(0);
+            // The body left behind keeps its implants; the one woken in
+            // brings its own.
+            move_implants(tx, me, me, left)?;
+            move_implants(tx, me, target, me)?;
+            tx.delete_where("chrJumpClones", &["jumpCloneID"], &[store::Value::Int(target)])?;
+            let location = station.unwrap_or(system);
+            let flag = if station.is_some() { FLAG_HANGAR } else { 0 };
+            let capsule = tx.nextval("dyn_id_seq")?;
+            tx.insert(
+                "entity",
+                &[
+                    ("itemID", store::Value::Int(capsule)),
+                    ("itemName", store::Value::Text("".into())),
+                    ("typeID", store::Value::Int(TYPE_CAPSULE)),
+                    ("ownerID", store::Value::Int(me)),
+                    ("locationID", store::Value::Int(location)),
+                    ("flag", store::Value::Int(flag)),
+                    ("contraband", store::Value::Int(0)),
+                    ("singleton", store::Value::Int(1)),
+                    ("quantity", store::Value::Int(1)),
+                    ("x", store::Value::Float(at.x)),
+                    ("y", store::Value::Float(at.y)),
+                    ("z", store::Value::Float(at.z)),
+                ],
+            )?;
+            if let Some(pilot) = tx.table("character_").get_id(me).map(|r| r.id) {
+                tx.update(
+                    "character_",
+                    pilot,
+                    &[
+                        ("stationID", store::Value::Int(station.unwrap_or(0))),
+                        ("solarSystemID", store::Value::Int(system)),
+                        ("constellationID", store::Value::Int(constellation)),
+                        ("regionID", store::Value::Int(region)),
+                        ("shipID", store::Value::Int(capsule)),
+                        ("lastCloneJump", store::Value::Int(now)),
+                    ],
+                )?;
+            }
+            if let Some(body) = tx.table("entity").get_id(me).map(|r| r.id) {
+                tx.update("entity", body, &[("locationID", store::Value::Int(location))])?;
+            }
+            let live = if station.is_none() {
+                let profile = crate::svc::inflight::profile(
+                    tx.db(),
+                    ctx.dogma,
+                    me,
+                    capsule,
+                    &Default::default(),
+                    crate::combat::now_ms(),
+                )?
+                .ok_or_else(|| Outcome::custom("The destination capsule could not be prepared."))?;
+                let mut ship = crate::ballpark::Ship::new(
+                    capsule,
+                    ctx.client_id,
+                    profile.stats,
+                    profile.pilot,
+                    at,
+                    crate::ballpark::Vec3::ZERO,
+                );
+                ship.fight = Some(profile.fighter);
+                Some(ship)
             } else {
-                "JumpCheckWillLoseExistingClone"
+                None
             };
-            return Err(Outcome::UserError {
-                msg: msg.into(),
-                args: vec![],
-            });
-        }
-        remove(&tx, old.get::<_, i32>(0) as i64)
-            .await
-            .map_err(db_err)?;
-    }
-    let left=tx.query_one(r#"INSERT INTO "chrJumpClones" ("ownerID","locationID","createdAt") VALUES ($1,$2,$3) RETURNING "jumpCloneID""#,&[&(me as i32),&(here as i32),&now]).await.map_err(db_err)?.get::<_,i32>(0);
-    tx.execute(
-        r#"UPDATE entity SET "locationID"=$2 WHERE "locationID"=$1 AND "ownerID"=$1 AND flag=$3"#,
-        &[&(me as i32), &left, &FLAG_IMPLANT],
-    )
-    .await
-    .map_err(db_err)?;
-    tx.execute(
-        r#"UPDATE entity SET "locationID"=$1 WHERE "locationID"=$2 AND "ownerID"=$1 AND flag=$3"#,
-        &[&(me as i32), &target, &FLAG_IMPLANT],
-    )
-    .await
-    .map_err(db_err)?;
-    tx.execute(
-        r#"DELETE FROM "chrJumpClones" WHERE "jumpCloneID"=$1"#,
-        &[&target],
-    )
-    .await
-    .map_err(db_err)?;
-    let location = station.unwrap_or(system);
-    let flag = if station.is_some() { FLAG_HANGAR } else { 0 };
-    let capsule=tx.query_one(r#"INSERT INTO entity ("itemID","itemName","typeID","ownerID","locationID",flag,contraband,singleton,quantity,x,y,z)
-        VALUES (nextval('dyn_id_seq'),'',$1,$2,$3,$4,0,1,1,$5,$6,$7) RETURNING "itemID""#,&[&TYPE_CAPSULE,&(me as i32),&(location as i32),&flag,&at.x,&at.y,&at.z]).await.map_err(db_err)?.get::<_,i32>(0);
-    tx.execute(r#"UPDATE "character_" SET "stationID"=$2,"solarSystemID"=$3,"constellationID"=$4,"regionID"=$5,"shipID"=$6,"lastCloneJump"=$7 WHERE "characterID"=$1"#,&[&(me as i32),&(station.unwrap_or(0) as i32),&(system as i32),&(constellation as i32),&(region as i32),&capsule,&now]).await.map_err(db_err)?;
-    tx.execute(
-        r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-        &[&(me as i32), &(location as i32)],
-    )
-    .await
-    .map_err(db_err)?;
-    let live = if station.is_none() {
+            Ok((landing, capsule, live))
+        })
+        .map_err(|Abort(o)| o)?;
+    if live.is_some() {
         crate::svc::space::ensure_park(ctx, system).await;
-        let profile = crate::svc::inflight::profile(
-            &tx,
-            ctx.dogma,
-            me,
-            capsule as i64,
-            &Default::default(),
-            crate::combat::now_ms(),
-        )
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| Outcome::custom("The destination capsule could not be prepared."))?;
-        let mut ship = crate::ballpark::Ship::new(
-            capsule as i64,
-            ctx.client_id,
-            profile.stats,
-            profile.pilot,
-            at,
-            crate::ballpark::Vec3::ZERO,
-        );
-        ship.fight = Some(profile.fighter);
-        Some(ship)
-    } else {
-        None
-    };
-    tx.commit().await.map_err(db_err)?;
+    }
     {
         let mut world = ctx.world.lock();
         if let Some(ship) = live {
@@ -511,7 +483,7 @@ async fn jump(ctx: &Ctx<'_>, me: i64, dest: i64, force: bool) -> Refused<Value> 
                 solar_system_id: system,
                 constellation_id: constellation,
                 region_id: region,
-                ship_id: capsule as i64,
+                ship_id: capsule,
             },
         );
     }
@@ -520,19 +492,79 @@ async fn jump(ctx: &Ctx<'_>, me: i64, dest: i64, force: bool) -> Refused<Value> 
     Ok(Value::None)
 }
 
+/// Where a jump to the clone at `dest` lands: the station, or the ship
+/// carrying it (which needs a clone vat bay, and in space must be able to
+/// receive the jump now: the capsule wakes beside it).
+fn landing(db: &Db, ctx: &Ctx<'_>, dest: i64, force: bool) -> Result<Landing, Abort> {
+    if let Some(place) = db.table("staStations").get_id(dest) {
+        return Ok((
+            place.int("stationID"),
+            place.int("solarSystemID").unwrap_or(0),
+            place.int("constellationID").unwrap_or(0),
+            place.int("regionID").unwrap_or(0),
+            crate::ballpark::Vec3::ZERO,
+        ));
+    }
+    let ships = crate::sde::get().types_in_category(6);
+    let place = db.table("entity").get_id(dest).filter(|e| e.int("typeID").is_some_and(|t| ships.contains(&(t as i32)))).and_then(|e| {
+        let location = e.int("locationID");
+        let st = location.and_then(|l| db.table("staStations").get_id(l));
+        let m = st.and_then(|st| st.int("solarSystemID")).or(location).and_then(|s| db.table("mapSolarSystems").get_id(s))?;
+        Some((st.and_then(|st| st.int("stationID")), m.int("solarSystemID"), m.int("constellationID"), m.int("regionID")))
+    });
+    let Some((station, system, constellation, region)) = place else {
+        return abort("The ship carrying your clone is no longer available.");
+    };
+    if !has_module(db, dest, &CLONE_VAT_BAYS)? {
+        return abort("The ship carrying your clone has no clone vat bay.");
+    }
+    if !force {
+        return Err(Abort(Outcome::UserError {
+            msg: "JumpCheckIntoShip".into(),
+            args: vec![],
+        }));
+    }
+    let station = station.filter(|id| *id > 0);
+    let system = system.unwrap_or(0);
+    let at = if station.is_none() {
+        let mut world = ctx.world.lock();
+        let Some(park) = world.parks.get_mut(&system) else {
+            return abort("The ship carrying your clone is not available in space.");
+        };
+        park.advance(crate::destiny::tick_now());
+        let Some(carrier) = park
+            .ships
+            .get(&dest)
+            .filter(|ship| ship.is_pilot() && !ship.warping() && !ship.cloaked)
+        else {
+            return abort("The ship carrying your clone cannot receive a clone jump now.");
+        };
+        carrier.pos + crate::ballpark::Vec3::new(carrier.stats.radius + 2_500.0, 0.0, 0.0)
+    } else {
+        crate::ballpark::Vec3::ZERO
+    };
+    Ok((station, system, constellation.unwrap_or(0), region.unwrap_or(0), at))
+}
+
+/// Moves `owner`'s implants at `from` to `to`.
+fn move_implants(tx: &mut Tx<'_>, owner: i64, from: i64, to: i64) -> Result<(), StoreError> {
+    let rows: Vec<store::RowId> = tx
+        .table("entity")
+        .find(&["locationID", "flag", "ownerID"], &[store::Value::Int(from), store::Value::Int(FLAG_IMPLANT), store::Value::Int(owner)])
+        .map(|e| e.id)
+        .collect();
+    for row in rows {
+        tx.update("entity", row, &[("locationID", store::Value::Int(to))])?;
+    }
+    Ok(())
+}
+
 /// Whether a ship has one of `types` fitted.
-pub async fn has_module(
-    db: &impl GenericClient,
-    ship: i64,
-    types: &[i32],
-) -> Result<bool, tokio_postgres::Error> {
-    let row = db
-        .query_opt(
-            r#"SELECT 1 FROM entity WHERE "locationID" = $1 AND "typeID" = ANY($2) AND "flag" BETWEEN $3 AND $4 LIMIT 1"#,
-            &[&(ship as i32), &types, &SLOT_FLAGS.0, &SLOT_FLAGS.1],
-        )
-        .await?;
-    Ok(row.is_some())
+pub fn has_module(db: &Db, ship: i64, types: &[i32]) -> Result<bool, StoreError> {
+    Ok(db.table("entity").find(&["locationID"], &[store::Value::Int(ship)]).any(|e| {
+        e.int("typeID").is_some_and(|t| types.contains(&(t as i32)))
+            && e.int("flag").is_some_and(|f| (SLOT_FLAGS.0..=SLOT_FLAGS.1).contains(&f))
+    }))
 }
 
 fn offer_args(offerer: i64, target: i64, ship: i64) -> Value {
@@ -550,10 +582,7 @@ async fn offer(ctx: &Ctx<'_>, me: i64, target: i64) -> Refused<Value> {
     let Some(ship) = ctx.session.ship_id else {
         return refuse("You are not in a ship.");
     };
-    if !has_module(ctx.db, ship, &CLONE_VAT_BAYS)
-        .await
-        .map_err(db_err)?
-    {
+    if !ctx.store.read(|db| has_module(db, ship, &CLONE_VAT_BAYS)).map_err(db_err)? {
         return refuse("Your ship has no clone vat bay.");
     }
     let mut w = ctx.world.lock();
@@ -579,38 +608,49 @@ async fn accept(ctx: &Ctx<'_>, me: i64) -> Refused<Value> {
     let Some((offerer, ship)) = ctx.world.lock().clone_offers.remove(&me) else {
         return refuse("Nobody is offering you a clone.");
     };
-    let done = async {
-        let mut client=crate::db::connect(ctx.db_url).await.map_err(db_err)?;
-        let tx=client.transaction().await.map_err(db_err)?;
-        lock_pilot(&tx,ctx,me).await?;
-        let carrier=tx.query_opt(r#"SELECT e."locationID",COALESCE(st."solarSystemID",e."locationID") FROM entity e LEFT JOIN "staStations" st ON st."stationID"=e."locationID" JOIN "character_" c ON c."shipID"=e."itemID" AND c."characterID"=e."ownerID" WHERE e."itemID"=$1 AND e."ownerID"=$2 FOR UPDATE OF e"#,&[&(ship as i32),&(offerer as i32)]).await.map_err(db_err)?;
-        let Some(carrier)=carrier else {return refuse("The offering pilot no longer controls that ship.");};
-        if Some(carrier.get::<_,i32>(1) as i64)!=ctx.session.solar_system_id2.or(ctx.session.solar_system_id) || !has_module(&tx,ship,&CLONE_VAT_BAYS).await.map_err(db_err)? {
-            return refuse("The offered clone bay is no longer available in this system.");
+    let done = ctx.store.write(|tx| -> Result<(), Abort> {
+        pilot_here(tx.db(), ctx, me)?;
+        // The ship, still the offering pilot's own and still flown by them.
+        let carrier = tx
+            .table("entity")
+            .get_id(ship)
+            .filter(|e| e.int("ownerID") == Some(offerer))
+            .filter(|_| tx.table("character_").get_id(offerer).is_some_and(|c| c.int("shipID") == Some(ship)))
+            .map(|e| {
+                let location = e.int("locationID");
+                location.and_then(|l| tx.table("staStations").get_id(l)).and_then(|st| st.int("solarSystemID")).or(location)
+            });
+        let Some(system) = carrier else { return abort("The offering pilot no longer controls that ship."); };
+        if system.is_none() || system != ctx.session.solar_system_id2.or(ctx.session.solar_system_id) || !has_module(tx.db(), ship, &CLONE_VAT_BAYS)? {
+            return abort("The offered clone bay is no longer available in this system.");
         }
         let online=ctx.world.lock().presence_of(offerer).is_some_and(|p|Some(p.solar_system_id)==ctx.session.solar_system_id2.or(ctx.session.solar_system_id));
-        if !online {return refuse("The offering pilot is no longer available.");}
-        let (have, may) = (count(&tx, me).await.map_err(db_err)?, allowed(&tx, me).await.map_err(db_err)?);
+        if !online {return abort("The offering pilot is no longer available.");}
+        let (have, may) = (count(tx.db(), me), allowed(tx.db(), me)?);
         if have >= may {
-            return refuse(&format!("You have {have} jump clone(s), as many as your Infomorph Psychology allows."));
+            return abort(&format!("You have {have} jump clone(s), as many as your Infomorph Psychology allows."));
         }
-        let already = tx
-            .query_opt(r#"SELECT 1 FROM "chrJumpClones" WHERE "ownerID" = $1 AND "locationID" = $2"#, &[&(me as i32), &(ship as i32)])
-            .await
-            .map_err(db_err)?;
-        if already.is_some() {
-            return refuse("You already have a clone in that ship.");
+        if clone_of(tx.db(), me, ship).is_some() {
+            return abort("You already have a clone in that ship.");
         }
-        pay(&tx, me, PRICE).await?;
-        tx
-            .execute(r#"INSERT INTO "chrJumpClones" ("ownerID","locationID","createdAt") VALUES ($1, $2, $3)"#, &[&(me as i32), &(ship as i32), &crate::bulkdata::filetime_now()])
-            .await
-            .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        super::wallet::notify_balance(ctx,me).await;
+        pay(tx, me, PRICE)?;
+        tx.insert(
+            "chrJumpClones",
+            &[
+                ("ownerID", store::Value::Int(me)),
+                ("locationID", store::Value::Int(ship)),
+                ("createdAt", store::Value::Int(crate::bulkdata::filetime_now())),
+            ],
+        )?;
         Ok(())
-    }
-    .await;
+    });
+    let done = match done {
+        Ok(()) => {
+            super::wallet::notify_balance(ctx, me).await;
+            Ok(())
+        }
+        Err(Abort(why)) => Err(why),
+    };
     let w = ctx.world.lock();
     let both: Vec<i64> = w
         .clients_of(me)
@@ -672,43 +712,73 @@ fn cancel(ctx: &Ctx<'_>, me: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Value as V;
     use crate::{session::Session, test_support::Database};
 
-    async fn stations(db: &Database) -> Vec<(i32, i32, i32)> {
-        db.db.query(r#"SELECT s."stationID",s."solarSystemID",s."corporationID" FROM "staStations" s WHERE EXISTS (SELECT 1 FROM "staOperationServices" os WHERE os."operationID"=s."operationID" AND os."serviceID" IN (512,8388608)) ORDER BY s."stationID" LIMIT 2"#,&[]).await.unwrap().iter().map(|r|(r.get(0),r.get(1),r.get(2))).collect()
+    fn stations(db: &Database) -> Vec<(i64, i64, i64)> {
+        let cloning: Vec<i64> = crate::sde::table("staOperationServices").rows()
+            .filter(|os| matches!(os.int("serviceID"), Some(512 | 8388608)))
+            .filter_map(|os| os.int("operationID")).collect();
+        db.store.read(|d| {
+            let mut found: Vec<(i64, i64, i64)> = d.table("staStations").rows()
+                .filter(|s| s.int("operationID").is_some_and(|o| cloning.contains(&o)))
+                .map(|s| (s.int("stationID").unwrap(), s.int("solarSystemID").unwrap(), s.int("corporationID").unwrap()))
+                .collect();
+            found.sort();
+            found.truncate(2);
+            found
+        })
     }
-    async fn pilot(db: &Database, place: (i32, i32, i32)) -> Session {
-        let me = db.id().await;
-        let ship = db.id().await;
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","accountID","characterName",balance,"stationID","solarSystemID","corporationID","shipID") VALUES ($1,$1,$2,10000000,$3,$4,$5,$6)"#,&[&me,&format!("Clone fixture {me}"),&place.0,&place.1,&place.2,&ship]).await.unwrap();
-        db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,587,$2,$3,4,1,1),($2,1377,$2,$3,0,1,1)"#,&[&ship,&me,&place.0]).await.unwrap();
-        let skill=db.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",flag,quantity,singleton) VALUES (24242,$1,$1,7,1,1) RETURNING "itemID""#,&[&me]).await.unwrap().get::<_,i32>(0);
-        db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,280,5)"#,&[&skill]).await.unwrap();
+    async fn pilot(db: &Database, place: (i64, i64, i64)) -> Session {
+        let me = i64::from(db.id().await);
+        let ship = i64::from(db.id().await);
+        db.store.write(|tx| -> Result<(), StoreError> {
+            tx.insert("character_", &[("characterID", V::Int(me)), ("accountID", V::Int(me)), ("characterName", V::Text(format!("Clone fixture {me}").into())),
+                ("balance", V::Float(10_000_000.0)), ("stationID", V::Int(place.0)), ("solarSystemID", V::Int(place.1)), ("corporationID", V::Int(place.2)), ("shipID", V::Int(ship))])?;
+            for (item, ty, flag) in [(ship, 587, 4), (me, 1377, 0)] {
+                tx.insert("entity", &[("itemID", V::Int(item)), ("typeID", V::Int(ty)), ("ownerID", V::Int(me)), ("locationID", V::Int(place.0)),
+                    ("flag", V::Int(flag)), ("quantity", V::Int(1)), ("singleton", V::Int(1))])?;
+            }
+            let skill = tx.insert("entity", &[("typeID", V::Int(24242)), ("ownerID", V::Int(me)), ("locationID", V::Int(me)), ("flag", V::Int(7)),
+                ("quantity", V::Int(1)), ("singleton", V::Int(1))])?;
+            let skill = tx.table("entity").row(skill).unwrap().int("itemID").unwrap();
+            tx.insert("entity_attributes", &[("itemID", V::Int(skill)), ("attributeID", V::Int(280)), ("valueInt", V::Int(5))])?;
+            Ok(())
+        }).unwrap();
         Session {
-            char_id: Some(me as i64),
-            ship_id: Some(ship as i64),
-            user_id: Some(me as i64),
-            station_id: Some(place.0 as i64),
-            solar_system_id2: Some(place.1 as i64),
-            corp_id: Some(place.2 as i64),
+            char_id: Some(me),
+            ship_id: Some(ship),
+            user_id: Some(me),
+            station_id: Some(place.0),
+            solar_system_id2: Some(place.1),
+            corp_id: Some(place.2),
             ..Default::default()
         }
     }
-    async fn clone_at(db: &Database, me: i64, location: i64) -> i32 {
-        db.db.query_one(r#"INSERT INTO "chrJumpClones" ("ownerID","locationID") VALUES ($1,$2) RETURNING "jumpCloneID""#,&[&(me as i32),&(location as i32)]).await.unwrap().get(0)
+    fn clone_at(db: &Database, me: i64, location: i64) -> i64 {
+        db.store.write(|tx| {
+            let row = tx.insert("chrJumpClones", &[("ownerID", V::Int(me)), ("locationID", V::Int(location))])?;
+            Ok::<_, StoreError>(tx.table("chrJumpClones").row(row).unwrap().int("jumpCloneID").unwrap())
+        }).unwrap()
     }
-    async fn implant(db: &Database, me: i64, location: i64) -> i32 {
-        db.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",flag,quantity,singleton) VALUES (9941,$1,$2,89,1,1) RETURNING "itemID""#,&[&(me as i32),&(location as i32)]).await.unwrap().get(0)
+    fn implant(db: &Database, me: i64, location: i64) -> i64 {
+        db.store.write(|tx| {
+            let row = tx.insert("entity", &[("typeID", V::Int(9941)), ("ownerID", V::Int(me)), ("locationID", V::Int(location)), ("flag", V::Int(89)),
+                ("quantity", V::Int(1)), ("singleton", V::Int(1))])?;
+            Ok::<_, StoreError>(tx.table("entity").row(row).unwrap().int("itemID").unwrap())
+        }).unwrap()
     }
-    async fn balance(db: &Database, me: i64) -> f64 {
-        db.db
-            .query_one(
-                r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,
-                &[&(me as i32)],
-            )
-            .await
-            .unwrap()
-            .get(0)
+    fn balance(db: &Database, me: i64) -> f64 {
+        db.store.read(|d| d.table("character_").get_id(me).unwrap().float("balance").unwrap())
+    }
+    fn update(db: &Database, table: &str, key: i64, sets: &[(&str, V)]) {
+        db.store.write(|tx| {
+            let row = tx.table(table).get_id(key).unwrap().id;
+            tx.update(table, row, sets)
+        }).unwrap();
+    }
+    fn exists(db: &Database, table: &str, key: i64) -> bool {
+        db.store.read(|d| d.table(table).get_id(key).is_some())
     }
     fn field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         match value {
@@ -722,16 +792,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn clone_installation_and_remote_destruction_are_atomic() {
         let db = Database::load().await;
-        let places = stations(&db).await;
+        let places = stations(&db);
         let mut session = pilot(&db, places[0]).await;
         let me = session.char_id.unwrap();
         let ctx = db.ctx(&session);
         let (one, two) = tokio::join!(install(&ctx, me), install(&ctx, me));
         assert_eq!([one, two].iter().filter(|r| r.is_ok()).count(), 1);
-        assert_eq!(balance(&db, me).await, 10_000_000.0 - PRICE);
+        assert_eq!(balance(&db, me), 10_000_000.0 - PRICE);
         let state = clone_state(&ctx, me).await.ok().unwrap();
         assert!(field(&state, "clones").is_some());
         assert!(field(&state, "implants").is_some());
@@ -739,179 +808,119 @@ mod tests {
             field(&state, "timeLastJump").and_then(Value::as_i64),
             Some(0)
         );
-        let old = db
-            .db
-            .query_one(
-                r#"SELECT "jumpCloneID" FROM "chrJumpClones" WHERE "ownerID"=$1"#,
-                &[&(me as i32)],
-            )
-            .await
-            .unwrap()
-            .get::<_, i32>(0);
-        let old_implant = implant(&db, me, old as i64).await;
-        db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,280,1)"#,&[&old_implant]).await.unwrap();
-        session.station_id = Some(places[1].0 as i64);
-        session.solar_system_id2 = Some(places[1].1 as i64);
-        session.corp_id = Some(places[1].2 as i64);
-        db.db.execute(r#"UPDATE "character_" SET "stationID"=$2,"solarSystemID"=$3,"corporationID"=$4 WHERE "characterID"=$1"#,&[&(me as i32),&places[1].0,&places[1].1,&places[1].2]).await.unwrap();
-        db.db
-            .execute(
-                r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-                &[&(session.ship_id.unwrap() as i32), &places[1].0],
-            )
-            .await
-            .unwrap();
-        let constraint = format!("clone_failure_fixture_{me}");
-        db.db.batch_execute(&format!(r#"ALTER TABLE "chrJumpClones" ADD CONSTRAINT {constraint} CHECK (NOT ("ownerID"={me} AND "locationID"={}))"#,places[1].0)).await.unwrap();
+        let old = db.store.read(|d| d.table("chrJumpClones").find(&["ownerID"], &[V::Int(me)]).next().unwrap().int("jumpCloneID").unwrap());
+        let old_implant = implant(&db, me, old);
+        db.store.write(|tx| tx.insert("entity_attributes", &[("itemID", V::Int(old_implant)), ("attributeID", V::Int(280)), ("valueInt", V::Int(1))])).unwrap();
+        session.station_id = Some(places[1].0);
+        session.solar_system_id2 = Some(places[1].1);
+        session.corp_id = Some(places[1].2);
+        update(&db, "character_", me, &[("stationID", V::Int(places[1].0)), ("solarSystemID", V::Int(places[1].1)), ("corporationID", V::Int(places[1].2))]);
+        update(&db, "entity", session.ship_id.unwrap(), &[("locationID", V::Int(places[1].0))]);
+        // A refused installation charges nothing: Infomorph Psychology I
+        // allows the one clone already installed.
+        let skill = db.store.read(|d| d.table("entity").find(&["ownerID", "typeID"], &[V::Int(me), V::Int(24242)]).next().unwrap().int("itemID").unwrap());
+        db.store.write(|tx| {
+            let row = tx.table("entity_attributes").get(&[V::Int(skill), V::Int(280)]).unwrap().id;
+            tx.update("entity_attributes", row, &[("valueInt", V::Int(1))])
+        }).unwrap();
         let failed = install(&db.ctx(&session), me).await;
-        db.db
-            .batch_execute(&format!(
-                r#"ALTER TABLE "chrJumpClones" DROP CONSTRAINT {constraint}"#
-            ))
-            .await
-            .unwrap();
         assert!(failed.is_err());
-        assert_eq!(balance(&db, me).await, 10_000_000.0 - PRICE);
+        assert_eq!(balance(&db, me), 10_000_000.0 - PRICE);
         assert!(
-            destroy(&db.ctx(&session), me, old as i64).await.is_ok(),
+            destroy(&db.ctx(&session), me, old).await.is_ok(),
             "the client permits destroying your own remote clone"
         );
-        assert!(db
-            .db
-            .query_opt(
-                r#"SELECT 1 FROM entity_attributes WHERE "itemID"=$1"#,
-                &[&old_implant]
-            )
-            .await
-            .unwrap()
-            .is_none());
-        assert!(db
-            .db
-            .query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#, &[&old_implant])
-            .await
-            .unwrap()
-            .is_none());
+        assert!(db.store.read(|d| d.table("entity_attributes").find(&["itemID"], &[V::Int(old_implant)]).next().is_none()));
+        assert!(!exists(&db, "entity", old_implant));
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn clone_jump_swaps_implants_once_and_rolls_back_failed_capsules() {
         let db = Database::load().await;
-        let places = stations(&db).await;
+        let places = stations(&db);
         let session = pilot(&db, places[0]).await;
         let me = session.char_id.unwrap();
         let ctx = db.ctx(&session);
-        let existing = clone_at(&db, me, places[0].0 as i64).await;
-        let target = clone_at(&db, me, places[1].0 as i64).await;
-        let active = implant(&db, me, me).await;
-        let arriving = implant(&db, me, target as i64).await;
-        let replaced = implant(&db, me, existing as i64).await;
+        let existing = clone_at(&db, me, places[0].0);
+        let target = clone_at(&db, me, places[1].0);
+        let active = implant(&db, me, me);
+        let arriving = implant(&db, me, target);
+        let replaced = implant(&db, me, existing);
         assert!(
-            matches!(jump(&ctx,me,places[1].0 as i64,false).await,Err(Outcome::UserError {msg,..}) if msg=="JumpCheckWillLoseExistingCloneAndImplants")
+            matches!(jump(&ctx,me,places[1].0,false).await,Err(Outcome::UserError {msg,..}) if msg=="JumpCheckWillLoseExistingCloneAndImplants")
         );
-        let constraint = format!("capsule_failure_fixture_{me}");
-        db.db.batch_execute(&format!(r#"ALTER TABLE entity ADD CONSTRAINT {constraint} CHECK (NOT ("ownerID"={me} AND "typeID"=670))"#)).await.unwrap();
-        let failed = jump(&ctx, me, places[1].0 as i64, true).await;
-        db.db
-            .batch_execute(&format!("ALTER TABLE entity DROP CONSTRAINT {constraint}"))
-            .await
-            .unwrap();
+        // The next item IDs are taken, so the capsule cannot be made.
+        let blockers = db.store.write(|tx| -> Result<Vec<i64>, StoreError> {
+            let next = tx.db().sequence("dyn_id_seq").unwrap_or(0);
+            for id in [next + 1, next + 2] {
+                tx.insert("entity", &[("itemID", V::Int(id)), ("typeID", V::Int(34)), ("ownerID", V::Int(1)), ("locationID", V::Int(1)), ("quantity", V::Int(1))])?;
+            }
+            Ok(vec![next + 1, next + 2])
+        }).unwrap();
+        let failed = jump(&ctx, me, places[1].0, true).await;
+        db.store.write(|tx| -> Result<(), StoreError> {
+            for id in &blockers {
+                tx.delete_where("entity", &["itemID"], &[V::Int(*id)])?;
+            }
+            Ok(())
+        }).unwrap();
         assert!(failed.is_err());
-        let untouched: i32 = db
-            .db
-            .query_one(
-                r#"SELECT "locationID" FROM entity WHERE "itemID"=$1"#,
-                &[&active],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(untouched, me as i32);
-        assert!(db
-            .db
-            .query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#, &[&replaced])
-            .await
-            .unwrap()
-            .is_some());
-        assert!(db
-            .db
-            .query_opt(
-                r#"SELECT 1 FROM "chrJumpClones" WHERE "jumpCloneID"=$1"#,
-                &[&target]
-            )
-            .await
-            .unwrap()
-            .is_some());
+        let untouched = db.store.read(|d| d.table("entity").get_id(active).unwrap().int("locationID"));
+        assert_eq!(untouched, Some(me));
+        assert!(exists(&db, "entity", replaced));
+        assert!(exists(&db, "chrJumpClones", target));
         let (one, two) = tokio::join!(
-            jump(&ctx, me, places[1].0 as i64, true),
-            jump(&ctx, me, places[1].0 as i64, true)
+            jump(&ctx, me, places[1].0, true),
+            jump(&ctx, me, places[1].0, true)
         );
         assert_eq!([one, two].iter().filter(|r| r.is_ok()).count(), 1);
-        let saved=db.db.query_one(r#"SELECT "stationID","shipID","lastCloneJump" FROM "character_" WHERE "characterID"=$1"#,&[&(me as i32)]).await.unwrap();
-        assert_eq!(saved.get::<_, i32>(0), places[1].0);
-        assert!(saved.get::<_, i64>(2) > 0);
-        let left=db.db.query_one(r#"SELECT "jumpCloneID" FROM "chrJumpClones" WHERE "ownerID"=$1 AND "locationID"=$2"#,&[&(me as i32),&places[0].0]).await.unwrap().get::<_,i32>(0);
-        let locations=db.db.query(r#"SELECT "itemID","locationID" FROM entity WHERE "itemID"=ANY($1) ORDER BY "itemID""#,&[&vec![active,arriving,replaced]]).await.unwrap();
+        let (station, ship, last) = db.store.read(|d| {
+            let c = d.table("character_").get_id(me).unwrap();
+            (c.int("stationID").unwrap(), c.int("shipID").unwrap(), c.int("lastCloneJump").unwrap())
+        });
+        assert_eq!(station, places[1].0);
+        assert!(last > 0);
+        let left = clone_of_test(&db, me, places[0].0);
+        let locations: Vec<(i64, i64)> = db.store.read(|d| {
+            [active, arriving, replaced].iter().filter_map(|id| d.table("entity").get_id(*id)).map(|e| (e.int("itemID").unwrap(), e.int("locationID").unwrap())).collect()
+        });
         assert_eq!(locations.len(), 2);
-        for row in locations {
-            assert_eq!(
-                row.get::<_, i32>(1),
-                if row.get::<_, i32>(0) == active {
-                    left
-                } else {
-                    me as i32
-                }
-            );
+        for (item, location) in locations {
+            assert_eq!(location, if item == active { left } else { me });
         }
-        let capsules: i64 = db
-            .db
-            .query_one(
-                r#"SELECT count(*) FROM entity WHERE "ownerID"=$1 AND "typeID"=670"#,
-                &[&(me as i32)],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let capsules = db.store.read(|d| d.table("entity").find(&["ownerID", "typeID"], &[V::Int(me), V::Int(670)]).count());
         assert_eq!(capsules, 1);
         let mut moved = session.clone();
-        moved.station_id = Some(places[1].0 as i64);
-        moved.solar_system_id2 = Some(places[1].1 as i64);
-        moved.ship_id = Some(saved.get::<_, i32>(1) as i64);
+        moved.station_id = Some(places[1].0);
+        moved.solar_system_id2 = Some(places[1].1);
+        moved.ship_id = Some(ship);
         assert!(
-            jump(&db.ctx(&moved), me, places[0].0 as i64, true)
+            jump(&db.ctx(&moved), me, places[0].0, true)
                 .await
                 .is_err(),
             "cooldown survives a new session"
         );
     }
 
+    fn clone_of_test(db: &Database, me: i64, location: i64) -> i64 {
+        db.store.read(|d| clone_of(d, me, location)).unwrap()
+    }
+
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn ship_clone_offer_is_revalidated_and_arrival_matches_live_carrier_position() {
         let db = Database::load().await;
-        let place = stations(&db).await[0];
+        let place = stations(&db)[0];
         let borrower = pilot(&db, place).await;
         let mut host = pilot(&db, place).await;
         let me = borrower.char_id.unwrap();
         let captain = host.char_id.unwrap();
         let carrier = host.ship_id.unwrap();
         host.station_id = None;
-        host.solar_system_id = Some(place.1 as i64);
-        db.db
-            .execute(
-                r#"UPDATE "character_" SET "stationID"=0 WHERE "characterID"=$1"#,
-                &[&(captain as i32)],
-            )
-            .await
-            .unwrap();
-        db.db
-            .execute(
-                r#"UPDATE entity SET "typeID"=11567,"locationID"=$2,flag=0 WHERE "itemID"=$1"#,
-                &[&(carrier as i32), &place.1],
-            )
-            .await
-            .unwrap();
-        db.db.execute(r#"INSERT INTO entity ("typeID","ownerID","locationID",flag,quantity,singleton) VALUES (23735,$1,$2,27,1,1)"#,&[&(captain as i32),&(carrier as i32)]).await.unwrap();
+        host.solar_system_id = Some(place.1);
+        update(&db, "character_", captain, &[("stationID", V::Int(0))]);
+        update(&db, "entity", carrier, &[("typeID", V::Int(11567)), ("locationID", V::Int(place.1)), ("flag", V::Int(0))]);
+        db.store.write(|tx| tx.insert("entity", &[("typeID", V::Int(23735)), ("ownerID", V::Int(captain)), ("locationID", V::Int(carrier)), ("flag", V::Int(27)),
+            ("quantity", V::Int(1)), ("singleton", V::Int(1))])).unwrap();
         let at = crate::ballpark::Vec3::new(1_000_000.0, 2_000_000.0, 3_000_000.0);
         let mut carrier_ship =
             crate::svc::inflight::ship_for_space(&db.ctx(&host), captain, carrier)
@@ -929,55 +938,44 @@ mod tests {
                     client,
                     Some(crate::world::Presence {
                         char_id: pilot,
-                        corp_id: place.2 as i64,
-                        solar_system_id: place.1 as i64,
+                        corp_id: place.2,
+                        solar_system_id: place.1,
                         docked,
-                        station_id: if docked { Some(place.0 as i64) } else { None },
+                        station_id: if docked { Some(place.0) } else { None },
                         role: 2,
                     }),
                 );
             }
             let mut park =
-                crate::ballpark::Park::new(place.1 as i64, vec![], crate::destiny::tick_now());
+                crate::ballpark::Park::new(place.1, vec![], crate::destiny::tick_now());
             park.ships.insert(carrier, carrier_ship);
-            world.parks.insert(place.1 as i64, park);
+            world.parks.insert(place.1, park);
             (a, b)
         };
         let mut host_ctx = db.ctx(&host);
         host_ctx.client_id = 2;
         assert!(offer(&host_ctx, captain, me).await.is_ok());
-        db.db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=0 WHERE "itemID"=$1"#,
-                &[&(carrier as i32)],
-            )
-            .await
-            .unwrap();
+        update(&db, "entity", carrier, &[("ownerID", V::Int(0))]);
         assert!(accept(&db.ctx(&borrower), me).await.is_err());
-        assert_eq!(balance(&db, me).await, 10_000_000.0);
-        db.db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,
-                &[&(carrier as i32), &(captain as i32)],
-            )
-            .await
-            .unwrap();
+        assert_eq!(balance(&db, me), 10_000_000.0);
+        update(&db, "entity", carrier, &[("ownerID", V::Int(captain))]);
         assert!(offer(&host_ctx, captain, me).await.is_ok());
         assert!(accept(&db.ctx(&borrower), me).await.is_ok());
-        assert_eq!(balance(&db, me).await, 10_000_000.0 - PRICE);
+        assert_eq!(balance(&db, me), 10_000_000.0 - PRICE);
         assert!(
             matches!(jump(&db.ctx(&borrower),me,carrier,false).await,Err(Outcome::UserError {msg,..}) if msg=="JumpCheckIntoShip")
         );
         assert!(jump(&db.ctx(&borrower), me, carrier, true).await.is_ok());
-        let saved=db.db.query_one(r#"SELECT c."stationID",c."shipID",e.x,e.y,e.z FROM "character_" c JOIN entity e ON e."itemID"=c."shipID" WHERE c."characterID"=$1"#,&[&(me as i32)]).await.unwrap();
-        assert_eq!(saved.get::<_, i32>(0), 0);
-        let capsule = saved.get::<_, i32>(1) as i64;
+        let (station, capsule, pos) = db.store.read(|d| {
+            let c = d.table("character_").get_id(me).unwrap();
+            let capsule = c.int("shipID").unwrap();
+            let e = d.table("entity").get_id(capsule).unwrap();
+            (c.int("stationID").unwrap(), capsule, crate::ballpark::Vec3::new(e.float("x").unwrap(), e.float("y").unwrap(), e.float("z").unwrap()))
+        });
+        assert_eq!(station, 0);
+        assert_eq!(pos, arrival);
         assert_eq!(
-            crate::ballpark::Vec3::new(saved.get(2), saved.get(3), saved.get(4)),
-            arrival
-        );
-        assert_eq!(
-            db.world.lock().parks[&(place.1 as i64)].ships[&capsule].pos,
+            db.world.lock().parks[&place.1].ships[&capsule].pos,
             arrival
         );
         assert_ne!(capsule, borrower.ship_id.unwrap());

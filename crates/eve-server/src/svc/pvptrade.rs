@@ -14,16 +14,17 @@
 //! hangars when the server starts ([`recover`]).
 
 use eve_marshal::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
-use tokio_postgres::Client;
 use tracing::{error, info};
 
 use crate::items::{self, ItemTxn, NewItem};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Store, StoreError};
 use crate::svc::bound;
 use crate::svc::inventory::{self, Container, FLAG_HANGAR};
 use crate::svc::membership::{db_failed, message, Refused};
-use crate::svc::rows::{int, key_val};
+use crate::svc::rows::key_val;
 use crate::svc::wallet::{self, Entry};
 use crate::world::World;
 
@@ -55,6 +56,34 @@ impl Trade {
     }
 }
 
+/// Why a change to a trade did not happen: a refusal, or a failed change.
+enum Failed {
+    Refused(Outcome),
+    Db(StoreError),
+}
+
+impl From<StoreError> for Failed {
+    fn from(e: StoreError) -> Self {
+        Failed::Db(e)
+    }
+}
+
+impl From<Outcome> for Failed {
+    fn from(refusal: Outcome) -> Self {
+        Failed::Refused(refusal)
+    }
+}
+
+impl Failed {
+    /// The refusal to answer with; a failed change while doing `what`.
+    fn refusal(self, what: &str) -> Outcome {
+        match self {
+            Failed::Refused(refusal) => refusal,
+            Failed::Db(e) => db_failed(what, e),
+        }
+    }
+}
+
 /// trademgr.InitiateTrade(charID, warID=None).
 pub async fn trademgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     if call.method != "InitiateTrade" {
@@ -68,7 +97,7 @@ async fn initiate(ctx: &Ctx<'_>, other: i64, war: Option<i64>) -> Refused<Value>
     let (Some(me), Some(station)) = (ctx.session.char_id, ctx.session.station_id) else {
         return Err(message(if war.is_some() { "MustBeInStationToNegotiate" } else { "OtherCharNotAtStation" }));
     };
-    let other_name = name_of(ctx, other).await;
+    let other_name = ctx.store.read(|db| name_of(db, other));
     if other == me {
         return Err(Outcome::custom("You cannot trade with yourself."));
     }
@@ -85,26 +114,25 @@ async fn initiate(ctx: &Ctx<'_>, other: i64, war: Option<i64>) -> Refused<Value>
         }
     }
     if let Some(war) = war {
-        may_surrender(ctx, war, me, other).await?;
+        ctx.store.read(|db| may_surrender(db, war, me, other))?;
     }
 
-    let result = async {
-        let mut client = crate::db::connect(ctx.db_url).await?;
-        let mut txn = ItemTxn::begin(&mut client).await?;
+    let result = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
         let container = txn
-            .create(NewItem { type_id: TYPE_CARGO_CONTAINER, owner_id: OWNER_SYSTEM, location_id: station, flag: 0, quantity: 1, singleton: true })
-            .await?;
-        txn.tx().execute(r#"UPDATE entity SET "itemName" = $2 WHERE "itemID" = $1"#, &[&(container as i32), &CONTAINER_NAME]).await?;
-        txn.commit().await?;
-        Ok::<_, tokio_postgres::Error>(container)
-    }
-    .await;
+            .create(NewItem { type_id: TYPE_CARGO_CONTAINER, owner_id: OWNER_SYSTEM, location_id: station, flag: 0, quantity: 1, singleton: true })?;
+        if let Some(row) = txn.db().table("entity").get_id(container).map(|e| e.id) {
+            txn.tx().update("entity", row, &[("itemName", store::Value::Text(CONTAINER_NAME.into()))])?;
+        }
+        Ok::<_, StoreError>(container)
+    });
     let container = result.map_err(|e| db_failed("opening the trade", e))?;
     let trade = Trade { gate: Arc::new(tokio::sync::Mutex::new(())), container, station, traders: [me, other], accepted: [false; 2], money: [0.0; 2], war };
     let session = bound::object_ref(ctx.node_id, SESSION, &[container]);
     let registered = {
         let mut w = ctx.world.lock();
-        // Both participants may initiate simultaneously while the DB call yields.
+        // Both participants may initiate at once; the first to get here opens
+        // the trade.
         if w.station_of(me)!=Some(station) || w.station_of(other)!=Some(station) || w.trades.values().any(|t|t.side(me).is_some() || t.side(other).is_some()) { false } else {
             w.trades.insert(container, trade);
             let event = Value::Tuple(vec![Value::bytes("Initiate"), Value::Int(me), session.clone()]);
@@ -113,7 +141,10 @@ async fn initiate(ctx: &Ctx<'_>, other: i64, war: Option<i64>) -> Refused<Value>
         }
     };
     if !registered {
-        ctx.db.execute(r#"DELETE FROM entity WHERE "itemID"=$1"#,&[&(container as i32)]).await.map_err(|e|db_failed("closing the unused trade",e))?;
+        ctx.store.write(|tx| match tx.table("entity").get_id(container).map(|e| e.id) {
+            Some(row) => tx.delete("entity", row),
+            None => Ok(()),
+        }).map_err(|e|db_failed("closing the unused trade",e))?;
         return Err(Outcome::custom("One of you has left the station or is already trading."));
     }
     info!("{me} opened a {}trade with {other} ({container})", if war.is_some() { "surrender " } else { "" });
@@ -122,15 +153,15 @@ async fn initiate(ctx: &Ctx<'_>, other: i64, war: Option<i64>) -> Refused<Value>
 
 /// A CEO trade: both are the active CEOs (an alliance's: its executor's) of
 /// the two sides of a war that has not ended.
-async fn may_surrender(ctx: &Ctx<'_>, war: i64, me: i64, other: i64) -> Refused<()> {
-    let Some((declarer, against)) = crate::svc::war::sides(ctx.db, war).await else {
+fn may_surrender(db: &Db, war: i64, me: i64, other: i64) -> Refused<()> {
+    let Some((declarer, against)) = crate::svc::war::sides(db, war) else {
         return Err(message("CanNotSurrenderAsWarIsOver"));
     };
     let mut leaders = Vec::new();
     for side in [declarer, against] {
-        let sql = r#"SELECT co."ceoID" FROM "corporation" co
-                      WHERE co."corporationID" = COALESCE((SELECT "executorCorpID" FROM alliances WHERE "allianceID" = $1), $1)"#;
-        match ctx.query_one(sql, &[&(side as i32)]).await.and_then(|r| int(&r, 0)) {
+        // An alliance's side is led by its executor corporation's CEO.
+        let corp = db.table("alliances").get_id(side).and_then(|a| a.int("executorCorpID")).unwrap_or(side);
+        match db.table("corporation").get_id(corp).and_then(|co| co.int("ceoID")) {
             Some(ceo) => leaders.push(ceo),
             None => return Err(message("CanNotSurrenderToAllianceInTurmoil")),
         }
@@ -141,9 +172,8 @@ async fn may_surrender(ctx: &Ctx<'_>, war: i64, me: i64, other: i64) -> Refused<
     Ok(())
 }
 
-async fn name_of(ctx: &Ctx<'_>, char_id: i64) -> String {
-    let sql = r#"SELECT "characterName" FROM "character_" WHERE "characterID" = $1"#;
-    ctx.query_one(sql, &[&(char_id as i32)]).await.and_then(|r| crate::svc::rows::text(&r, 0)).unwrap_or_default()
+fn name_of(db: &Db, char_id: i64) -> String {
+    db.table("character_").get_id(char_id).and_then(|c| c.text("characterName")).unwrap_or_default().to_string()
 }
 
 /// The bound trade session.
@@ -170,7 +200,7 @@ pub async fn session(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "MultiMerge" | "StackAll" => Ok(Value::None),
         "OfferMoney" => offer_money(ctx, &trade, call.args.first().and_then(|v| v.as_f64()).unwrap_or(0.0)).await,
         "ToggleAccept" => accept(ctx, container, call.arg_i64(0).unwrap_or(0) != 0).await,
-        "Abort" => abort_locked(ctx.db_url, ctx.world, container).await.map(|_| Value::None),
+        "Abort" => abort_locked(ctx.store, ctx.world, container).await.map(|_| Value::None),
         _ => return Some(Outcome::Unknown(format!("{SESSION}::{}", call.method))),
     };
     Some(result.map_or_else(|refusal| refusal, Outcome::Value))
@@ -180,27 +210,25 @@ pub async fn session(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 async fn offer(ctx: &Ctx<'_>, trade: &Trade, ids: &[i64], quantity: Option<i64>) -> Refused<Value> {
     if quantity.is_some_and(|q|q<=0 || q>i32::MAX as i64) {return Err(Outcome::custom("Choose a positive item quantity."))}
     let me = ctx.session.char_id.unwrap_or(0);
-    let failed = |e| db_failed("offering the items", e);
-    let events = {
-        let mut client = crate::db::connect(ctx.db_url).await.map_err(failed)?;
-        let mut txn = ItemTxn::begin(&mut client).await.map_err(failed)?;
+    let events = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
         for &id in ids {
-            let Some(item) = txn.item(id).await.map_err(failed)? else { continue };
+            let Some(item) = txn.item(id)? else { continue };
             let in_hangar = item.location_id == trade.station && item.flag == i64::from(FLAG_HANGAR);
             if item.owner_id != me || !in_hangar || Some(item.id) == ctx.session.ship_id {
                 continue;
             }
             match offer_split_quantity(quantity, item.quantity, item.singleton)? {
                 Some(q) => {
-                    txn.set_quantity(id, item.quantity - q).await.map_err(failed)?;
+                    txn.set_quantity(id, item.quantity - q)?;
                     let new = NewItem { type_id: item.type_id, owner_id: me, location_id: trade.container, flag: 0, quantity: q, singleton: false };
-                    txn.create(new).await.map_err(failed)?;
+                    txn.create(new)?;
                 }
-                None => txn.move_to(id, trade.container, 0).await.map_err(failed)?,
+                None => txn.move_to(id, trade.container, 0)?,
             }
         }
-        txn.commit().await.map_err(failed)?
-    };
+        Ok::<_, Failed>(txn.events())
+    }).map_err(|e| e.refusal("offering the items"))?;
     tell_items(ctx.world, trade, events);
     reset(ctx.world, trade.container);
     Ok(Value::None)
@@ -218,11 +246,7 @@ fn offer_split_quantity(requested: Option<i64>, available: i64, singleton: bool)
 async fn offer_money(ctx: &Ctx<'_>, trade: &Trade, amount: f64) -> Refused<Value> {
     let me = ctx.session.char_id.unwrap_or(0);
     let Some(side) = trade.side(me) else { return Ok(Value::None) };
-    let have = ctx
-        .query_one(r#"SELECT "balance" FROM "character_" WHERE "characterID" = $1"#, &[&(me as i32)])
-        .await
-        .and_then(|r| crate::svc::rows::float(&r, 0))
-        .unwrap_or(0.0);
+    let have = ctx.store.read(|db| db.table("character_").get_id(me).and_then(|c| c.float("balance"))).unwrap_or(0.0);
     if !amount.is_finite() || amount < 0.0 {
         return Err(Outcome::custom("That is not an amount of money."));
     }
@@ -265,31 +289,27 @@ async fn accept(ctx: &Ctx<'_>, container: i64, state: bool) -> Refused<Value> {
 /// a surrender ends its war.
 async fn complete(ctx: &Ctx<'_>, container: i64) -> Refused<()> {
     let Some(trade) = ctx.world.lock().trades.get(&container).cloned() else { return Ok(()) };
-    let result = async {
-        let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-        let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| db_failed("BEGIN", e))?;
+    let result = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
         let surrender=if let Some(war)=trade.war {
-            may_surrender(ctx,war,trade.traders[0],trade.traders[1]).await?;
-            Some(crate::svc::war::prepare_surrender(txn.tx(),war).await?)
+            may_surrender(txn.db(),war,trade.traders[0],trade.traders[1])?;
+            Some(crate::svc::war::prepare_surrender(txn.tx(),war)?)
         } else {None};
         let inside: Vec<(i64, i64)> = txn
-            .tx()
-            .query(r#"SELECT "itemID", "ownerID" FROM entity WHERE "locationID" = $1"#, &[&(container as i32)])
-            .await
-            .map_err(|e| db_failed("reading the offers", e))?
-            .iter()
-            .filter_map(|r| Some((int(r, 0)?, int(r, 1)?)))
+            .db()
+            .table("entity")
+            .find(&["locationID"], &[store::Value::Int(container)])
+            .filter_map(|r| Some((r.int("itemID")?, r.int("ownerID")?)))
             .collect();
         for (item, owner) in inside {
-            if !trade.traders.contains(&owner) {return Err(Outcome::custom("The trade contains an item belonging to somebody else."))}
+            if !trade.traders.contains(&owner) {return Err(Outcome::custom("The trade contains an item belonging to somebody else.").into())}
             let to = if owner == trade.traders[0] { trade.traders[1] } else { trade.traders[0] };
-            let children=txn.tx().query(r#"WITH RECURSIVE contents AS (SELECT "itemID","ownerID" FROM entity WHERE "locationID"=$1 UNION SELECT e."itemID",e."ownerID" FROM entity e JOIN contents c ON e."locationID"=c."itemID") SELECT "itemID","ownerID" FROM contents ORDER BY "itemID""#,&[&(item as i32)]).await.map_err(|e|db_failed("reading container contents",e))?;
-            for child in children {
-                if child.get::<_,i32>(1) as i64!=owner {return Err(Outcome::custom("An offered container holds somebody else's property."))}
-                txn.set_owner(child.get::<_,i32>(0) as i64,to).await.map_err(|e|db_failed("handing over container contents",e))?;
+            for (child, child_owner) in contents(txn.db(), item) {
+                if child_owner!=owner {return Err(Outcome::custom("An offered container holds somebody else's property.").into())}
+                txn.set_owner(child,to)?;
             }
-            txn.move_to(item, trade.station, i64::from(FLAG_HANGAR)).await.map_err(|e| db_failed("handing over", e))?;
-            txn.set_owner(item, to).await.map_err(|e| db_failed("handing over", e))?;
+            txn.move_to(item, trade.station, i64::from(FLAG_HANGAR))?;
+            txn.set_owner(item, to)?;
         }
         let mut balances = Vec::new();
         for (from, to, amount) in [(0, 1, trade.money[0]), (1, 0, trade.money[1])] {
@@ -298,15 +318,13 @@ async fn complete(ctx: &Ctx<'_>, container: i64) -> Refused<()> {
             }
             let (payer, payee) = (trade.traders[from], trade.traders[to]);
             let entry = Entry { ref_type: REF_PLAYER_TRADING, payer, payee, arg_id1: "", reason: "" };
-            let paid = wallet::post(txn.tx(), payer, -amount, &entry).await.map_err(crate::svc::membership::transfer_refused)?;
-            let got = wallet::post(txn.tx(), payee, amount, &entry).await.map_err(crate::svc::membership::transfer_refused)?;
+            let paid = wallet::post(txn.tx(), payer, -amount, &entry).map_err(crate::svc::membership::transfer_refused)?;
+            let got = wallet::post(txn.tx(), payee, amount, &entry).map_err(crate::svc::membership::transfer_refused)?;
             balances.extend([(payer, paid), (payee, got)]);
         }
-        txn.destroy(container).await.map_err(|e| db_failed("closing the trade", e))?;
-        let events = txn.commit().await.map_err(|e| db_failed("COMMIT", e))?;
-        Ok::<_, Outcome>((events, balances,surrender))
-    }
-    .await;
+        txn.destroy(container)?;
+        Ok::<_, Failed>((txn.events(), balances,surrender))
+    }).map_err(|e| e.refusal("completing the trade"));
     let (events, balances,surrender) = match result {
         Ok(v) => v,
         Err(refusal) => {
@@ -328,37 +346,53 @@ async fn complete(ctx: &Ctx<'_>, container: i64) -> Refused<()> {
     }
     info!("trade {container} between {} and {} completed", trade.traders[0], trade.traders[1]);
     if let (Some(war),Some(event)) = (trade.war,surrender) {
-        crate::svc::war::announce_surrender(ctx.world, ctx.db, war,event).await;
+        ctx.store.read(|db| crate::svc::war::announce_surrender(ctx.world, db, war,event));
     }
     Ok(())
 }
 
-/// Abort: everything goes back to its owner's hangar.
-pub async fn abort(db_url: &str, world: &World, container: i64) -> Refused<()> {
-    let Some(trade)=world.lock().trades.get(&container).cloned() else {return Ok(())};
-    let _guard=trade.gate.lock().await;
-    abort_locked(db_url,world,container).await
+/// Everything inside `item`, however deep, with its owner, by itemID.
+fn contents(db: &Db, item: i64) -> Vec<(i64, i64)> {
+    let entity = db.table("entity");
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    let mut parents = vec![item];
+    while let Some(parent) = parents.pop() {
+        for e in entity.find(&["locationID"], &[store::Value::Int(parent)]) {
+            let (Some(id), Some(owner)) = (e.int("itemID"), e.int("ownerID")) else { continue };
+            if seen.insert(id) {
+                found.push((id, owner));
+                parents.push(id);
+            }
+        }
+    }
+    found.sort_unstable();
+    found
 }
 
-async fn abort_locked(db_url: &str, world: &World, container: i64) -> Refused<()> {
+/// Abort: everything goes back to its owner's hangar.
+pub async fn abort(store: &Store, world: &World, container: i64) -> Refused<()> {
+    let Some(trade)=world.lock().trades.get(&container).cloned() else {return Ok(())};
+    let _guard=trade.gate.lock().await;
+    abort_locked(store,world,container).await
+}
+
+async fn abort_locked(store: &Store, world: &World, container: i64) -> Refused<()> {
     let Some(trade) = world.lock().trades.get(&container).cloned() else { return Ok(()) };
-    let result = async {
-        let mut client = crate::db::connect(db_url).await?;
-        let mut txn = ItemTxn::begin(&mut client).await?;
+    let result = store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
         let inside: Vec<i64> = txn
-            .tx()
-            .query(r#"SELECT "itemID" FROM entity WHERE "locationID" = $1"#, &[&(container as i32)])
-            .await?
-            .iter()
-            .filter_map(|r| int(r, 0))
+            .db()
+            .table("entity")
+            .find(&["locationID"], &[store::Value::Int(container)])
+            .filter_map(|r| r.int("itemID"))
             .collect();
         for item in inside {
-            txn.move_to(item, trade.station, i64::from(FLAG_HANGAR)).await?;
+            txn.move_to(item, trade.station, i64::from(FLAG_HANGAR))?;
         }
-        txn.destroy(container).await?;
-        txn.commit().await
-    }
-    .await;
+        txn.destroy(container)?;
+        Ok::<_, StoreError>(txn.events())
+    });
     let events = result.map_err(|e| db_failed("returning the offers", e))?;
     world.lock().trades.remove(&container);
     tell_items(world, &trade, events);
@@ -416,10 +450,10 @@ pub fn offers_changed(world: &World, origins: &[i64]) {
 }
 
 /// Trades a pilot is part of end when they leave the station.
-pub async fn left_station(db_url: &str, world: &World, char_id: i64) {
+pub async fn left_station(store: &Store, world: &World, char_id: i64) {
     let mine: Vec<i64> = world.lock().trades.values().filter(|t| t.side(char_id).is_some()).map(|t| t.container).collect();
     for container in mine {
-        if let Err(Outcome::UserError { msg, .. }) = abort(db_url, world, container).await {
+        if let Err(Outcome::UserError { msg, .. }) = abort(store, world, container).await {
             error!("aborting trade {container}: {msg}");
         }
     }
@@ -427,19 +461,28 @@ pub async fn left_station(db_url: &str, world: &World, char_id: i64) {
 
 /// At startup: trade containers left over from before are emptied back into
 /// their owners' hangars, and go.
-pub async fn recover(db: &Client) {
-    let sql = r#"WITH box AS (
-                     SELECT "itemID", "locationID" FROM entity
-                      WHERE "typeID" = $1 AND "ownerID" = $2 AND "itemName" = $3),
-                 back AS (
-                     UPDATE entity e SET "locationID" = box."locationID", "flag" = $4
-                       FROM box WHERE e."locationID" = box."itemID"
-                     RETURNING e."itemID")
-                 DELETE FROM entity WHERE "itemID" IN (SELECT "itemID" FROM box)
-                 RETURNING (SELECT count(*) FROM back)"#;
-    match db.query(sql, &[&(TYPE_CARGO_CONTAINER as i32), &(OWNER_SYSTEM as i32), &CONTAINER_NAME, &FLAG_HANGAR]).await {
-        Ok(rows) if !rows.is_empty() => info!("{} trade container(s) from before were emptied back into hangars", rows.len()),
-        Ok(_) => {}
+pub fn recover(store: &Store) {
+    let recovered = store.write(|tx| {
+        let boxes: Vec<(store::RowId, i64, store::Value)> = tx
+            .table("entity")
+            .find(&["typeID"], &[store::Value::Int(TYPE_CARGO_CONTAINER)])
+            .filter(|e| e.int("ownerID") == Some(OWNER_SYSTEM) && e.text("itemName") == Some(CONTAINER_NAME))
+            .filter_map(|e| Some((e.id, e.int("itemID")?, e.value("locationID").clone())))
+            .collect();
+        for (_, id, location) in &boxes {
+            let inside: Vec<store::RowId> = tx.table("entity").find(&["locationID"], &[store::Value::Int(*id)]).map(|e| e.id).collect();
+            for row in inside {
+                tx.update("entity", row, &[("locationID", location.clone()), ("flag", store::Value::Int(i64::from(FLAG_HANGAR)))])?;
+            }
+        }
+        for (row, _, _) in &boxes {
+            tx.delete("entity", *row)?;
+        }
+        Ok::<_, StoreError>(boxes.len())
+    });
+    match recovered {
+        Ok(0) => {}
+        Ok(n) => info!("{n} trade container(s) from before were emptied back into hangars"),
         Err(e) => error!("recovering trade containers: {}", crate::logging::chain(&e)),
     }
 }
@@ -466,21 +509,25 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn concurrent_acceptance_settles_once_and_transfers_container_contents() {
+        use crate::store::Value as V;
         let fixture=crate::test_support::Database::load().await;
-        let a=fixture.id().await; let b=fixture.id().await;
-        for id in [a,b] {fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,1000)"#,&[&id,&format!("Trade race {id}")]).await.unwrap();}
-        let container=fixture.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",quantity) VALUES (23,1,60000004,1) RETURNING "itemID""#,&[]).await.unwrap().get::<_,i32>(0) as i64;
-        let offered=fixture.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",quantity,singleton) VALUES (23,$1,$2,1,1) RETURNING "itemID""#,&[&a,&(container as i32)]).await.unwrap().get::<_,i32>(0);
-        let child=fixture.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",quantity,flag) VALUES (34,$1,$2,5,5) RETURNING "itemID""#,&[&a,&offered]).await.unwrap().get::<_,i32>(0);
-        fixture.world.lock().trades.insert(container,Trade {gate:Arc::new(tokio::sync::Mutex::new(())),container,station:60000004,traders:[a as i64,b as i64],accepted:[true,false],money:[100.0,0.0],war:None});
-        let s=crate::session::Session {char_id:Some(b as i64),station_id:Some(60000004),..Default::default()}; let ctx=fixture.ctx(&s);
+        let a=fixture.id().await as i64; let b=fixture.id().await as i64;
+        let (container,child)=fixture.store.write(|tx| {
+            for id in [a,b] {tx.insert("character_",&[("characterID",V::Int(id)),("characterName",V::Text(format!("Trade race {id}").into())),("balance",V::Float(1000.0))])?;}
+            let mut item=|sets:&[(&str,V)]| -> Result<i64,StoreError> {let row=tx.insert("entity",sets)?;Ok(tx.table("entity").row(row).unwrap().int("itemID").unwrap())};
+            let container=item(&[("typeID",V::Int(23)),("ownerID",V::Int(1)),("locationID",V::Int(60000004)),("quantity",V::Int(1))])?;
+            let offered=item(&[("typeID",V::Int(23)),("ownerID",V::Int(a)),("locationID",V::Int(container)),("quantity",V::Int(1)),("singleton",V::Int(1))])?;
+            let child=item(&[("typeID",V::Int(34)),("ownerID",V::Int(a)),("locationID",V::Int(offered)),("quantity",V::Int(5)),("flag",V::Int(5))])?;
+            Ok::<_,StoreError>((container,child))
+        }).unwrap();
+        fixture.world.lock().trades.insert(container,Trade {gate:Arc::new(tokio::sync::Mutex::new(())),container,station:60000004,traders:[a,b],accepted:[true,false],money:[100.0,0.0],war:None});
+        let s=crate::session::Session {char_id:Some(b),station_id:Some(60000004),..Default::default()}; let ctx=fixture.ctx(&s);
         let call=Call {service:bound::object_id(1,SESSION,&[container]),method:"ToggleAccept".into(),args:vec![Value::Bool(true)],kwargs:vec![]};
         let (first,second)=tokio::join!(session(&call,&ctx),session(&call,&ctx));
         assert_eq!([first,second].iter().filter(|r|matches!(r,Some(Outcome::Value(_)))).count(),1);
-        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&a]).await.unwrap().get(0); assert_eq!(balance,900.0);
-        let owner:i32=fixture.db.query_one(r#"SELECT "ownerID" FROM entity WHERE "itemID"=$1"#,&[&child]).await.unwrap().get(0); assert_eq!(owner,b);
+        let balance=fixture.store.read(|db|db.table("character_").get_id(a).unwrap().float("balance")); assert_eq!(balance,Some(900.0));
+        let owner=fixture.store.read(|db|db.table("entity").get_id(child).unwrap().int("ownerID")); assert_eq!(owner,Some(b));
         assert!(!fixture.world.lock().trades.contains_key(&container));
     }
 }

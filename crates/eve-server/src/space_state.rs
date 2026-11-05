@@ -1,13 +1,14 @@
-//! Atomic player motion checkpoints. Lock inventory before taking a live
-//! snapshot, so queued writes cannot carry a pre-jump position across a move.
+//! Atomic player motion checkpoints. The live snapshot is taken inside the
+//! store write that checks inventory, so no other write can carry a pre-jump
+//! position across a move.
 use crate::{
     ballpark::{Motion, Ship},
     combat, destiny,
+    store::{Db, Store, StoreError, Tx, Value},
     svc::inflight,
     services::Ctx,
     world::World,
 };
-use tokio_postgres::{Client, Transaction};
 use tracing::{error, warn};
 
 #[cfg(test)]
@@ -23,95 +24,72 @@ struct Snapshot {
     cloak:crate::cloak::SavedState,
 }
 
-pub async fn ensure(db: &Client) -> Result<(), tokio_postgres::Error> {
-    db.batch_execute(r#"
-        CREATE TABLE IF NOT EXISTS "shipSpaceMotion" (
-            "itemID" integer PRIMARY KEY REFERENCES entity("itemID") ON DELETE CASCADE,
-            "characterID" integer NOT NULL, "solarSystemID" integer NOT NULL,
-            tick bigint NOT NULL, "savedAt" bigint NOT NULL, state text NOT NULL);
-        CREATE OR REPLACE FUNCTION invalidate_ship_space_motion() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-            DELETE FROM "shipSpaceMotion" WHERE "itemID"=OLD."itemID";
-            RETURN NEW;
-        END $$;
-        CREATE OR REPLACE TRIGGER invalidate_ship_space_motion
-            BEFORE UPDATE OF "ownerID","locationID",flag,"typeID",quantity,x,y,z ON entity
-            FOR EACH ROW EXECUTE FUNCTION invalidate_ship_space_motion();
-    "#).await
+/// `shipSpaceMotion` and the entity trigger that invalidates it are part of
+/// the store's schema; there is nothing left to bring up to date.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    Ok(())
 }
 
-pub(crate) async fn lock_current(
-    tx: &Transaction<'_>,
-    pilot: i64,
-    ship: i64,
-    system: i64,
-) -> Result<bool, tokio_postgres::Error> {
-    if tx
-        .query_opt(
-            r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2
-        AND "solarSystemID"=$3 AND COALESCE("stationID",0)=0 FOR UPDATE"#,
-            &[&(pilot as i32), &(ship as i32), &(system as i32)],
-        )
-        .await?
-        .is_none()
-    {
-        return Ok(false);
-    }
-    Ok(tx
-        .query_opt(
-            r#"SELECT 1 FROM entity WHERE "itemID"=$1 AND "ownerID"=$2
-        AND "locationID"=$3 AND COALESCE(flag,0)=0 AND quantity>0 FOR UPDATE"#,
-            &[&(ship as i32), &(pilot as i32), &(system as i32)],
-        )
-        .await?
-        .is_some())
+/// Whether the pilot still sits in that ship in space there. Checked in the
+/// store write that checkpoints, so nothing can move the ship in between.
+pub(crate) fn lock_current(db: &Db, pilot: i64, ship: i64, system: i64) -> Result<bool, StoreError> {
+    let in_space = db.table("character_").get_id(pilot).is_some_and(|c| {
+        c.int("shipID") == Some(ship) && c.int("solarSystemID") == Some(system) && c.int("stationID").unwrap_or(0) == 0
+    });
+    Ok(in_space
+        && db.table("entity").get_id(ship).is_some_and(|e| {
+            e.int("ownerID") == Some(pilot)
+                && e.int("locationID") == Some(system)
+                && e.int("flag").unwrap_or(0) == 0
+                && e.int("quantity").is_some_and(|q| q > 0)
+        }))
 }
 
-async fn write(
-    tx: &Transaction<'_>,
+fn write(
+    tx: &mut Tx<'_>,
     system: i64,
     ship: &Ship,
     tick: i64,
-) -> Result<bool, tokio_postgres::Error> {
-    if crate::losses::pending::blocked(tx,ship.id).await? {return Ok(false);}
+) -> Result<bool, StoreError> {
+    if crate::losses::pending::blocked(tx.db(),ship.id)? {return Ok(false);}
     // The inactive profile loaded after restart can have a different hull
     // maximum. Preserve a confirmed lethal result, including attribution,
     // rather than interpreting its raw damage against that new maximum.
     if ship.fight.as_ref().is_some_and(|f|f.vitals.hull_max.is_finite() && f.vitals.hull_max>0.0
         && f.vitals.hull_damage.is_finite() && f.vitals.hull_damage>=f.vitals.hull_max-1e-6) {
-        return crate::losses::journal::stage(tx,&crate::losses::Loss::of(ship,system,ship.pilot.type_id==670)).await;
+        return crate::losses::journal::stage(tx,&crate::losses::Loss::of(ship,system,ship.pilot.type_id==670));
     }
-    write_snapshot(tx,system,ship,tick).await
+    write_snapshot(tx,system,ship,tick)
 }
 
-/// The travel journal has already locked and validated its exact generation.
-/// Only that owner may write through its own unresolved arrival marker.
-pub(crate) async fn write_arrival(tx:&Transaction<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,tokio_postgres::Error> {
-    if crate::losses::pending::blocked_except_travel(tx,ship.id).await?
+/// The travel journal has already validated its exact generation. Only that
+/// owner may write through its own unresolved arrival marker.
+pub(crate) fn write_arrival(tx:&mut Tx<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,StoreError> {
+    if crate::losses::pending::blocked_except_travel(tx.db(),ship.id)?
         || ship.fight.as_ref().is_none_or(|f| !f.vitals.hull_max.is_finite() || f.vitals.hull_max<=0.0
             || !f.vitals.hull_damage.is_finite() || f.vitals.hull_damage>=f.vitals.hull_max-1e-6) {return Ok(false);}
-    write_snapshot(tx,system,ship,tick).await
+    write_snapshot(tx,system,ship,tick)
 }
 
-/// Only the portal journal holding the exact receipt and custody locks may
+/// Only the portal journal holding the exact receipt and custody may
 /// checkpoint through its own marker. The source remains live during startup.
-pub(crate) async fn write_portal(tx:&Transaction<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,tokio_postgres::Error> {
-    if crate::losses::pending::blocked_except_portal(tx,ship.id).await?
+pub(crate) fn write_portal(tx:&mut Tx<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,StoreError> {
+    if crate::losses::pending::blocked_except_portal(tx.db(),ship.id)?
         || ship.fight.as_ref().is_none_or(|f| !f.vitals.hull_max.is_finite() || f.vitals.hull_max<=0.0
             || !f.vitals.hull_damage.is_finite() || f.vitals.hull_damage>=f.vitals.hull_max-1e-6) {return Ok(false);}
-    write_snapshot(tx,system,ship,tick).await
+    write_snapshot(tx,system,ship,tick)
 }
 
-pub(crate) async fn write_logout(tx:&Transaction<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,tokio_postgres::Error> {
-    if crate::losses::pending::blocked_except_logout(tx,ship.id).await? {return Ok(false);}
+pub(crate) fn write_logout(tx:&mut Tx<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,StoreError> {
+    if crate::losses::pending::blocked_except_logout(tx.db(),ship.id)? {return Ok(false);}
     if ship.fight.as_ref().is_none_or(|f| !f.vitals.hull_max.is_finite() || f.vitals.hull_max<=0.0 || !f.vitals.hull_damage.is_finite()) {return Ok(false);}
     if ship.fight.as_ref().is_some_and(|f|f.vitals.hull_damage>=f.vitals.hull_max-1e-6) {
-        return crate::losses::journal::stage(tx,&crate::losses::Loss::of(ship,system,ship.pilot.type_id==670)).await;
+        return crate::losses::journal::stage(tx,&crate::losses::Loss::of(ship,system,ship.pilot.type_id==670));
     }
-    write_snapshot(tx,system,ship,tick).await
+    write_snapshot(tx,system,ship,tick)
 }
 
-async fn write_snapshot(tx:&Transaction<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,tokio_postgres::Error> {
+fn write_snapshot(tx:&mut Tx<'_>,system:i64,ship:&Ship,tick:i64)->Result<bool,StoreError> {
     let motion = ship.motion(tick);
     // Validate before touching inventory. Corrupt physics must not become the
     // only durable location a character can load.
@@ -122,41 +100,58 @@ async fn write_snapshot(tx:&Transaction<'_>,system:i64,ship:&Ship,tick:i64)->Res
         return Ok(false);
     };
     let saved_at = combat::now_ms();
-    tx.execute(
-        r#"UPDATE entity SET x=$2,y=$3,z=$4 WHERE "itemID"=$1"#,
-        &[&(ship.id as i32), &ship.pos.x, &ship.pos.y, &ship.pos.z],
-    )
-    .await?;
-    if let Some(fighter) = &ship.fight {
-        inflight::write_vitals_at(tx, ship.id, fighter, false, saved_at).await?;
+    if let Some(hull) = tx.table("entity").get_id(ship.id).map(|r| r.id) {
+        tx.update("entity", hull, &[("x", Value::Float(ship.pos.x)), ("y", Value::Float(ship.pos.y)), ("z", Value::Float(ship.pos.z))])?;
     }
-    crate::cloak::durability::save_history(tx,ship,saved_at).await?;
-    tx.execute(r#"INSERT INTO "shipSpaceMotion" ("itemID","characterID","solarSystemID",tick,"savedAt",state)
-        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT ("itemID") DO UPDATE SET "characterID"=$2,
-        "solarSystemID"=$3,tick=$4,"savedAt"=$5,state=$6"#,
-        &[&(ship.id as i32),&(ship.pilot.char_id as i32),&(system as i32),&tick,&saved_at,&state]).await?;
+    if let Some(fighter) = &ship.fight {
+        inflight::write_vitals_at(tx, ship.id, fighter, false, saved_at)?;
+    }
+    crate::cloak::durability::save_history(tx,ship,saved_at)?;
+    let sets = [("characterID", Value::Int(ship.pilot.char_id)), ("solarSystemID", Value::Int(system)), ("tick", Value::Int(tick)),
+        ("savedAt", Value::Int(saved_at)), ("state", Value::Text(state.into()))];
+    let mut row = vec![("itemID", Value::Int(ship.id))];
+    row.extend(sets.iter().cloned());
+    tx.upsert("shipSpaceMotion", &["itemID"], &row, &sets)?;
     Ok(true)
+}
+
+/// Why a checkpoint's write was undone: refused (as a transaction ended
+/// without COMMIT was), or failed.
+enum Undone {
+    Refused,
+    Failed(StoreError),
+}
+
+impl From<StoreError> for Undone {
+    fn from(e: StoreError) -> Self {
+        Undone::Failed(e)
+    }
+}
+
+fn saved(result: Result<(), Undone>) -> Result<bool, StoreError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(Undone::Refused) => Ok(false),
+        Err(Undone::Failed(e)) => Err(e),
+    }
 }
 
 #[cfg(test)]
 pub async fn save_detached(
-    db: &mut Client,
+    store: &Store,
     system: i64,
     ship: &Ship,
     tick: i64,
-) -> Result<bool, tokio_postgres::Error> {
-    let tx = db.transaction().await?;
-    if !lock_current(&tx, ship.pilot.char_id, ship.id, system).await? {
-        return Ok(false);
-    }
-    if !write(&tx, system, ship, tick).await? {
-        return Ok(false);
-    }
-    tx.commit().await?;
-    Ok(true)
+) -> Result<bool, StoreError> {
+    saved(store.write(|tx| {
+        if !lock_current(tx.db(), ship.pilot.char_id, ship.id, system)? || !write(tx, system, ship, tick)? {
+            return Err(Undone::Refused);
+        }
+        Ok(())
+    }))
 }
 
-pub async fn checkpoint(world: &World, db: &mut Client) {
+pub async fn checkpoint(world: &World, store: &Store) {
     let candidates: Vec<_> = {
         let world = world.lock();
         world
@@ -171,7 +166,7 @@ pub async fn checkpoint(world: &World, db: &mut Client) {
             .collect()
     };
     for (system, id, pilot, client) in candidates {
-        if let Err(e) = checkpoint_one(world, db, system, id, pilot, client).await {
+        if let Err(e) = checkpoint_one(world, store, system, id, pilot, client).await {
             error!("checkpointing ship {id}: {}", crate::logging::chain(&e));
         }
     }
@@ -179,38 +174,38 @@ pub async fn checkpoint(world: &World, db: &mut Client) {
 
 pub(crate) async fn checkpoint_one(
     world: &World,
-    db: &mut Client,
+    store: &Store,
     system: i64,
     id: i64,
     pilot: i64,
     client: i64,
-) -> Result<bool, tokio_postgres::Error> {
-    let tx = db.transaction().await?;
-    if !lock_current(&tx, pilot, id, system).await? {
-        return Ok(false);
-    }
-    let snapshot = {
-        let world = world.lock();
-        world.parks.get(&system).and_then(|park| {
-            park.ships
-                .get(&id)
-                .filter(|s| {
-                    s.is_player()
-                        && !s.identity_reserved
-                        && s.client_id == client
-                        && s.pilot.char_id == pilot
-                })
-                .map(|ship| (ship.clone(), park.tick))
-        })
-    };
-    let Some((ship, tick)) = snapshot else {
-        return Ok(false);
-    };
-    if !write(&tx, system, &ship, tick).await? {
-        return Ok(false);
-    }
-    tx.commit().await?;
-    Ok(true)
+) -> Result<bool, StoreError> {
+    saved(store.write(|tx| {
+        if !lock_current(tx.db(), pilot, id, system)? {
+            return Err(Undone::Refused);
+        }
+        let snapshot = {
+            let world = world.lock();
+            world.parks.get(&system).and_then(|park| {
+                park.ships
+                    .get(&id)
+                    .filter(|s| {
+                        s.is_player()
+                            && !s.identity_reserved
+                            && s.client_id == client
+                            && s.pilot.char_id == pilot
+                    })
+                    .map(|ship| (ship.clone(), park.tick))
+            })
+        };
+        let Some((ship, tick)) = snapshot else {
+            return Err(Undone::Refused);
+        };
+        if !write(tx, system, &ship, tick)? {
+            return Err(Undone::Refused);
+        }
+        Ok(())
+    }))
 }
 
 /// Called only for a reconnect, not when undocking, boarding or jumping.
@@ -218,36 +213,34 @@ pub async fn restore(
     ctx: &Ctx<'_>,
     system: i64,
     ship: &mut Ship,
-) -> Result<bool, tokio_postgres::Error> {
-    let db=ctx.db;
-    let row = db
-        .query_opt(
-            r#"SELECT m.state,m.tick,m."savedAt" FROM "shipSpaceMotion" m
-        JOIN entity e ON e."itemID"=m."itemID"
-        JOIN "character_" c ON c."characterID"=m."characterID" AND c."shipID"=e."itemID"
-        WHERE m."itemID"=$1 AND m."characterID"=$2 AND m."solarSystemID"=$3
-        AND e."ownerID"=$2 AND e."locationID"=$3 AND COALESCE(e.flag,0)=0
-        AND c."solarSystemID"=$3 AND COALESCE(c."stationID",0)=0"#,
-            &[
-                &(ship.id as i32),
-                &(ship.pilot.char_id as i32),
-                &(system as i32),
-            ],
-        )
-        .await?;
-    let Some(row) = row else {
+) -> Result<bool, StoreError> {
+    let (ship_id, pilot) = (ship.id, ship.pilot.char_id);
+    let row = ctx.store.read(|db| {
+        let m = db.table("shipSpaceMotion").get_id(ship_id)?;
+        if m.int("characterID") != Some(pilot) || m.int("solarSystemID") != Some(system) {
+            return None;
+        }
+        let e = db.table("entity").get_id(ship_id)?;
+        if e.int("ownerID") != Some(pilot) || e.int("locationID") != Some(system) || e.int("flag").unwrap_or(0) != 0 {
+            return None;
+        }
+        let c = db.table("character_").get_id(pilot)?;
+        if c.int("shipID") != Some(ship_id) || c.int("solarSystemID") != Some(system) || c.int("stationID").unwrap_or(0) != 0 {
+            return None;
+        }
+        Some((m.text("state")?.to_string(), m.int("tick")?, m.int("savedAt")?))
+    });
+    let Some((raw, tick, saved_at)) = row else {
         return Ok(false);
     };
-    let raw: String = row.get(0);
     let snapshot = if raw.len() <= 16_384 {
         serde_json::from_str::<Snapshot>(&raw).ok()
     } else {
         None
     };
     let now = combat::now_ms();
-    let saved_at: i64 = row.get(2);
     let Some(snapshot) =
-        snapshot.filter(|m| m.motion.tick == row.get::<_, i64>(1) && saved_at >= 0 && saved_at <= now)
+        snapshot.filter(|m| m.motion.tick == tick && saved_at >= 0 && saved_at <= now)
     else {
         warn!(
             ship = ship.id,
@@ -263,10 +256,16 @@ pub async fn restore(
         return Ok(false);
     }
     if let Some(fighter) = ship.fight.as_mut() {
-        for row in db.query(r#"SELECT "attributeID",COALESCE("valueFloat","valueInt"::float8) FROM entity_attributes
-            WHERE "itemID"=$1 AND "attributeID" IN (18,264)"#,&[&(ship.id as i32)]).await? {
-            let Some(value)=row.get::<_,Option<f64>>(1).filter(|v|v.is_finite()) else { continue; };
-            match row.get::<_,i32>(0) {
+        let stored: Vec<(i64, Option<f64>)> = ctx.store.read(|db| {
+            db.table("entity_attributes")
+                .find(&["itemID"], &[Value::Int(ship_id)])
+                .filter(|r| matches!(r.int("attributeID"), Some(18 | 264)))
+                .map(|r| (r.int("attributeID").unwrap_or(0), r.float("valueFloat").or(r.float("valueInt"))))
+                .collect()
+        });
+        for (attribute, value) in stored {
+            let Some(value)=value.filter(|v|v.is_finite()) else { continue; };
+            match attribute as i32 {
                 combat::attr::CHARGE=>fighter.vitals.capacitor.set(saved_at,value),
                 combat::attr::SHIELD_CHARGE=>fighter.vitals.shield.set(saved_at,value),
                 _=>{}

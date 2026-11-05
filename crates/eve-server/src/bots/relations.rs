@@ -26,7 +26,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use eve_marshal::Value;
-use tokio_postgres::Client;
 use tracing::{error, info};
 
 use super::behaviour::{self, Activity, Atlas, Bot, Role};
@@ -34,7 +33,7 @@ use super::politics::Politics;
 use super::presence::Identity;
 use crate::ballpark::Pilot;
 use crate::combat::Rng;
-use crate::svc::rows::{float, int, text};
+use crate::store::{Db, Sets, Store, StoreError, Tx, Value as Field};
 
 pub const HOSTILE: u32 = 1;
 pub const BOUNTY: u32 = 2;
@@ -387,64 +386,64 @@ impl Relations {
 
 // ---- the database ------------------------------------------------------------------------------
 
-pub async fn load(db: &Client) -> Result<Relations, tokio_postgres::Error> {
+pub fn load(db: &Db) -> Relations {
     let mut r = Relations::new();
-    for row in db.query(r#"SELECT "sideID", "charID", "heat", "favor", "flags" FROM "botRelations""#, &[]).await? {
-        let rel = Rel { heat: float(&row, 2).unwrap_or(0.0) as f32, favor: float(&row, 3).unwrap_or(0.0) as f32, flags: int(&row, 4).unwrap_or(0) as u32 };
-        r.map.insert((int(&row, 0).unwrap_or(0) as i32, int(&row, 1).unwrap_or(0) as i32), rel);
+    for row in db.table("botRelations").rows() {
+        let rel = Rel { heat: row.float("heat").unwrap_or(0.0) as f32, favor: row.float("favor").unwrap_or(0.0) as f32, flags: row.int("flags").unwrap_or(0) as u32 };
+        r.map.insert((row.int("sideID").unwrap_or(0) as i32, row.int("charID").unwrap_or(0) as i32), rel);
     }
-    Ok(r)
+    r
 }
 
-pub async fn flush(r: &mut Relations, db: &Client) -> Result<(), tokio_postgres::Error> {
+pub async fn flush(r: &mut Relations, store: &Store) -> Result<(), StoreError> {
     if r.dirty.is_empty() {
         return Ok(());
     }
     let keys: Vec<(i32, i32)> = r.dirty.drain().collect();
     let (kept, gone): (Vec<(i32, i32)>, Vec<(i32, i32)>) = keys.into_iter().partition(|k| r.map.contains_key(k));
     let now = crate::bulkdata::filetime_now();
+    let key = |k: &(i32, i32)| [("sideID", Field::Int(i64::from(k.0))), ("charID", Field::Int(i64::from(k.1)))];
     if !kept.is_empty() {
-        let sides: Vec<i32> = kept.iter().map(|k| k.0).collect();
-        let chars: Vec<i32> = kept.iter().map(|k| k.1).collect();
-        let heat: Vec<f32> = kept.iter().map(|k| r.map[k].heat).collect();
-        let favor: Vec<f32> = kept.iter().map(|k| r.map[k].favor).collect();
-        let flags: Vec<i32> = kept.iter().map(|k| r.map[k].flags as i32).collect();
-        db.execute(
-            r#"INSERT INTO "botRelations" ("sideID","charID","heat","favor","flags","updatedAt")
-               SELECT u.s, u.c, u.h, u.f, u.fl, $6::bigint FROM unnest($1::int[], $2::int[], $3::real[], $4::real[], $5::int[]) AS u(s, c, h, f, fl)
-               ON CONFLICT ("sideID","charID") DO UPDATE SET "heat" = EXCLUDED."heat", "favor" = EXCLUDED."favor",
-                      "flags" = EXCLUDED."flags", "updatedAt" = EXCLUDED."updatedAt""#,
-            &[&sides, &chars, &heat, &favor, &flags, &now],
-        )
-        .await?;
+        store.write(|tx| -> Result<(), StoreError> {
+            for k in &kept {
+                let rel = &r.map[k];
+                let values = [
+                    ("heat", Field::Float(f64::from(rel.heat))),
+                    ("favor", Field::Float(f64::from(rel.favor))),
+                    ("flags", Field::Int(i64::from(rel.flags as i32))),
+                    ("updatedAt", Field::Int(now)),
+                ];
+                let row: Vec<(&str, Field)> = key(k).into_iter().chain(values.iter().cloned()).collect();
+                tx.upsert("botRelations", &["sideID", "charID"], &row, &values)?;
+            }
+            Ok(())
+        })?;
     }
     if !gone.is_empty() {
-        let sides: Vec<i32> = gone.iter().map(|k| k.0).collect();
-        let chars: Vec<i32> = gone.iter().map(|k| k.1).collect();
-        db.execute(
-            r#"DELETE FROM "botRelations" r USING unnest($1::int[], $2::int[]) AS u(s, c) WHERE r."sideID" = u.s AND r."charID" = u.c"#,
-            &[&sides, &chars],
-        )
-        .await?;
+        store.write(|tx| -> Result<(), StoreError> {
+            for k in &gone {
+                tx.delete_where("botRelations", &["sideID", "charID"], &key(k).map(|(_, v)| v))?;
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
 
 /// A side's executor corporation (the side itself, for a corporation) and
 /// that corporation's CEO.
-async fn leader(db: &Client, side: i32) -> Option<(i32, i32)> {
-    let sql = r#"SELECT co."corporationID", co."ceoID" FROM "corporation" co
-                  WHERE co."corporationID" = COALESCE((SELECT "executorCorpID" FROM alliances WHERE "allianceID" = $1), $1)"#;
-    let r = db.query_opt(sql, &[&side]).await.ok().flatten()?;
-    Some((int(&r, 0)? as i32, int(&r, 1)? as i32))
+fn leader(db: &Db, side: i32) -> Option<(i32, i32)> {
+    let corp = db.table("alliances").get_id(i64::from(side)).and_then(|a| a.int("executorCorpID")).unwrap_or(i64::from(side));
+    let r = db.table("corporation").get_id(corp)?;
+    Some((r.int("corporationID")? as i32, r.int("ceoID")? as i32))
 }
 
-async fn owner_name(db: &Client, id: i32) -> String {
-    let sql = r#"SELECT COALESCE((SELECT "allianceName" FROM alliances WHERE "allianceID" = $1),
-                                 (SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $1),
-                                 (SELECT "characterName" FROM "character_" WHERE "characterID" = $1),
-                                 (SELECT "solarSystemName" FROM "mapSolarSystems" WHERE "solarSystemID" = $1))"#;
-    db.query_opt(sql, &[&id]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_else(|| id.to_string())
+fn owner_name(db: &Db, id: i32) -> String {
+    let id64 = i64::from(id);
+    [("alliances", "allianceName"), ("corporation", "corporationName"), ("character_", "characterName"), ("mapSolarSystems", "solarSystemName")]
+        .iter()
+        .find_map(|(table, column)| db.table(table).get_id(id64).and_then(|r| r.text(column).map(String::from)))
+        .unwrap_or_else(|| id.to_string())
 }
 
 fn isk(amount: f64) -> String {
@@ -462,7 +461,7 @@ fn isk(amount: f64) -> String {
 
 /// Carries out what the relations called for: standings, bounties, wars,
 /// mercenary pay and mail.
-pub async fn act(r: &mut Relations, db: &Client, db_url: &str, world: &crate::world::World) {
+pub async fn act(r: &mut Relations, store: &Store, world: &crate::world::World) {
     if r.deeds.is_empty() {
         return;
     }
@@ -472,25 +471,25 @@ pub async fn act(r: &mut Relations, db: &Client, db_url: &str, world: &crate::wo
         let done = match deed {
             Deed::Standing { side, player, value } => {
                 standings_changed = true;
-                set_standing(db, side, player, value).await
+                set_standing(store, side, player, value).await
             }
-            Deed::Bounty { side, player, amount } => bounty(db, side, player, amount).await,
-            Deed::War { side, player } => match declare(db, side, player).await {
+            Deed::Bounty { side, player, amount } => bounty(store, side, player, amount).await,
+            Deed::War { side, player } => match declare(store, side, player).await {
                 Ok(Some((against, ceo))) => {
-                    let (who, them) = (owner_name(db, side).await, owner_name(db, against).await);
+                    let (who, them) = store.read(|db| (owner_name(db, side), owner_name(db, against)));
                     r.news.push((crate::bulkdata::filetime_now(), format!("{who} declared war on {them}")));
-                    mail(db, world, Sender::Leader(side), ceo, Letter::War { side }).await;
+                    mail(store, world, Sender::Leader(side), ceo, Letter::War { side }).await;
                     Ok(())
                 }
                 Ok(None) => Ok(()),
                 Err(e) => Err(e),
             },
             Deed::Pay { side, player, amount, .. } => {
-                pay(db, db_url, world, side, player, amount).await;
+                pay(store, world, side, player, amount).await;
                 Ok(())
             }
             Deed::Mail { from, player, kind } => {
-                mail(db, world, from, player, kind).await;
+                mail(store, world, from, player, kind).await;
                 Ok(())
             }
         };
@@ -499,44 +498,49 @@ pub async fn act(r: &mut Relations, db: &Client, db_url: &str, world: &crate::wo
         }
     }
     if standings_changed {
-        crate::guard::refresh_standings(db).await;
+        store.read(crate::guard::refresh_standings);
     }
 }
 
-async fn set_standing(db: &Client, side: i32, player: i32, value: f64) -> Result<(), tokio_postgres::Error> {
-    if value == 0.0 {
-        db.execute(r#"DELETE FROM "ownerStandings" WHERE "fromID" = $1 AND "toID" = $2"#, &[&side, &player]).await?;
-    } else {
-        let reason = if value < 0.0 { "Killed our pilots" } else { "Fought our enemies" };
-        db.execute(
-            r#"INSERT INTO "ownerStandings" ("fromID","toID","standing","reason","setAt") VALUES ($1,$2,$3,$4,$5)
-               ON CONFLICT ("fromID","toID") DO UPDATE SET "standing" = EXCLUDED."standing", "reason" = EXCLUDED."reason", "setAt" = EXCLUDED."setAt""#,
-            &[&side, &player, &value, &reason, &crate::bulkdata::filetime_now()],
-        )
-        .await?;
-    }
+async fn set_standing(store: &Store, side: i32, player: i32, value: f64) -> Result<(), StoreError> {
+    let key = [Field::Int(i64::from(side)), Field::Int(i64::from(player))];
+    store.write(|tx| -> Result<(), StoreError> {
+        if value == 0.0 {
+            tx.delete_where("ownerStandings", &["fromID", "toID"], &key)?;
+        } else {
+            let reason = if value < 0.0 { "Killed our pilots" } else { "Fought our enemies" };
+            let set = [("standing", Field::Float(value)), ("reason", Field::Text(reason.into())), ("setAt", Field::Int(crate::bulkdata::filetime_now()))];
+            let row: Vec<(&str, Field)> = [("fromID", key[0].clone()), ("toID", key[1].clone())].into_iter().chain(set.iter().cloned()).collect();
+            tx.upsert("ownerStandings", &["fromID", "toID"], &row, &set)?;
+        }
+        Ok(())
+    })?;
     info!("bots: {side}'s standing to {player} is now {value}");
     Ok(())
 }
 
 /// A bounty from the side's leader, paid out of its executor's wallet (as
 /// much as it has, up to `amount`).
-async fn bounty(db: &Client, side: i32, player: i32, amount: f64) -> Result<(), tokio_postgres::Error> {
+async fn bounty(store: &Store, side: i32, player: i32, amount: f64) -> Result<(), StoreError> {
     if !amount.is_finite() || amount<100_000.0 {return Ok(())}
-    let Some((exec, ceo)) = leader(db, side).await else { return Ok(()) };
-    let paid: f64 = db
-        .query_opt(
-            r#"WITH target AS (SELECT "characterID" FROM "character_" WHERE "characterID"=$3 FOR UPDATE),
-                    old AS (SELECT "balance" FROM "corporation" WHERE "corporationID"=$1 AND "balance">=100000 AND EXISTS (SELECT 1 FROM target) FOR UPDATE),
-                    paid AS (UPDATE "corporation" c SET "balance"=c."balance"-LEAST(old."balance",$2) FROM old WHERE c."corporationID"=$1 RETURNING LEAST(old."balance",$2) AS amount),
-                    placed AS (INSERT INTO bounties ("characterID","ownerID",bounty,"placedAt") SELECT $3,$4,amount,$5 FROM paid
-                        ON CONFLICT ("characterID","ownerID") DO UPDATE SET bounty=bounties.bounty+EXCLUDED.bounty,"placedAt"=EXCLUDED."placedAt")
-               UPDATE "character_" c SET bounty=c.bounty+paid.amount FROM paid WHERE c."characterID"=$3 RETURNING paid.amount"#,
-            &[&exec, &amount, &player, &ceo, &crate::bulkdata::filetime_now()],
-        )
-        .await?
-        .and_then(|r| float(&r, 0))
-        .unwrap_or(0.0);
+    let Some((exec, ceo)) = store.read(|db| leader(db, side)) else { return Ok(()) };
+    let paid = store.write(|tx| -> Result<f64, StoreError> {
+        let Some(target) = tx.table("character_").get_id(i64::from(player)).map(|c| (c.id, c.float("bounty").unwrap_or(0.0))) else { return Ok(0.0) };
+        let Some((wallet, balance)) = tx.table("corporation").get_id(i64::from(exec)).map(|c| (c.id, c.float("balance").unwrap_or(0.0))) else { return Ok(0.0) };
+        if balance < 100_000.0 {
+            return Ok(0.0);
+        }
+        let paid = balance.min(amount);
+        tx.update("corporation", wallet, &[("balance", Field::Float(balance - paid))])?;
+        let now = crate::bulkdata::filetime_now();
+        let on = [Field::Int(i64::from(player)), Field::Int(i64::from(ceo))];
+        let placed = tx.table("bounties").get(&on).map(|b| b.float("bounty").unwrap_or(0.0));
+        let row = [("characterID", on[0].clone()), ("ownerID", on[1].clone()), ("bounty", Field::Float(paid)), ("placedAt", Field::Int(now))];
+        let update = [("bounty", Field::Float(placed.unwrap_or(0.0) + paid)), ("placedAt", Field::Int(now))];
+        tx.upsert("bounties", &["characterID", "ownerID"], &row, &update)?;
+        tx.update("character_", target.0, &[("bounty", Field::Float(target.1 + paid))])?;
+        Ok(paid)
+    })?;
     if paid < 100_000.0 {
         return Ok(());
     }
@@ -544,51 +548,70 @@ async fn bounty(db: &Client, side: i32, player: i32, amount: f64) -> Result<(), 
     Ok(())
 }
 
+/// The NPC corporations (crpNPCCorporations), which are no player's.
+fn npc_corporations() -> HashSet<i64> {
+    crate::sde::table("crpNPCCorporations").rows().filter_map(|n| n.int("corporationID")).collect()
+}
+
 /// War on the player's corporation (or its alliance), if it is a player
 /// one and the side is not at war with it already. Returns who it is
 /// against and their leader's CEO.
-async fn declare(db: &Client, side: i32, player: i32) -> Result<Option<(i32, i32)>, tokio_postgres::Error> {
-    let sql = r#"SELECT co."corporationID", COALESCE(NULLIF(co."allianceID", 0), co."corporationID"), co."ceoID"
-                   FROM "character_" c JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                  WHERE c."characterID" = $1
-                    AND NOT EXISTS (SELECT 1 FROM "crpNPCCorporations" n WHERE n."corporationID" = co."corporationID")
-                    AND NOT EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = co."corporationID")"#;
-    let Some(row) = db.query_opt(sql, &[&player]).await? else { return Ok(None) };
-    let (against, ceo) = (int(&row, 1).unwrap_or(0) as i32, int(&row, 2).unwrap_or(0) as i32);
-    let existing = db
-        .query_opt(
-            r#"SELECT 1 FROM "crpWars" WHERE "retracted" IS NULL AND (("declaredByID" = $1 AND "againstID" = $2) OR ("declaredByID" = $2 AND "againstID" = $1))"#,
-            &[&side, &against],
-        )
-        .await?;
-    if existing.is_some() {
-        return Ok(None);
-    }
-    let Some((exec, _)) = leader(db, side).await else { return Ok(None) };
-    let paid = db.execute(r#"UPDATE "corporation" SET "balance" = "balance" - $2 WHERE "corporationID" = $1 AND "balance" >= $2"#, &[&exec, &WAR_COST]).await?;
-    if paid == 0 {
-        return Ok(None);
-    }
-    let now = crate::bulkdata::filetime_now();
-    db.execute(
-        r#"INSERT INTO "crpWars" ("warID","declaredByID","againstID","timeDeclared","timeFinished","mutual") VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, 0)"#,
-        &[&side, &against, &now, &(now + WAR_DAYS * 86_400 * SECOND_FT)],
-    )
-    .await?;
-    crate::svc::war::refresh(db).await;
+async fn declare(store: &Store, side: i32, player: i32) -> Result<Option<(i32, i32)>, StoreError> {
+    let npc = npc_corporations();
+    let declared = store.write(|tx| -> Result<Option<(i32, i32)>, StoreError> {
+        let db = tx.db();
+        let corp = db
+            .table("character_")
+            .get_id(i64::from(player))
+            .and_then(|c| db.table("corporation").get_id(c.int("corporationID")?))
+            .filter(|co| co.int("corporationID").is_some_and(|id| !npc.contains(&id) && db.table("botGroups").get_id(id).is_none()));
+        let Some(co) = corp else { return Ok(None) };
+        let corp_id = co.int("corporationID").unwrap_or(0);
+        let against = co.int("allianceID").filter(|a| *a != 0).unwrap_or(corp_id) as i32;
+        let ceo = co.int("ceoID").unwrap_or(0) as i32;
+        let wars = db.table("crpWars");
+        let between = |x: i32, y: i32| {
+            wars.find(&["declaredByID"], &[Field::Int(i64::from(x))]).any(|w| w.int("retracted").is_none() && w.int("againstID") == Some(i64::from(y)))
+        };
+        if between(side, against) || between(against, side) {
+            return Ok(None);
+        }
+        let Some((exec, _)) = leader(db, side) else { return Ok(None) };
+        let Some((wallet, balance)) = db.table("corporation").get_id(i64::from(exec)).map(|c| (c.id, c.float("balance").unwrap_or(0.0))) else { return Ok(None) };
+        if balance < WAR_COST {
+            return Ok(None);
+        }
+        tx.update("corporation", wallet, &[("balance", Field::Float(balance - WAR_COST))])?;
+        let now = crate::bulkdata::filetime_now();
+        let id = tx.nextval("dyn_id_seq")?;
+        tx.insert(
+            "crpWars",
+            &[
+                ("warID", Field::Int(id)),
+                ("declaredByID", Field::Int(i64::from(side))),
+                ("againstID", Field::Int(i64::from(against))),
+                ("timeDeclared", Field::Int(now)),
+                ("timeFinished", Field::Int(now + WAR_DAYS * 86_400 * SECOND_FT)),
+                ("mutual", Field::Int(0)),
+            ],
+        )?;
+        Ok(Some((against, ceo)))
+    })?;
+    let Some((against, ceo)) = declared else { return Ok(None) };
+    store.read(crate::svc::war::refresh);
     info!("bots: {side} declared war on {against} over {player}");
     Ok(Some((against, ceo)))
 }
 
 /// Mercenary pay from the side's executor to the player, if it can afford it.
-async fn pay(db: &Client, db_url: &str, world: &crate::world::World, side: i32, player: i32, amount: f64) {
+async fn pay(store: &Store, world: &crate::world::World, side: i32, player: i32, amount: f64) {
     use crate::svc::wallet::{move_cash, Payment, Transfer};
-    let Some((exec, _)) = leader(db, side).await else { return };
+    let Some((exec, _)) = store.read(|db| leader(db, side)) else { return };
     let payment = Payment { payer: exec as i64, payee: Some(player as i64), amount, ref_type: REF_PLAYER_DONATION, arg_id1: "", reason: "Mercenary contract" };
-    match move_cash(db_url, payment).await {
+    match move_cash(store, payment).await {
         Ok(()) => {
             info!("bots: {side} paid {player} {amount} ISK for a kill");
-            tell_balance(db, world, player).await;
+            tell_balance(store, world, player);
         }
         Err(Transfer::NotEnough { .. }) | Err(Transfer::NoSuchOwner) => {}
         Err(Transfer::Db(e)) => error!("bots: mercenary pay: {}", crate::logging::chain(&e)),
@@ -596,13 +619,8 @@ async fn pay(db: &Client, db_url: &str, world: &crate::world::World, side: i32, 
 }
 
 /// A player's wallet changed: their client hears its new balance.
-pub async fn tell_balance(db: &Client, world: &crate::world::World, player: i32) {
-    let balance = db
-        .query_opt(r#"SELECT "balance" FROM "character_" WHERE "characterID" = $1"#, &[&player])
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| float(&r, 0));
+pub fn tell_balance(store: &Store, world: &crate::world::World, player: i32) {
+    let balance = store.read(|db| db.table("character_").get_id(i64::from(player)).and_then(|r| r.float("balance")));
     if let Some(balance) = balance {
         let w = world.lock();
         let event = Value::Tuple(vec![Value::bytes("cash"), Value::Int(player as i64), Value::Double(balance)]);
@@ -611,55 +629,57 @@ pub async fn tell_balance(db: &Client, world: &crate::world::World, player: i32)
 }
 
 /// An EVE mail to a player.
-pub async fn mail(db: &Client, world: &crate::world::World, from: Sender, player: i32, kind: Letter) {
+pub async fn mail(store: &Store, world: &crate::world::World, from: Sender, player: i32, kind: Letter) {
     let sender = match from {
         Sender::Pilot(c) => c,
-        Sender::Leader(side) => match leader(db, side).await {
+        Sender::Leader(side) => match store.read(|db| leader(db, side)) {
             Some((_, ceo)) => ceo,
             None => return,
         },
     };
-    let name = owner_name(db, player).await;
-    let (subject, body) = match kind {
-        Letter::Revenge { system } => {
-            let place = owner_name(db, system).await;
-            (
-                "You'll regret that".to_string(),
-                format!("{name},\n\nThat was my ship you blew up in {place}. I know your name now, and so do my friends. Watch the gates.\n"),
-            )
+    let (subject, body) = store.read(|db| {
+        let name = owner_name(db, player);
+        match kind {
+            Letter::Revenge { system } => {
+                let place = owner_name(db, system);
+                (
+                    "You'll regret that".to_string(),
+                    format!("{name},\n\nThat was my ship you blew up in {place}. I know your name now, and so do my friends. Watch the gates.\n"),
+                )
+            }
+            Letter::Hostile { side } => {
+                let who = owner_name(db, side);
+                ("Hostile".to_string(), format!("{name},\n\nYou have killed enough of our pilots. As of today you are hostile to {who}: our ships will engage you on sight and our towers will fire on you.\n"))
+            }
+            Letter::Bounty { side, amount } => {
+                let who = owner_name(db, side);
+                ("A price on your head".to_string(), format!("{name},\n\n{who} has placed a bounty of {} on you. Every pilot in New Eden can collect it.\n", isk(amount)))
+            }
+            Letter::War { side } => {
+                let who = owner_name(db, side);
+                (
+                    format!("War declared by {who}"),
+                    format!("{name},\n\nOne of your members has been killing our pilots, and you have done nothing about it. {who} has declared war on you. It is in force from tomorrow and lasts a week.\n"),
+                )
+            }
+            Letter::Contract { side, enemy } => {
+                let (who, them) = (owner_name(db, side), owner_name(db, enemy));
+                (
+                    "A contract".to_string(),
+                    format!(
+                        "{name},\n\nWe have noticed what you have been doing to {them}. {who} will pay you for every ship of theirs you destroy from now on: {} for a frigate, more for bigger hulls, paid straight to your wallet. Our standing towards you is now good.\n",
+                        isk(MERC_PAY)
+                    ),
+                )
+            }
+            Letter::Invite { side } => {
+                let who = owner_name(db, side);
+                ("An invitation".to_string(), format!("{name},\n\nYou have done more for {who} than most of our members. If you want to fly with us, apply to any of our corporations; you will be accepted.\n"))
+            }
         }
-        Letter::Hostile { side } => {
-            let who = owner_name(db, side).await;
-            ("Hostile".to_string(), format!("{name},\n\nYou have killed enough of our pilots. As of today you are hostile to {who}: our ships will engage you on sight and our towers will fire on you.\n"))
-        }
-        Letter::Bounty { side, amount } => {
-            let who = owner_name(db, side).await;
-            ("A price on your head".to_string(), format!("{name},\n\n{who} has placed a bounty of {} on you. Every pilot in New Eden can collect it.\n", isk(amount)))
-        }
-        Letter::War { side } => {
-            let who = owner_name(db, side).await;
-            (
-                format!("War declared by {who}"),
-                format!("{name},\n\nOne of your members has been killing our pilots, and you have done nothing about it. {who} has declared war on you. It is in force from tomorrow and lasts a week.\n"),
-            )
-        }
-        Letter::Contract { side, enemy } => {
-            let (who, them) = (owner_name(db, side).await, owner_name(db, enemy).await);
-            (
-                "A contract".to_string(),
-                format!(
-                    "{name},\n\nWe have noticed what you have been doing to {them}. {who} will pay you for every ship of theirs you destroy from now on: {} for a frigate, more for bigger hulls, paid straight to your wallet. Our standing towards you is now good.\n",
-                    isk(MERC_PAY)
-                ),
-            )
-        }
-        Letter::Invite { side } => {
-            let who = owner_name(db, side).await;
-            ("An invitation".to_string(), format!("{name},\n\nYou have done more for {who} than most of our members. If you want to fly with us, apply to any of our corporations; you will be accepted.\n"))
-        }
-    };
+    });
     let body = body.replace('\n', "<br>");
-    if let Err(e) = crate::svc::chat::deliver(db, world, sender as i64, &[player as i64], &subject, &body).await {
+    if let Err(e) = store.write(|tx| crate::svc::chat::deliver(tx, world, sender as i64, &[player as i64], &subject, &body)) {
         error!("bots: mailing {player}: {}", crate::logging::chain(&e));
     }
 }
@@ -668,28 +688,38 @@ pub async fn mail(db: &Client, world: &crate::world::World, from: Sender, player
 
 /// Applications to bot corporations: accepted unless the applicant is
 /// hostile to the corporation's side, rejected if so.
-pub async fn answer_applications(r: &Relations, db: &Client, world: &crate::world::World, p: &Politics) -> Result<(), tokio_postgres::Error> {
-    let sql = r#"SELECT a."corporationID", a."characterID", a."applicationText", a."applicationDateTime"
-                   FROM "crpApplications" a JOIN "botGroups" g ON g."ownerID" = a."corporationID"
-                  WHERE a."status" = $1 AND a."deleted" = 0"#;
-    for row in db.query(sql, &[&APPLIED_BY_CHARACTER]).await? {
-        let (corp, char_id) = (int(&row, 0).unwrap_or(0) as i32, int(&row, 1).unwrap_or(0) as i32);
+pub async fn answer_applications(r: &Relations, store: &Store, world: &crate::world::World, p: &Politics) -> Result<(), StoreError> {
+    // (corporation, character, its text, when)
+    let applied: Vec<(i32, i32, String, i64)> = store.read(|db| {
+        let groups = db.table("botGroups");
+        db.table("crpApplications")
+            .rows()
+            .filter(|a| a.int("status") == Some(i64::from(APPLIED_BY_CHARACTER)) && a.int("deleted") == Some(0))
+            .filter(|a| a.int("corporationID").is_some_and(|c| groups.get_id(c).is_some()))
+            .map(|a| {
+                let text = a.text("applicationText").unwrap_or_default().to_string();
+                (a.int("corporationID").unwrap_or(0) as i32, a.int("characterID").unwrap_or(0) as i32, text, a.int("applicationDateTime").unwrap_or(0))
+            })
+            .collect()
+    });
+    for (corp, char_id, text, when) in applied {
         let side = p.side_of(corp).unwrap_or(corp);
         let hostile = r.get(side, char_id).flags & HOSTILE != 0;
         let (status, note) = if hostile { (REJECTED_BY_CORPORATION, "We do not take pilots who kill ours.") } else { (ACCEPTED_BY_CORPORATION, "Welcome aboard. Accept to join us.") };
-        db.execute(
-            r#"UPDATE "crpApplications" SET "status" = $3, "corporationText" = $4 WHERE "corporationID" = $1 AND "characterID" = $2"#,
-            &[&corp, &char_id, &status, &note],
-        )
-        .await?;
-        let when = int(&row, 3).unwrap_or(0);
-        let line = |s: i16| vec![Value::Int(corp as i64), Value::Int(char_id as i64), Value::text(text(&row, 2).unwrap_or_default()), Value::Long(when), Value::Int(s as i64)];
+        store.write(|tx| set_application(tx, corp, char_id, &[("status", Field::Int(i64::from(status))), ("corporationText", Field::Text(note.into()))]))?;
+        let line = |s: i16| vec![Value::Int(corp as i64), Value::Int(char_id as i64), Value::text(text.as_str()), Value::Long(when), Value::Int(s as i64)];
         let change = crate::svc::rows::change(APPLICATION_HEADER, Some(&line(APPLIED_BY_CHARACTER)), Some(&line(status)));
         let w = world.lock();
         w.notify(&w.clients_of(char_id as i64), "OnCorporationApplicationChanged", Value::Tuple(vec![Value::Int(char_id as i64), Value::Int(corp as i64), change]));
         info!("bots: corporation {corp} {} {char_id}'s application", if hostile { "turned down" } else { "accepted" });
     }
     Ok(())
+}
+
+/// Sets columns of a character's application to a corporation, if there is one.
+fn set_application(tx: &mut Tx<'_>, corp: i32, char_id: i32, sets: Sets) -> Result<(), StoreError> {
+    let Some(row) = tx.table("crpApplications").get(&[Field::Int(i64::from(corp)), Field::Int(i64::from(char_id))]).map(|a| a.id) else { return Ok(()) };
+    tx.update("crpApplications", row, sets)
 }
 
 const PITCHES: [&str; 6] = [
@@ -701,13 +731,26 @@ const PITCHES: [&str; 6] = [
     "Industrialist with my own ships. Happy to work near your headquarters.",
 ];
 
+/// Why a bot's move into a corporation did not happen.
+enum Join {
+    /// The corporation would not have it: nothing changes.
+    Refused,
+    Failed(StoreError),
+}
+
+impl From<StoreError> for Join {
+    fn from(e: StoreError) -> Join {
+        Join::Failed(e)
+    }
+}
+
 /// Bots in NPC corporations apply to player corporations now and then;
 /// those accepted join (changing corporation as a player would), move near
 /// its headquarters, and work for it. Bots a corporation let go are noticed.
 /// Returns the bots whose corporation changed.
 #[allow(clippy::too_many_arguments)]
 pub async fn recruit(
-    db: &Client,
+    store: &Store,
     world: &crate::world::World,
     atlas: &Atlas,
     p: &Politics,
@@ -715,38 +758,54 @@ pub async fn recruit(
     ids: &mut [Identity],
     by_char: &HashMap<i64, u32>,
     rng: &mut Rng,
-) -> Result<Vec<u32>, tokio_postgres::Error> {
+) -> Result<Vec<u32>, StoreError> {
     let mut moved = Vec::new();
     // Applications accepted by the corporation: the bot accepts too.
-    let sql = r#"SELECT a."corporationID", a."characterID", a."applicationText", a."applicationDateTime", co."stationID", COALESCE(co."allianceID", 0)
-                   FROM "crpApplications" a JOIN "bots" b ON b."characterID" = a."characterID"
-                   JOIN "corporation" co ON co."corporationID" = a."corporationID"
-                  WHERE a."status" = $1 AND a."deleted" = 0"#;
-    for row in db.query(sql, &[&ACCEPTED_BY_CORPORATION]).await? {
-        let (corp, char_id) = (int(&row, 0).unwrap_or(0) as i32, int(&row, 1).unwrap_or(0) as i32);
+    // (corporation, character, its text, when, headquarters, alliance)
+    let accepted: Vec<(i32, i32, String, i64, i64, i64)> = store.read(|db| {
+        let (bot_rows, corps) = (db.table("bots"), db.table("corporation"));
+        db.table("crpApplications")
+            .rows()
+            .filter(|a| a.int("status") == Some(i64::from(ACCEPTED_BY_CORPORATION)) && a.int("deleted") == Some(0))
+            .filter(|a| a.int("characterID").is_some_and(|c| bot_rows.get_id(c).is_some()))
+            .filter_map(|a| {
+                let co = corps.get_id(a.int("corporationID")?)?;
+                let text = a.text("applicationText").unwrap_or_default().to_string();
+                Some((
+                    a.int("corporationID").unwrap_or(0) as i32,
+                    a.int("characterID").unwrap_or(0) as i32,
+                    text,
+                    a.int("applicationDateTime").unwrap_or(0),
+                    co.int("stationID").unwrap_or(0),
+                    co.int("allianceID").unwrap_or(0),
+                ))
+            })
+            .collect()
+    });
+    for (corp, char_id, text, when, hq, alliance) in accepted {
         let Some(&i) = by_char.get(&(char_id as i64)) else { continue };
-        let mut client = crate::db::connect(&crate::bots::db_url()).await?;
-        let tx = client.transaction().await?;
         let now = crate::bulkdata::filetime_now();
-        let left = match crate::svc::membership::change_corporation(&tx, char_id as i64, corp as i64, 0, now).await {
-            Ok(old) => old,
-            Err(_) => continue,
+        let joined = store.write(|tx| -> Result<i64, Join> {
+            let left = crate::svc::membership::change_corporation(tx, char_id as i64, corp as i64, 0, now).map_err(|_| Join::Refused)?;
+            set_application(tx, corp, char_id, &[("status", Field::Int(i64::from(ACCEPTED_BY_CHARACTER)))])?;
+            Ok(left)
+        });
+        let left = match joined {
+            Ok(left) => left,
+            Err(Join::Refused) => continue,
+            Err(Join::Failed(e)) => return Err(e),
         };
-        tx.execute(r#"UPDATE "crpApplications" SET "status" = $3 WHERE "corporationID" = $1 AND "characterID" = $2"#, &[&corp, &char_id, &ACCEPTED_BY_CHARACTER])
-            .await?;
-        tx.commit().await?;
         crate::svc::membership::member_moved(world, char_id as i64, left, corp as i64);
-        let when = int(&row, 3).unwrap_or(0);
-        let line = |s: i16| vec![Value::Int(corp as i64), Value::Int(char_id as i64), Value::text(text(&row, 2).unwrap_or_default()), Value::Long(when), Value::Int(s as i64)];
+        let line = |s: i16| vec![Value::Int(corp as i64), Value::Int(char_id as i64), Value::text(text.as_str()), Value::Long(when), Value::Int(s as i64)];
         let change = crate::svc::rows::change(APPLICATION_HEADER, Some(&line(ACCEPTED_BY_CORPORATION)), Some(&line(ACCEPTED_BY_CHARACTER)));
         {
             let w = world.lock();
             w.notify(&w.corp_members(corp as i64), "OnCorporationApplicationChanged", Value::Tuple(vec![Value::Int(char_id as i64), Value::Int(corp as i64), change]));
         }
         ids[i as usize].corp = corp;
-        ids[i as usize].alliance = int(&row, 5).map(|a| a as i32).filter(|a| *a != 0);
+        ids[i as usize].alliance = Some(alliance as i32).filter(|a| *a != 0);
         // Home near the headquarters, if it can get there.
-        let hq = int(&row, 4).unwrap_or(0) as i32;
+        let hq = hq as i32;
         let b = &mut bots[i as usize];
         if atlas.station_system.contains_key(&hq) && atlas.route(atlas.system_of(b.home), atlas.system_of(hq)).is_some() {
             b.home = hq;
@@ -758,32 +817,56 @@ pub async fn recruit(
     // Bots their corporation let go (or that are somewhere else now).
     let watched: Vec<i32> = ids.iter().zip(bots.iter()).filter(|(id, _)| !p.corps.contains_key(&id.corp) && id.corp >= 2_000_000).map(|(_, b)| b.id).collect();
     if !watched.is_empty() {
-        let sql = r#"SELECT c."characterID", c."corporationID", COALESCE(co."allianceID", 0) FROM "character_" c
-                       JOIN "corporation" co ON co."corporationID" = c."corporationID" WHERE c."characterID" = ANY($1)"#;
-        for row in db.query(sql, &[&watched]).await? {
-            let Some(&i) = by_char.get(&int(&row, 0).unwrap_or(0)) else { continue };
-            let corp = int(&row, 1).unwrap_or(0) as i32;
+        // (character, corporation, alliance)
+        let now_in: Vec<(i64, i32, i32)> = store.read(|db| {
+            let (characters, corps) = (db.table("character_"), db.table("corporation"));
+            watched
+                .iter()
+                .filter_map(|c| {
+                    let corp = characters.get_id(i64::from(*c))?.int("corporationID")?;
+                    let co = corps.get_id(corp)?;
+                    Some((i64::from(*c), corp as i32, co.int("allianceID").unwrap_or(0) as i32))
+                })
+                .collect()
+        });
+        for (char_id, corp, alliance) in now_in {
+            let Some(&i) = by_char.get(&char_id) else { continue };
+            let alliance = Some(alliance).filter(|a| *a != 0);
             if ids[i as usize].corp != corp {
                 ids[i as usize].corp = corp;
-                ids[i as usize].alliance = int(&row, 2).map(|a| a as i32).filter(|a| *a != 0);
+                ids[i as usize].alliance = alliance;
                 moved.push(i);
             } else {
-                ids[i as usize].alliance = int(&row, 2).map(|a| a as i32).filter(|a| *a != 0);
+                ids[i as usize].alliance = alliance;
             }
         }
     }
     // New applications.
-    let sql = r#"SELECT co."corporationID", r."regionID",
-                        (SELECT count(*) FROM "crpApplications" a JOIN "bots" b ON b."characterID" = a."characterID"
-                          WHERE a."corporationID" = co."corporationID" AND a."status" IN (0, 1, 5, 6) AND a."deleted" = 0)
-                   FROM "corporation" co
-                   JOIN "staStations" st ON st."stationID" = co."stationID"
-                   JOIN "mapSolarSystems" r ON r."solarSystemID" = st."solarSystemID"
-                  WHERE co."deleted" = 0 AND co."memberCount" > 0
-                    AND NOT EXISTS (SELECT 1 FROM "crpNPCCorporations" n WHERE n."corporationID" = co."corporationID")
-                    AND NOT EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = co."corporationID")"#;
-    for row in db.query(sql, &[]).await? {
-        let (corp, region, pending) = (int(&row, 0).unwrap_or(0) as i32, int(&row, 1).unwrap_or(0) as i32, int(&row, 2).unwrap_or(0));
+    let npc = npc_corporations();
+    // (corporation, its headquarters' region, applications from bots waiting)
+    let corps: Vec<(i32, i32, i64)> = store.read(|db| {
+        let (stations, systems, groups, bot_rows) = (db.table("staStations"), db.table("mapSolarSystems"), db.table("botGroups"), db.table("bots"));
+        let applications = db.table("crpApplications");
+        db.table("corporation")
+            .rows()
+            .filter(|co| co.int("deleted") == Some(0) && co.int("memberCount").is_some_and(|n| n > 0))
+            .filter_map(|co| {
+                let id = co.int("corporationID")?;
+                if npc.contains(&id) || groups.get_id(id).is_some() {
+                    return None;
+                }
+                let system = stations.get_id(co.int("stationID")?)?.int("solarSystemID")?;
+                let region = systems.get_id(system)?.int("regionID").unwrap_or(0);
+                let pending = applications
+                    .find(&["corporationID"], &[Field::Int(id)])
+                    .filter(|a| matches!(a.int("status"), Some(0 | 1 | 5 | 6)) && a.int("deleted") == Some(0))
+                    .filter(|a| a.int("characterID").is_some_and(|c| bot_rows.get_id(c).is_some()))
+                    .count() as i64;
+                Some((id as i32, region as i32, pending))
+            })
+            .collect()
+    });
+    for (corp, region, pending) in corps {
         if pending >= PENDING_MAX || rng.unit() >= APPLY_CHANCE {
             continue;
         }
@@ -797,13 +880,16 @@ pub async fn recruit(
         let i = pool[rng.below(pool.len())];
         let pitch = PITCHES[rng.below(PITCHES.len())];
         let now = crate::bulkdata::filetime_now();
-        db.execute(
-            r#"INSERT INTO "crpApplications" ("corporationID","characterID","applicationText","applicationDateTime","status","deleted")
-               VALUES ($1,$2,$3,$4,$5,0)
-               ON CONFLICT ("corporationID","characterID") DO UPDATE SET "applicationText" = $3, "applicationDateTime" = $4, "status" = $5, "corporationText" = '', "deleted" = 0"#,
-            &[&corp, &bots[i as usize].id, &pitch, &now, &APPLIED_BY_CHARACTER],
-        )
-        .await?;
+        store.write(|tx| {
+            let fresh = [("applicationText", Field::Text(pitch.into())), ("applicationDateTime", Field::Int(now)), ("status", Field::Int(i64::from(APPLIED_BY_CHARACTER)))];
+            let row: Vec<(&str, Field)> = [("corporationID", Field::Int(i64::from(corp))), ("characterID", Field::Int(i64::from(bots[i as usize].id)))]
+                .into_iter()
+                .chain(fresh.iter().cloned())
+                .chain([("deleted", Field::Int(0))])
+                .collect();
+            let update: Vec<(&str, Field)> = fresh.iter().cloned().chain([("corporationText", Field::Text("".into())), ("deleted", Field::Int(0))]).collect();
+            tx.upsert("crpApplications", &["corporationID", "characterID"], &row, &update)
+        })?;
         let line = vec![Value::Int(corp as i64), Value::Int(bots[i as usize].id as i64), Value::text(pitch), Value::Long(now), Value::Int(APPLIED_BY_CHARACTER as i64)];
         let change = crate::svc::rows::change(APPLICATION_HEADER, None, Some(&line));
         let w = world.lock();
@@ -818,20 +904,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn bounty_only_debits_when_a_valid_minimum_bounty_is_placed() {
         let fixture=crate::test_support::Database::load().await;
+        let store=&fixture.store;
         let corp=fixture.id().await; let target=fixture.id().await; let absent=fixture.id().await;
-        fixture.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName",balance,"ceoID") VALUES ($1,$2,50000,$3)"#,&[&corp,&format!("Bounty treasury {corp}"),&target]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName") VALUES ($1,$2)"#,&[&target,&format!("Bounty target {target}")]).await.unwrap();
-        bounty(&fixture.db,corp,target,1_000_000.0).await.unwrap();
-        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap().get(0);assert_eq!(balance,50_000.0);
-        fixture.db.execute(r#"UPDATE corporation SET balance=200000 WHERE "corporationID"=$1"#,&[&corp]).await.unwrap();
-        bounty(&fixture.db,corp,absent,1_000_000.0).await.unwrap();
-        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap().get(0);assert_eq!(balance,200_000.0);
-        bounty(&fixture.db,corp,target,1_000_000.0).await.unwrap();
-        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#,&[&corp]).await.unwrap().get(0);assert_eq!(balance,0.0);
-        let placed:f64=fixture.db.query_one(r#"SELECT bounty FROM "character_" WHERE "characterID"=$1"#,&[&target]).await.unwrap().get(0);assert_eq!(placed,200_000.0);
+        store.write(|tx|tx.insert("corporation",&[("corporationID",Field::Int(corp.into())),("corporationName",Field::Text(format!("Bounty treasury {corp}").into())),("balance",Field::Float(50_000.0)),("ceoID",Field::Int(target.into()))])).unwrap();
+        store.write(|tx|tx.insert("character_",&[("characterID",Field::Int(target.into())),("characterName",Field::Text(format!("Bounty target {target}").into()))])).unwrap();
+        let balance=|id:i32|store.read(|db|db.table("corporation").get_id(id.into()).and_then(|r|r.float("balance")).unwrap());
+        let set_balance=|id:i32,v:f64|store.write(|tx|{let row=tx.table("corporation").get_id(id.into()).unwrap().id;tx.update("corporation",row,&[("balance",Field::Float(v))])}).unwrap();
+        bounty(store,corp,target,1_000_000.0).await.unwrap();
+        assert_eq!(balance(corp),50_000.0);
+        set_balance(corp,200_000.0);
+        bounty(store,corp,absent,1_000_000.0).await.unwrap();
+        assert_eq!(balance(corp),200_000.0);
+        bounty(store,corp,target,1_000_000.0).await.unwrap();
+        assert_eq!(balance(corp),0.0);
+        let placed=store.read(|db|db.table("character_").get_id(target.into()).and_then(|r|r.float("bounty")).unwrap());assert_eq!(placed,200_000.0);
     }
 
     fn kill(class: u8) -> Kill {

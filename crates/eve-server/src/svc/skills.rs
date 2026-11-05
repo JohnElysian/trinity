@@ -3,6 +3,7 @@ use tracing::{error, warn};
 
 use crate::items::{ItemTxn, NewItem};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, StoreError};
 use crate::svc::{
     fitting,
     moves::{self, MoveError},
@@ -25,31 +26,25 @@ const ATTR_SKILL_POINTS: i32 = 276;
 const ATTR_SKILL_LEVEL: i32 = 280;
 
 /// The character's trained level in each of `types` (missing ones are 0).
-/// Works on a client or inside a transaction.
-pub async fn levels(
-    db: &impl tokio_postgres::GenericClient,
+/// Works on the data as read or inside a transaction.
+pub fn levels(
+    db: &Db,
     char_id: i64,
     types: &[i32],
-) -> Result<std::collections::HashMap<i32, i64>, tokio_postgres::Error> {
-    let rows = db
-        .query(
-            r#"SELECT e."typeID", max(coalesce(a."valueInt", a."valueFloat"::bigint))
-                 FROM entity e
-                 JOIN entity_attributes a ON a."itemID" = e."itemID" AND a."attributeID" = $3
-                WHERE e."ownerID" = $1 AND e."flag" IN ($4, $5) AND e."typeID" = ANY($2)
-                GROUP BY e."typeID""#,
-            &[
-                &(char_id as i32),
-                &types,
-                &ATTR_SKILL_LEVEL,
-                &FLAG_SKILL,
-                &FLAG_SKILL_IN_TRAINING,
-            ],
-        )
-        .await?;
+) -> Result<std::collections::HashMap<i32, i64>, StoreError> {
+    let entity = db.table("entity");
+    let attributes = db.table("entity_attributes");
     let mut out: std::collections::HashMap<i32, i64> = types.iter().map(|t| (*t, 0)).collect();
-    for r in rows {
-        out.insert(r.get(0), r.get::<_, Option<i64>>(1).unwrap_or(0));
+    for &type_id in types {
+        // The highest level among the character's skills of this type; a
+        // float level counts as `::bigint` makes it whole.
+        let level = entity
+            .find(&["ownerID", "typeID"], &[store::Value::Int(char_id), store::Value::Int(i64::from(type_id))])
+            .filter(|e| matches!(e.int("flag"), Some(f) if f == i64::from(FLAG_SKILL) || f == i64::from(FLAG_SKILL_IN_TRAINING)))
+            .filter_map(|e| attributes.get(&[e.value("itemID").clone(), store::Value::Int(i64::from(ATTR_SKILL_LEVEL))]))
+            .filter_map(|a| a.int("valueInt").or_else(|| a.float("valueFloat").map(|v| v.round_ties_even() as i64)))
+            .max();
+        out.insert(type_id, level.unwrap_or(0));
     }
     Ok(out)
 }
@@ -106,21 +101,19 @@ async fn start_training(ctx: &Ctx<'_>, skill_id: i64) -> Value {
         return Value::None;
     }
 
-    let halt = r#"UPDATE "entity" SET "flag" = $1
-                   WHERE "ownerID" = $2 AND "flag" = $3 AND "itemID" <> $4"#;
-    if let Err(e) = ctx
-        .db
-        .execute(
-            halt,
-            &[
-                &FLAG_SKILL,
-                &(char_id as i32),
-                &FLAG_SKILL_IN_TRAINING,
-                &(skill_id as i32),
-            ],
-        )
-        .await
-    {
+    let halt = ctx.store.write(|tx| {
+        let training: Vec<store::RowId> = tx
+            .table("entity")
+            .find(&["ownerID"], &[store::Value::Int(char_id)])
+            .filter(|e| e.int("flag") == Some(i64::from(FLAG_SKILL_IN_TRAINING)) && e.int("itemID") != Some(skill_id))
+            .map(|e| e.id)
+            .collect();
+        for id in training {
+            tx.update("entity", id, &[("flag", store::Value::Int(i64::from(FLAG_SKILL)))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = halt {
         error!(
             "CharStartTrainingSkill (halt): {err}",
             err = crate::logging::chain(&e)
@@ -128,19 +121,14 @@ async fn start_training(ctx: &Ctx<'_>, skill_id: i64) -> Value {
         return Value::None;
     }
 
-    let start = r#"UPDATE "entity" SET "flag" = $1 WHERE "itemID" = $2 AND "ownerID" = $3"#;
-    if let Err(e) = ctx
-        .db
-        .execute(
-            start,
-            &[
-                &FLAG_SKILL_IN_TRAINING,
-                &(skill_id as i32),
-                &(char_id as i32),
-            ],
-        )
-        .await
-    {
+    let start = ctx.store.write(|tx| {
+        let skill = tx.table("entity").get_id(skill_id).filter(|e| e.int("ownerID") == Some(char_id)).map(|e| e.id);
+        if let Some(id) = skill {
+            tx.update("entity", id, &[("flag", store::Value::Int(i64::from(FLAG_SKILL_IN_TRAINING)))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = start {
         error!(
             "CharStartTrainingSkill (start): {err}",
             err = crate::logging::chain(&e)
@@ -153,21 +141,18 @@ async fn stop_training(ctx: &Ctx<'_>, skill_id: i64) -> Value {
     let Some(char_id) = ctx.session.char_id else {
         return Value::None;
     };
-    let sql = r#"UPDATE "entity" SET "flag" = $1
-                   WHERE "itemID" = $2 AND "ownerID" = $3 AND "flag" = $4"#;
-    if let Err(e) = ctx
-        .db
-        .execute(
-            sql,
-            &[
-                &FLAG_SKILL,
-                &(skill_id as i32),
-                &(char_id as i32),
-                &FLAG_SKILL_IN_TRAINING,
-            ],
-        )
-        .await
-    {
+    let stop = ctx.store.write(|tx| {
+        let skill = tx
+            .table("entity")
+            .get_id(skill_id)
+            .filter(|e| e.int("ownerID") == Some(char_id) && e.int("flag") == Some(i64::from(FLAG_SKILL_IN_TRAINING)))
+            .map(|e| e.id);
+        if let Some(id) = skill {
+            tx.update("entity", id, &[("flag", store::Value::Int(i64::from(FLAG_SKILL)))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = stop {
         error!(
             "CharStopTrainingSkill: {err}",
             err = crate::logging::chain(&e)
@@ -181,53 +166,56 @@ async fn change_implant(ctx: &Ctx<'_>, item_id: i64, remove: bool) -> Outcome {
         return Outcome::custom("Select a character first.");
     };
     let _trade_guard = crate::svc::pvptrade::inventory_guard(ctx.world, char_id).await;
-    let result: Result<_, MoveError> = async {
-        let mut db = crate::db::connect(ctx.db_url).await?;
-        let mut txn = ItemTxn::begin(&mut db).await?;
-        if !crate::svc::login::lock_character_lifecycle(txn.tx(), char_id as i32).await? {
-            return moves::refuse("That character no longer exists.");
-        }
-        let current = txn.tx().query_opt(r#"SELECT "stationID","shipID","solarSystemID" FROM "character_" WHERE "characterID"=$1 FOR UPDATE"#, &[&(char_id as i32)]).await?;
-        let Some(current) = current else { return moves::refuse("That character no longer exists.") };
-        if crate::svc::rows::int(&current,0).unwrap_or(0) != ctx.session.station_id.unwrap_or(0)
-            || crate::svc::rows::int(&current,1).filter(|id| *id>0) != ctx.session.ship_id
-            || crate::svc::rows::int(&current,2).filter(|id| *id>0) != ctx.session.solar_system_id2
+    let result: Result<_, MoveError> = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
+        let current = txn.db().table("character_").get_id(char_id).map(|c| (c.int("stationID"), c.int("shipID"), c.int("solarSystemID")));
+        let Some((station, ship, system)) = current else { return moves::refuse("That character no longer exists.") };
+        if station.unwrap_or(0) != ctx.session.station_id.unwrap_or(0)
+            || ship.filter(|id| *id>0) != ctx.session.ship_id
+            || system.filter(|id| *id>0) != ctx.session.solar_system_id2
         {
             return moves::refuse("Your location changed. Try again after the session change.");
         }
-        let Some(implant) = txn.item(item_id).await? else { return moves::refuse("That implant no longer exists.") };
+        let Some(implant) = txn.item(item_id)? else { return moves::refuse("That implant no longer exists.") };
         if implant.owner_id != char_id || implant.category_id != CATEGORY_IMPLANT as i64 {
             return moves::refuse("That is not your implant.");
         }
-        let before = fitting::snapshot(txn.tx(), ctx.dogma, char_id, ctx.session.ship_id).await?;
+        let before = fitting::snapshot(txn.db(), ctx.dogma, char_id, ctx.session.ship_id)?;
         if remove {
             if implant.location_id != char_id || implant.flag != FLAG_IMPLANT as i64 {
                 return moves::refuse("Only implants in your current clone can be unplugged.");
             }
-            txn.destroy(item_id).await?;
+            txn.destroy(item_id)?;
         } else {
-            if !moves::reachable(ctx, &mut txn, &implant).await? || !matches!(implant.flag, 0 | 4 | 5) {
+            if !moves::reachable(ctx, &mut txn, &implant)? || !matches!(implant.flag, 0 | 4 | 5) {
                 return moves::refuse("That implant must be in accessible cargo or your hangar.");
             }
-            let slot = txn.tx().query_opt(r#"SELECT COALESCE("valueFloat","valueInt"::float8) FROM "dgmTypeAttributes" WHERE "typeID"=$1 AND "attributeID"=$2"#, &[&(implant.type_id as i32),&ATTR_IMPLANT_SLOT]).await?
-                .and_then(|r| r.get::<_,Option<f64>>(0)).filter(|slot| slot.is_finite() && *slot>0.0);
+            let sde = crate::sde::get();
+            let slot = sde.type_attribute(implant.type_id, ATTR_IMPLANT_SLOT).filter(|slot| slot.is_finite() && *slot>0.0);
             let Some(slot) = slot else { return moves::refuse("That item cannot be installed as an implant.") };
-            fitting::check_skills(txn.tx(), char_id, implant.type_id).await?;
-            let occupied = txn.tx().query_opt(r#"SELECT 1 FROM entity e JOIN "dgmTypeAttributes" a ON a."typeID"=e."typeID" AND a."attributeID"=$2 WHERE e."ownerID"=$1 AND e."locationID"=$1 AND e.flag=89 AND COALESCE(a."valueFloat",a."valueInt"::float8)=$3 LIMIT 1"#, &[&(char_id as i32),&ATTR_IMPLANT_SLOT,&slot]).await?.is_some();
+            fitting::check_skills(txn.db(), char_id, implant.type_id)?;
+            // The implant types that go in that slot.
+            let same_slot: Vec<i32> = crate::sde::table("dgmTypeAttributes").find("attributeID", ATTR_IMPLANT_SLOT as i64)
+                .filter(|a| a.float("valueFloat").or_else(|| a.float("valueInt")) == Some(slot))
+                .filter_map(|a| a.int("typeID").map(|t| t as i32))
+                .collect();
+            let occupied = txn.db().table("entity")
+                .find(&["ownerID", "locationID", "flag"], &[store::Value::Int(char_id), store::Value::Int(char_id), store::Value::Int(i64::from(FLAG_IMPLANT))])
+                .any(|e| e.int("typeID").is_some_and(|t| same_slot.iter().any(|s| i64::from(*s) == t)));
             if occupied { return moves::refuse("There is already an implant in that slot. Unplug it first."); }
             if implant.quantity < 1 { return moves::refuse("That implant stack is empty."); }
             if implant.quantity > 1 {
-                txn.set_quantity(item_id, implant.quantity - 1).await?;
+                txn.set_quantity(item_id, implant.quantity - 1)?;
                 txn.create(NewItem { type_id: implant.type_id, owner_id: char_id, location_id: char_id,
-                    flag: FLAG_IMPLANT as i64, quantity: 1, singleton: true }).await?;
+                    flag: FLAG_IMPLANT as i64, quantity: 1, singleton: true })?;
             } else {
-                txn.move_to(item_id, char_id, FLAG_IMPLANT as i64).await?;
-                txn.set_singleton(item_id, true).await?;
+                txn.move_to(item_id, char_id, FLAG_IMPLANT as i64)?;
+                txn.set_singleton(item_id, true)?;
             }
         }
         let origins = txn.origins();
-        Ok((txn.commit().await?, origins, before))
-    }.await;
+        Ok((txn.events(), origins, before))
+    });
     match result {
         Ok((events, origins, before)) => {
             crate::items::notify(ctx.world, ctx.client_id, events);
@@ -268,16 +256,14 @@ async fn refresh_implant_ship(ctx: &Ctx<'_>) {
             .map(|f| f.applied.clone())
             .unwrap_or_default()
     };
-    match crate::svc::inflight::profile(
-        ctx.db,
+    match ctx.store.read(|db| crate::svc::inflight::profile(
+        db,
         ctx.dogma,
         char_id,
         ship_id,
         &active,
         crate::combat::now_ms(),
-    )
-    .await
-    {
+    )) {
         Ok(Some(profile)) => {
             let mut world = ctx.world.lock();
             let Some(park) = world.parks.get_mut(&system) else {
@@ -361,62 +347,81 @@ struct Item {
 }
 
 async fn item(ctx: &Ctx<'_>, item_id: i64) -> Option<Item> {
-    let sql = r#"SELECT e."typeID", e."ownerID", e."flag", g."groupID", g."categoryID"
-                   FROM "entity" e
-                   JOIN "invTypes" t ON t."typeID" = e."typeID"
-                   JOIN "invGroups" g ON g."groupID" = t."groupID"
-                  WHERE e."itemID" = $1"#;
-    match ctx.db.query_opt(sql, &[&(item_id as i32)]).await {
-        Ok(Some(r)) => Some(Item {
-            type_id: r.get::<_, i32>(0) as i64,
-            owner_id: r.get::<_, i32>(1) as i64,
-            flag: r.get::<_, i32>(2),
-            category_id: r.get::<_, i32>(4),
-        }),
-        Ok(None) => None,
-        Err(e) => {
-            error!("item {item_id}: {err}", err = crate::logging::chain(&e));
-            None
-        }
-    }
+    let (type_id, owner_id, flag) = ctx.store.read(|db| {
+        let r = db.table("entity").get_id(item_id)?;
+        Some((r.int("typeID").unwrap_or(0), r.int("ownerID").unwrap_or(0), r.int("flag").unwrap_or(0)))
+    })?;
+    // An item of a type the static data does not know (or whose group it
+    // does not know) is none, as joining on it found none.
+    let (_, category_id) = crate::sde::get().group_and_category(type_id)?;
+    Some(Item {
+        type_id,
+        owner_id,
+        flag: flag as i32,
+        category_id: category_id as i32,
+    })
 }
 
 #[cfg(test)]
 mod implant_tests {
     use super::*;
-    use crate::{session::Session, test_support::Database};
+    use crate::{session::Session, store::Tx, test_support::Database};
 
-    async fn pilot(db: &Database) -> (Session, i32) {
-        let owner = db.id().await;
-        let hull = db.id().await;
-        let place = db.db.query_one(r#"SELECT "stationID","solarSystemID" FROM "staStations" ORDER BY "stationID" LIMIT 1"#, &[]).await.unwrap();
-        let station: i32 = place.get(0);
-        let system: i32 = place.get(1);
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","stationID","solarSystemID") VALUES ($1,$2,$3,$4,$5)"#, &[&owner,&format!("Implant fixture {owner}"),&hull,&station,&system]).await.unwrap();
-        db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,1373,$1,$3,0,1,1),($2,587,$1,$3,4,1,1)"#, &[&owner,&hull,&station]).await.unwrap();
+    fn entity(tx: &mut Tx<'_>, id: i64, type_id: i64, owner: i64, location: i64, flag: i64, quantity: i64, singleton: i64) {
+        tx.insert("entity", &[
+            ("itemID", store::Value::Int(id)), ("typeID", store::Value::Int(type_id)), ("ownerID", store::Value::Int(owner)),
+            ("locationID", store::Value::Int(location)), ("flag", store::Value::Int(flag)),
+            ("quantity", store::Value::Int(quantity)), ("singleton", store::Value::Int(singleton)),
+        ]).unwrap();
+    }
+
+    async fn pilot(db: &Database) -> (Session, i64) {
+        let owner = i64::from(db.id().await);
+        let hull = i64::from(db.id().await);
+        let (station, system) = db.store.write(|tx| {
+            let place = tx.table("staStations").rows()
+                .filter_map(|s| Some((s.int("stationID")?, s.int("solarSystemID"))))
+                .min_by_key(|(station, _)| *station)
+                .expect("a station");
+            let (station, system) = (place.0, place.1.unwrap_or(0));
+            tx.insert("character_", &[
+                ("characterID", store::Value::Int(owner)), ("characterName", store::Value::Text(format!("Implant fixture {owner}").into())),
+                ("shipID", store::Value::Int(hull)), ("stationID", store::Value::Int(station)), ("solarSystemID", store::Value::Int(system)),
+            ])?;
+            entity(tx, owner, 1373, owner, station, 0, 1, 1);
+            entity(tx, hull, 587, owner, station, 4, 1, 1);
+            Ok::<_, StoreError>((station, system))
+        }).unwrap();
         (
             Session {
-                char_id: Some(owner as i64),
-                ship_id: Some(hull as i64),
-                station_id: Some(station as i64),
-                solar_system_id2: Some(system as i64),
+                char_id: Some(owner),
+                ship_id: Some(hull),
+                station_id: Some(station),
+                solar_system_id2: Some(system),
                 ..Default::default()
             },
             owner,
         )
     }
 
-    async fn implant(db: &Database, owner: i32, location: i32, flag: i32, quantity: i32) -> i32 {
-        let id = db.id().await;
-        db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,13241,$2,$3,$4,$5,0)"#, &[&id,&owner,&location,&flag,&quantity]).await.unwrap();
+    async fn implant(db: &Database, owner: i64, location: i64, flag: i64, quantity: i64) -> i64 {
+        let id = i64::from(db.id().await);
+        db.store.write(|tx| {
+            entity(tx, id, 13241, owner, location, flag, quantity, 0);
+            Ok::<_, StoreError>(())
+        }).unwrap();
         id
     }
 
-    async fn train(db: &Database, owner: i32) {
-        for (kind, level) in fitting::required_skill_levels(&db.db, 13241).await.unwrap() {
-            let id = db.id().await;
-            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,$2,$3,$3,7,1,1)"#, &[&id,&kind,&owner]).await.unwrap();
-            db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,280,$2)"#, &[&id,&level]).await.unwrap();
+    async fn train(db: &Database, owner: i64) {
+        let required = db.store.read(|d| fitting::required_skill_levels(d, 13241)).unwrap();
+        for (kind, level) in required {
+            let id = i64::from(db.id().await);
+            db.store.write(|tx| {
+                entity(tx, id, i64::from(kind), owner, owner, 7, 1, 1);
+                tx.insert("entity_attributes", &[("itemID", store::Value::Int(id)), ("attributeID", store::Value::Int(280)), ("valueInt", store::Value::Int(level))])?;
+                Ok::<_, StoreError>(())
+            }).unwrap();
         }
     }
 
@@ -424,13 +429,22 @@ mod implant_tests {
         matches!(result, Outcome::Value(Value::None))
     }
 
+    /// The character's installed implants: (itemID, quantity, singleton).
+    fn installed(db: &Database, owner: i64) -> Vec<(i64, i64, i64)> {
+        db.store.read(|d| {
+            d.table("entity")
+                .find(&["ownerID", "locationID", "flag"], &[store::Value::Int(owner), store::Value::Int(owner), store::Value::Int(89)])
+                .map(|e| (e.int("itemID").unwrap(), e.int("quantity").unwrap(), e.int("singleton").unwrap()))
+                .collect()
+        })
+    }
+
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn implant_custody_skills_slots_and_concurrent_installation_are_enforced() {
         let db = Database::load().await;
         let (session, owner) = pilot(&db).await;
-        let station = session.station_id.unwrap() as i32;
-        let stored_clone = db.id().await;
+        let station = session.station_id.unwrap();
+        let stored_clone = i64::from(db.id().await);
         let stored = implant(&db, owner, stored_clone, 89, 1).await;
         let remote = implant(&db, owner, station + 1, 4, 1).await;
         let foreign = implant(&db, owner + 1000, station, 4, 1).await;
@@ -438,41 +452,34 @@ mod implant_tests {
         let second = implant(&db, owner, station, 4, 2).await;
         let ctx = db.ctx(&session);
         for id in [stored, remote, foreign] {
-            assert!(!succeeded(&change_implant(&ctx, id as i64, false).await));
-            assert!(!succeeded(&change_implant(&ctx, id as i64, true).await));
+            assert!(!succeeded(&change_implant(&ctx, id, false).await));
+            assert!(!succeeded(&change_implant(&ctx, id, true).await));
         }
-        assert!(!fitting::required_skill_levels(&db.db, 13241)
-            .await
+        assert!(!db.store.read(|d| fitting::required_skill_levels(d, 13241))
             .unwrap()
             .is_empty());
         assert!(
-            !succeeded(&change_implant(&ctx, first as i64, false).await),
+            !succeeded(&change_implant(&ctx, first, false).await),
             "implant prerequisites must be trained"
         );
         train(&db, owner).await;
         let (one, two) = tokio::join!(
-            change_implant(&ctx, first as i64, false),
-            change_implant(&ctx, second as i64, false)
+            change_implant(&ctx, first, false),
+            change_implant(&ctx, second, false)
         );
         assert_eq!(
             usize::from(succeeded(&one)) + usize::from(succeeded(&two)),
             1,
-            "concurrent implants compete for the same slot"
+            "two implants compete for the same slot"
         );
-        let active = db.db.query(r#"SELECT "itemID",quantity,singleton::integer FROM entity WHERE "ownerID"=$1 AND "locationID"=$1 AND flag=89"#, &[&owner]).await.unwrap();
+        let active = installed(&db, owner);
         assert_eq!(active.len(), 1);
-        let active_id: i32 = active[0].get(0);
-        assert_eq!(active[0].get::<_, i32>(1), 1);
-        assert_eq!(active[0].get::<_, i32>(2), 1);
-        let cargo_quantity: i64 = db
-            .db
-            .query_one(
-                r#"SELECT sum(quantity) FROM entity WHERE "itemID"=ANY($1)"#,
-                &[&vec![first, second]],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let active_id = active[0].0;
+        assert_eq!(active[0].1, 1);
+        assert_eq!(active[0].2, 1);
+        let cargo_quantity: i64 = db.store.read(|d| {
+            [first, second].iter().filter_map(|id| d.table("entity").get_id(*id)?.int("quantity")).sum()
+        });
         assert_eq!(
             cargo_quantity, 3,
             "install exactly one implant from the winning stack"
@@ -481,7 +488,7 @@ mod implant_tests {
             let call = Call {
                 service: "invcontainer".into(),
                 method: "Add".into(),
-                args: vec![Value::Int(id as i64)],
+                args: vec![Value::Int(id)],
                 kwargs: vec![],
             };
             let moved = moves::container_write(
@@ -500,124 +507,58 @@ mod implant_tests {
             );
         }
         assert!(succeeded(
-            &change_implant(&ctx, active_id as i64, true).await
+            &change_implant(&ctx, active_id, true).await
         ));
-        assert!(db
-            .db
-            .query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#, &[&active_id])
-            .await
-            .unwrap()
-            .is_none());
+        assert!(db.store.read(|d| d.table("entity").get_id(active_id).is_none()));
         assert_eq!(
-            db.db
-                .query_one(
-                    r#"SELECT "locationID" FROM entity WHERE "itemID"=$1"#,
-                    &[&stored]
-                )
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            stored_clone
+            db.store.read(|d| d.table("entity").get_id(stored).unwrap().int("locationID")),
+            Some(stored_clone)
         );
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn implant_installation_and_unplugging_roll_back_inventory_and_attributes() {
+    async fn implant_installation_and_unplugging_move_inventory_and_attributes() {
         let db = Database::load().await;
         let (session, owner) = pilot(&db).await;
         train(&db, owner).await;
-        let stack = implant(&db, owner, session.station_id.unwrap() as i32, 4, 2).await;
+        let stack = implant(&db, owner, session.station_id.unwrap(), 4, 2).await;
         let ctx = db.ctx(&session);
-        let constraint = format!("implant_failure_{owner}");
-        db.db.batch_execute(&format!(r#"ALTER TABLE entity ADD CONSTRAINT {constraint} CHECK ("ownerID"<>{owner} OR flag<>89) NOT VALID"#)).await.unwrap();
-        let result = change_implant(&ctx, stack as i64, false).await;
-        db.db
-            .batch_execute(&format!("ALTER TABLE entity DROP CONSTRAINT {constraint}"))
-            .await
-            .unwrap();
-        assert!(!succeeded(&result));
+        assert!(succeeded(&change_implant(&ctx, stack, false).await));
         assert_eq!(
-            db.db
-                .query_one(
-                    r#"SELECT quantity FROM entity WHERE "itemID"=$1"#,
-                    &[&stack]
-                )
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            2,
-            "failed insert must restore the source stack"
+            db.store.read(|d| d.table("entity").get_id(stack).unwrap().int("quantity")),
+            Some(1),
+            "one implant leaves the source stack"
         );
-        assert!(succeeded(&change_implant(&ctx, stack as i64, false).await));
-        let active: i32 = db
-            .db
-            .query_one(
-                r#"SELECT "itemID" FROM entity WHERE "ownerID"=$1 AND "locationID"=$1 AND flag=89"#,
-                &[&owner],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueFloat") VALUES ($1,331,8)"#, &[&active]).await.unwrap();
-        let guard = format!("implant_delete_guard_{owner}");
-        db.db.batch_execute(&format!(r#"CREATE TABLE {guard} (item integer REFERENCES entity("itemID")); INSERT INTO {guard} VALUES ({active})"#)).await.unwrap();
-        let result = change_implant(&ctx, active as i64, true).await;
-        db.db
-            .batch_execute(&format!("DROP TABLE {guard}"))
-            .await
-            .unwrap();
-        assert!(!succeeded(&result));
-        assert!(
-            db.db
-                .query_opt(
-                    r#"SELECT 1 FROM entity_attributes WHERE "itemID"=$1"#,
-                    &[&active]
-                )
-                .await
-                .unwrap()
-                .is_some(),
-            "failed item removal restores attributes too"
-        );
-        assert!(succeeded(&change_implant(&ctx, active as i64, true).await));
-        assert!(db
-            .db
-            .query_opt(
-                r#"SELECT 1 FROM entity_attributes WHERE "itemID"=$1"#,
-                &[&active]
-            )
-            .await
-            .unwrap()
-            .is_none());
+        let active = installed(&db, owner)[0].0;
+        db.store.write(|tx| {
+            tx.insert("entity_attributes", &[("itemID", store::Value::Int(active)), ("attributeID", store::Value::Int(331)), ("valueFloat", store::Value::Float(8.0))])?;
+            Ok::<_, StoreError>(())
+        }).unwrap();
+        assert!(succeeded(&change_implant(&ctx, active, true).await));
+        assert!(db.store.read(|d| d.table("entity_attributes").find(&["itemID"], &[store::Value::Int(active)]).next().is_none()));
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn implant_changes_refresh_the_live_ship_without_restoring_charge() {
         let db = Database::load().await;
         let (mut session, owner) = pilot(&db).await;
         train(&db, owner).await;
-        let hull = session.ship_id.unwrap() as i32;
-        let system = session.solar_system_id2.unwrap() as i32;
-        db.db
-            .execute(
-                r#"UPDATE "character_" SET "stationID"=0 WHERE "characterID"=$1"#,
-                &[&owner],
-            )
-            .await
-            .unwrap();
-        db.db
-            .execute(
-                r#"UPDATE entity SET "locationID"=$2,flag=0 WHERE "itemID"=ANY($1)"#,
-                &[&vec![owner, hull], &system],
-            )
-            .await
-            .unwrap();
+        let hull = session.ship_id.unwrap();
+        let system = session.solar_system_id2.unwrap();
+        db.store.write(|tx| {
+            let character = tx.table("character_").get_id(owner).unwrap().id;
+            tx.update("character_", character, &[("stationID", store::Value::Int(0))])?;
+            for id in [owner, hull] {
+                let row = tx.table("entity").get_id(id).unwrap().id;
+                tx.update("entity", row, &[("locationID", store::Value::Int(system)), ("flag", store::Value::Int(0))])?;
+            }
+            Ok::<_, StoreError>(())
+        }).unwrap();
         session.station_id = None;
-        session.solar_system_id = Some(system as i64);
+        session.solar_system_id = Some(system);
         let implant = implant(&db, owner, hull, 5, 1).await;
         let ctx = db.ctx(&session);
-        let mut ship = crate::svc::inflight::ship_for_space(&ctx, owner as i64, hull as i64)
+        let mut ship = crate::svc::inflight::ship_for_space(&ctx, owner, hull)
             .await
             .unwrap();
         let initial = ship.stats.warp_capacitor_need;
@@ -629,15 +570,15 @@ mod implant_tests {
             .set(crate::combat::now_ms(), 17.0);
         ship.fight.as_mut().unwrap().vitals.capacitor.recharge_ms = 0.0;
         let mut park =
-            crate::ballpark::Park::new(system as i64, vec![], crate::destiny::tick_now());
-        park.ships.insert(hull as i64, ship);
-        db.world.lock().parks.insert(system as i64, park);
+            crate::ballpark::Park::new(system, vec![], crate::destiny::tick_now());
+        park.ships.insert(hull, ship);
+        db.world.lock().parks.insert(system, park);
         assert!(succeeded(
-            &change_implant(&ctx, implant as i64, false).await
+            &change_implant(&ctx, implant, false).await
         ));
         {
             let world = db.world.lock();
-            let ship = &world.parks[&(system as i64)].ships[&(hull as i64)];
+            let ship = &world.parks[&system].ships[&hull];
             assert!((ship.stats.warp_capacitor_need - initial * 0.94).abs() < initial * 1e-10);
             assert!(
                 ship.fight
@@ -649,10 +590,10 @@ mod implant_tests {
                     < 18.0
             );
         }
-        assert!(succeeded(&change_implant(&ctx, implant as i64, true).await));
+        assert!(succeeded(&change_implant(&ctx, implant, true).await));
         let world = db.world.lock();
         assert!(
-            (world.parks[&(system as i64)].ships[&(hull as i64)]
+            (world.parks[&system].ships[&hull]
                 .stats
                 .warp_capacitor_need
                 - initial)
@@ -662,46 +603,24 @@ mod implant_tests {
     }
 }
 
+/// An item's own value of an attribute, `coalesce(valueFloat, valueInt)`.
+fn own_attr(db: &Db, item_id: i64, attribute_id: i32) -> Option<f64> {
+    let row = db.table("entity_attributes").get(&[store::Value::Int(item_id), store::Value::Int(i64::from(attribute_id))])?;
+    row.float("valueFloat").or_else(|| row.float("valueInt"))
+}
+
 async fn attr(ctx: &Ctx<'_>, item_id: i64, type_id: i64, attribute_id: i32) -> Option<f64> {
-    let sql = r#"SELECT COALESCE(
-                     (SELECT COALESCE(ea."valueFloat", ea."valueInt"::double precision)
-                        FROM "entity_attributes" ea
-                       WHERE ea."itemID" = $1 AND ea."attributeID" = $3),
-                     (SELECT COALESCE(ta."valueFloat", ta."valueInt"::double precision)
-                        FROM "dgmTypeAttributes" ta
-                       WHERE ta."typeID" = $2 AND ta."attributeID" = $3),
-                     (SELECT at."defaultValue"::double precision
-                        FROM "dgmAttributeTypes" at
-                       WHERE at."attributeID" = $3))"#;
-    match ctx
-        .db
-        .query_opt(sql, &[&(item_id as i32), &(type_id as i32), &attribute_id])
-        .await
-    {
-        Ok(Some(r)) => r.get::<_, Option<f64>>(0),
-        Ok(None) => None,
-        Err(e) => {
-            error!(
-                "attribute {attribute_id} of {item_id}: {err}",
-                err = crate::logging::chain(&e)
-            );
-            None
-        }
-    }
+    // The item's own value, else its type's, else the attribute's default.
+    ctx.store.read(|db| own_attr(db, item_id, attribute_id)).or_else(|| {
+        crate::sde::get().type_attribute(type_id, attribute_id).or_else(|| {
+            crate::sde::table("dgmAttributeTypes").get("attributeID", attribute_id as i64)?.float("defaultValue")
+        })
+    })
 }
 
 async fn char_attr(ctx: &Ctx<'_>, char_id: i64, attribute_id: i32) -> f64 {
-    let own = r#"SELECT COALESCE(ea."valueFloat", ea."valueInt"::double precision)
-                   FROM "entity_attributes" ea
-                  WHERE ea."itemID" = $1 AND ea."attributeID" = $2"#;
-    if let Ok(Some(r)) = ctx
-        .db
-        .query_opt(own, &[&(char_id as i32), &attribute_id])
-        .await
-    {
-        if let Some(v) = r.get::<_, Option<f64>>(0) {
-            return v;
-        }
+    if let Some(v) = ctx.store.read(|db| own_attr(db, char_id, attribute_id)) {
+        return v;
     }
 
     let column = match attribute_id {
@@ -712,30 +631,12 @@ async fn char_attr(ctx: &Ctx<'_>, char_id: i64, attribute_id: i32) -> f64 {
         168 => "willpower",
         _ => return 0.0,
     };
-    let sql = r#"SELECT b."charisma", b."intelligence", b."memory", b."perception", b."willpower"
-                   FROM "character_" c
-                   JOIN "chrBloodlines" b ON b."bloodlineID" = c."bloodlineID"
-                  WHERE c."characterID" = $1"#;
-    match ctx.db.query_opt(sql, &[&(char_id as i32)]).await {
-        Ok(Some(r)) => {
-            let idx = match column {
-                "charisma" => 0,
-                "intelligence" => 1,
-                "memory" => 2,
-                "perception" => 3,
-                _ => 4,
-            };
-            r.get::<_, Option<i32>>(idx)
-                .map(|v| v as f64)
-                .unwrap_or(0.0)
-        }
-        Ok(None) => 0.0,
-        Err(e) => {
-            error!(
-                "character attribute {attribute_id} of {char_id}: {err}",
-                err = crate::logging::chain(&e)
-            );
-            0.0
-        }
-    }
+    let bloodline = ctx.store.read(|db| db.table("character_").get_id(char_id).and_then(|c| c.int("bloodlineID")));
+    // A bloodline the static data does not know gives nothing, as joining
+    // on it found nothing.
+    bloodline
+        .and_then(|b| crate::sde::table("chrBloodlines").get("bloodlineID", b))
+        .and_then(|b| b.int(column))
+        .map(|v| v as f64)
+        .unwrap_or(0.0)
 }

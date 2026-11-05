@@ -1,17 +1,23 @@
 use super::*;
 
-async fn arrive(f:&Fixture,db:&mut Client)->Loss {
-    let row=db.query_one(r#"SELECT "solarSystemID","constellationID","regionID" FROM "mapSolarSystems"
-        WHERE "solarSystemID"<>$1 ORDER BY "solarSystemID" LIMIT 1"#,&[&(f.system as i32)]).await.unwrap();
-    let destination=SpaceArrivalCustody {system:i64::from(row.get::<_,i32>(0)),at:Vec3::new(701.0,802.0,903.0)};
+fn arrive(f:&Fixture)->Loss {
+    let store=f.store();
+    let (system,constellation,region)=store.read(|db| {
+        let s=db.table("mapSolarSystems").rows().filter(|s| s.int("solarSystemID")!=Some(f.system)).min_by_key(|s| s.int("solarSystemID")).unwrap();
+        (s.int("solarSystemID").unwrap(),s.int("constellationID").unwrap(),s.int("regionID").unwrap())
+    });
+    let destination=SpaceArrivalCustody {system,at:Vec3::new(701.0,802.0,903.0)};
     let mut loss=f.loss();loss.arrival_custody=Some(destination);
     // A source-space hull cannot be claimed with a fabricated destination.
-    let tx=db.transaction().await.unwrap();
-    assert!(!stage(&tx,&loss).await.unwrap());tx.rollback().await.unwrap();
-    db.execute(r#"UPDATE "character_" SET "solarSystemID"=$2,"constellationID"=$3,"regionID"=$4 WHERE "characterID"=$1"#,
-        &[&(loss.char_id as i32),&(destination.system as i32),&row.get::<_,i32>(1),&row.get::<_,i32>(2)]).await.unwrap();
-    db.execute(r#"UPDATE entity SET "locationID"=$2,x=$3,y=$4,z=$5 WHERE "itemID"=ANY($1)"#,
-        &[&vec![loss.char_id as i32,loss.ship_id as i32],&(destination.system as i32),&destination.at.x,&destination.at.y,&destination.at.z]).await.unwrap();
+    assert!(!store.write(|tx| stage(tx,&loss)).unwrap());
+    store.write(|tx| {
+        update_id(tx,"character_",loss.char_id,&[("solarSystemID",int(system)),("constellationID",int(constellation)),("regionID",int(region))])?;
+        for id in [loss.char_id,loss.ship_id] {
+            update_id(tx,"entity",id,&[("locationID",int(system)),("x",store::Value::Float(destination.at.x)),
+                ("y",store::Value::Float(destination.at.y)),("z",store::Value::Float(destination.at.z))])?;
+        }
+        Ok::<_,StoreError>(())
+    }).unwrap();
     loss
 }
 
@@ -30,75 +36,77 @@ fn arrival_custody_is_optional_for_old_journals_and_rejects_invalid_destinations
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn arrival_loss_restarts_in_destination_with_immutable_source_attribution() {
-    let mut f=Fixture::new(false).await;f.insured().await;
-    let mut db=crate::db::connect(&f.server.db_url).await.unwrap();
-    let mut loss=arrive(&f,&mut db).await;
+    let mut f=Fixture::new(false).await;f.insured();
+    let store=f.store();
+    let mut loss=arrive(&f);
     loss.final_blow=Some(-587);loss.attackers=vec![Attacker {who:-587,ship_type:587,weapon_type:34,damage:42.0}];
     let arrival=loss.arrival_custody.unwrap();
-    let captured=capture(&mut db,&loss).await.unwrap().unwrap();assert_eq!(captured.arrival_custody,Some(arrival));
+    let captured=capture(&store,&loss).unwrap().unwrap();assert_eq!(captured.arrival_custody,Some(arrival));
     let mut conflict=loss.clone();conflict.final_blow=Some(-601);conflict.arrival_custody.as_mut().unwrap().at=Vec3::ZERO;
-    let recorded=capture(&mut db,&conflict).await.unwrap().unwrap();
+    let recorded=capture(&store,&conflict).unwrap().unwrap();
     assert_eq!(recorded.final_blow,loss.final_blow);assert_eq!(recorded.arrival_custody,loss.arrival_custody);
-    let stored=db.query_one(r#"SELECT "solarSystemID",occupied FROM "pendingShipLosses" WHERE "shipID"=$1"#,&[&(loss.ship_id as i32)]).await.unwrap();
-    assert_eq!(stored.get::<_,i32>(0),loss.system as i32);assert!(stored.get::<_,bool>(1));
-    let source_name:String=db.query_one(r#"SELECT "solarSystemName" FROM "mapSolarSystems" WHERE "solarSystemID"=$1"#,&[&(loss.system as i32)]).await.unwrap().get(0);
-    assert!(report_text(&db,&loss).await.contains(&source_name));
+    let stored=store.read(|db| db.table("pendingShipLosses").get_id(loss.ship_id).map(|p| (p.int("solarSystemID"),p.bool("occupied"))));
+    assert_eq!(stored,Some((Some(loss.system),Some(true))));
+    let (source_name,report)=store.read(|db| {
+        let name=db.table("mapSolarSystems").get_id(loss.system).and_then(|s| s.text("solarSystemName")).unwrap().to_string();
+        (name,report_text(db,&loss))
+    });
+    assert!(report.contains(&source_name));
     f.server.world=Default::default();
     for system in [loss.system,arrival.system] {
         f.server.world.lock().parks.insert(system,crate::ballpark::Park::new(system,vec![],crate::destiny::tick_now()));
     }
-    retry(&f.server,&mut db).await;
-    let row=db.query_one(r#"SELECT c."shipID",c.balance,e."locationID",e.x,e.y,e.z FROM "character_" c
-        JOIN entity e ON e."itemID"=c."shipID" WHERE c."characterID"=$1"#,&[&(loss.char_id as i32)]).await.unwrap();
-    let capsule=i64::from(row.get::<_,i32>(0));assert_ne!(capsule,loss.ship_id);assert_eq!(row.get::<_,f64>(1),1500.0);
-    assert_eq!(i64::from(row.get::<_,i32>(2)),arrival.system);assert_eq!(Vec3::new(row.get(3),row.get(4),row.get(5)),arrival.at);
-    let kill=db.query_one(r#"SELECT "solarSystemID","locationID","finalBlowID","totalDamage" FROM "killLog" WHERE "victimItemID"=$1"#,&[&(loss.ship_id as i32)]).await.unwrap();
-    assert_eq!(kill.get::<_,i32>(0),loss.system as i32);assert_eq!(kill.get::<_,i32>(1),loss.system as i32);
-    assert_eq!(kill.get::<_,i32>(2),-587);assert_eq!(kill.get::<_,f64>(3),42.0);
+    retry(&f.server,&store).await;
+    let capsule=fixture::character_int(&store,loss.char_id,"shipID").unwrap();
+    assert_ne!(capsule,loss.ship_id);assert_eq!(fixture::character_float(&store,loss.char_id,"balance"),Some(1500.0));
+    let at=store.read(|db| db.table("entity").get_id(capsule).map(|e| (e.int("locationID").unwrap(),Vec3::new(e.float("x").unwrap(),e.float("y").unwrap(),e.float("z").unwrap())))).unwrap();
+    assert_eq!(at,(arrival.system,arrival.at));
+    let kill=store.read(|db| db.table("killLog").rows().find(|k| k.int("victimItemID")==Some(loss.ship_id))
+        .map(|k| (k.int("solarSystemID"),k.int("locationID"),k.int("finalBlowID"),k.float("totalDamage")))).unwrap();
+    assert_eq!(kill,(Some(loss.system),Some(loss.system),Some(-587),Some(42.0)));
     {
         let w=f.server.world.lock();assert!(w.parks[&loss.system].ships.is_empty());
         assert_eq!(w.parks[&arrival.system].ships[&capsule].pos,arrival.at);
     }
     // Cargo either dies or survives in a can at the same destination; the
     // probabilistic drop decision does not change its custody requirements.
-    let cans=db.query(r#"SELECT "locationID",x,y,z FROM entity WHERE "ownerID"=$1 AND "typeID"=23"#,&[&(loss.char_id as i32)]).await.unwrap();
-    for can in cans {assert_eq!(i64::from(can.get::<_,i32>(0)),arrival.system);assert_eq!(Vec3::new(can.get(1),can.get(2),can.get(3)),arrival.at);}
-    handle(&f.server,&mut db,loss.clone()).await;
-    assert_eq!(db.query_one(r#"SELECT count(*) FROM "killLog" WHERE "victimItemID"=$1"#,&[&(loss.ship_id as i32)]).await.unwrap().get::<_,i64>(0),1);
-    f.cleanup().await;
+    let cans:Vec<(i64,Vec3)>=store.read(|db| db.table("entity").find(&["ownerID"],&[int(loss.char_id)]).filter(|e| e.int("typeID")==Some(23))
+        .map(|e| (e.int("locationID").unwrap(),Vec3::new(e.float("x").unwrap(),e.float("y").unwrap(),e.float("z").unwrap()))).collect());
+    for can in cans {assert_eq!(can,(arrival.system,arrival.at));}
+    handle(&f.server,&store,loss.clone()).await;
+    assert_eq!(kills(&store,loss.ship_id),1);
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn arrival_loss_does_not_redirect_a_newer_boarded_hull() {
-    let f=Fixture::new(false).await;let mut db=crate::db::connect(&f.server.db_url).await.unwrap();
-    let loss=arrive(&f,&mut db).await;capture(&mut db,&loss).await.unwrap().unwrap();
-    let newer=db.query_one("SELECT nextval('dyn_id_seq')::integer",&[]).await.unwrap().get::<_,i32>(0);
-    db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-        VALUES($1,587,$2,$3,0,1,1)"#,&[&newer,&(loss.char_id as i32),&(loss.custody_system() as i32)]).await.unwrap();
-    db.execute(r#"UPDATE "character_" SET "shipID"=$2 WHERE "characterID"=$1"#,&[&(loss.char_id as i32),&newer]).await.unwrap();
-    handle(&f.server,&mut db,loss.clone()).await;
-    assert!(completed(&db,&loss).await.unwrap());
-    assert_eq!(db.query_one(r#"SELECT "shipID" FROM "character_" WHERE "characterID"=$1"#,&[&(loss.char_id as i32)]).await.unwrap().get::<_,i32>(0),newer);
-    assert!(db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&newer]).await.unwrap().is_some());
-    assert_eq!(db.query_one(r#"SELECT count(*) FROM entity WHERE "ownerID"=$1 AND "typeID"=670"#,&[&(loss.char_id as i32)]).await.unwrap().get::<_,i64>(0),0);
-    assert!(!blocked_in_memory(&f.server.world,loss.ship_id));f.cleanup().await;
+    let f=Fixture::new(false).await;let store=f.store();
+    let loss=arrive(&f);capture(&store,&loss).unwrap().unwrap();
+    let newer=fixture::id(&store);
+    store.write(|tx| {
+        fixture::item(tx,(newer,587,loss.char_id,loss.custody_system(),0,1),true,(0.0,0.0,0.0))?;
+        update_id(tx,"character_",loss.char_id,&[("shipID",int(newer))])
+    }).unwrap();
+    handle(&f.server,&store,loss.clone()).await;
+    assert!(is_completed(&store,&loss));
+    assert_eq!(fixture::character_int(&store,loss.char_id,"shipID"),Some(newer));
+    assert!(exists(&store,newer));
+    let capsules=store.read(|db| db.table("entity").find(&["ownerID"],&[int(loss.char_id)]).filter(|e| e.int("typeID")==Some(670)).count());
+    assert_eq!(capsules,0);
+    assert!(!blocked_in_memory(&f.server.world,loss.ship_id));
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn arrival_capsule_loss_uses_destination_custody_and_source_kill_location() {
-    let mut f=Fixture::new(true).await;let mut db=crate::db::connect(&f.server.db_url).await.unwrap();
-    crate::svc::medical::replace_clone(&db,f.ship.pilot.char_id,TYPE_CLONE_ALPHA,Some(f.station)).await.unwrap();
-    let loss=arrive(&f,&mut db).await;capture(&mut db,&loss).await.unwrap().unwrap();
-    f.server.world=Default::default();retry(&f.server,&mut db).await;
-    assert!(completed(&db,&loss).await.unwrap());
-    let row=db.query_one(r#"SELECT c."stationID",c."shipID",e."locationID" FROM "character_" c JOIN entity e ON e."itemID"=c."shipID"
-        WHERE c."characterID"=$1"#,&[&(loss.char_id as i32)]).await.unwrap();
-    assert_eq!(row.get::<_,i32>(0),f.station as i32);assert_ne!(row.get::<_,i32>(1),loss.ship_id as i32);assert_eq!(row.get::<_,i32>(2),f.station as i32);
-    let kill=db.query_one(r#"SELECT "solarSystemID","isPodKill" FROM "killLog" WHERE "victimItemID"=$1"#,&[&(loss.ship_id as i32)]).await.unwrap();
-    assert_eq!(kill.get::<_,i32>(0),loss.system as i32);assert_eq!(kill.get::<_,i16>(1),1);
-    assert!(db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(f.cargo as i32)]).await.unwrap().is_none());f.cleanup().await;
+    let mut f=Fixture::new(true).await;let store=f.store();
+    store.write(|tx| crate::svc::medical::replace_clone(tx,f.pilot(),TYPE_CLONE_ALPHA,Some(f.station))).unwrap();
+    let loss=arrive(&f);capture(&store,&loss).unwrap().unwrap();
+    f.server.world=Default::default();retry(&f.server,&store).await;
+    assert!(is_completed(&store,&loss));
+    let pod=fixture::character_int(&store,loss.char_id,"shipID").unwrap();
+    assert_eq!(fixture::character_int(&store,loss.char_id,"stationID"),Some(f.station));assert_ne!(pod,loss.ship_id);
+    assert_eq!(fixture::entity_int(&store,pod,"locationID"),Some(f.station));
+    let kill=store.read(|db| db.table("killLog").rows().find(|k| k.int("victimItemID")==Some(loss.ship_id)).map(|k| (k.int("solarSystemID"),k.int("isPodKill"))));
+    assert_eq!(kill,Some((Some(loss.system),Some(1))));
+    assert!(!exists(&store,f.cargo));
 }

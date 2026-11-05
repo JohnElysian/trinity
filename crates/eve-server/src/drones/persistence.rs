@@ -2,7 +2,6 @@
 //! transition invalidates its launch generation, and snapshots never create one.
 use super::*;
 use serde::{Deserialize, Serialize};
-use tokio_postgres::GenericClient;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Identity { pub(super) generation: i64, revision: i64 }
@@ -41,40 +40,31 @@ impl State {
     }
 }
 
-pub async fn ensure(db: &Client) -> Result<(),tokio_postgres::Error> {
-    db.batch_execute(r#"
-        CREATE SEQUENCE IF NOT EXISTS launched_drone_generation;
-        CREATE TABLE IF NOT EXISTS launched_drone_state (
-            drone_id integer PRIMARY KEY REFERENCES entity("itemID") ON DELETE CASCADE,
-            generation bigint NOT NULL DEFAULT nextval('launched_drone_generation'),
-            revision bigint NOT NULL DEFAULT 0,
-            owner_id integer NOT NULL, system_id integer NOT NULL, state text NOT NULL);
-        CREATE INDEX IF NOT EXISTS launched_drone_system ON launched_drone_state(system_id);
-        CREATE OR REPLACE FUNCTION invalidate_drone_launch() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-            IF ROW(OLD."ownerID",OLD."locationID",OLD.flag,OLD."typeID",OLD.quantity,OLD.singleton)
-                IS DISTINCT FROM ROW(NEW."ownerID",NEW."locationID",NEW.flag,NEW."typeID",NEW.quantity,NEW.singleton) THEN
-                DELETE FROM launched_drone_state WHERE drone_id=OLD."itemID";
-            END IF;
-            RETURN NEW;
-        END $$;
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='invalidate_drone_launch') THEN
-                CREATE TRIGGER invalidate_drone_launch AFTER UPDATE OF "ownerID","locationID",flag,"typeID",quantity,singleton
-                    ON entity FOR EACH ROW EXECUTE FUNCTION invalidate_drone_launch();
-            END IF;
-        END $$;
-    "#).await
-}
+/// The launch records, their generations and the trigger that drops a
+/// record when its item moves are defined in the store's schema.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(),StoreError> {Ok(())}
 
-pub(super) async fn begin(db:&impl GenericClient,id:i64,owner:i64,system:i64,controller:Option<i64>,pos:Vec3,
-    settings:Settings,range:f64) -> Result<Identity,tokio_postgres::Error> {
+pub(super) fn begin(tx:&mut Tx<'_>,id:i64,owner:i64,system:i64,controller:Option<i64>,pos:Vec3,
+    settings:Settings,range:f64) -> Result<Identity,StoreError> {
     let state=serde_json::to_string(&State::initial(owner,controller,pos,settings,range)).unwrap();
-    let row=db.query_one("INSERT INTO launched_drone_state(drone_id,owner_id,system_id,state) VALUES($1,$2,$3,$4)
-        ON CONFLICT(drone_id) DO UPDATE SET generation=nextval('launched_drone_generation'),revision=0,
-            owner_id=EXCLUDED.owner_id,system_id=EXCLUDED.system_id,state=EXCLUDED.state RETURNING generation",
-        &[&(id as i32),&(owner as i32),&(system as i32),&state]).await?;
-    Ok(Identity{generation:row.get(0),revision:0})
+    let record=[("owner_id",store::Value::Int(owner)),("system_id",store::Value::Int(system)),("state",store::Value::Text(state.into()))];
+    // A relaunch of a recorded drone starts a new generation.
+    let row=match tx.table("launched_drone_state").get_id(id).map(|r|r.id) {
+        Some(row)=>{
+            let generation=tx.nextval("launched_drone_generation")?;
+            let mut sets=vec![("generation",store::Value::Int(generation)),("revision",store::Value::Int(0))];
+            sets.extend(record);
+            tx.update("launched_drone_state",row,&sets)?;
+            row
+        }
+        None=>{
+            let mut sets=vec![("drone_id",store::Value::Int(id))];
+            sets.extend(record);
+            tx.insert("launched_drone_state",&sets)?
+        }
+    };
+    let generation=tx.table("launched_drone_state").row(row).and_then(|r|r.int("generation")).unwrap_or(0);
+    Ok(Identity{generation,revision:0})
 }
 
 #[derive(Clone)]
@@ -95,55 +85,56 @@ fn capture(world:&World, ids:Option<&[i64]>) -> Vec<Snapshot> {
     snapshots
 }
 
-async fn save(db:&mut Client,world:&World,snapshot:Snapshot) -> Result<bool,tokio_postgres::Error> {
-    let tx=db.transaction().await?;
+async fn save(store:&Store,world:&World,snapshot:Snapshot) -> Result<bool,StoreError> {
     let id=snapshot.ship.id;
     let owner=snapshot.ship.drone.as_ref().unwrap().owner;
-    // Lock the inventory row first, in the same order as scoop/abandon/loss.
-    // READ COMMITTED rechecks this predicate after a concurrent move commits.
-    if tx.query_opt(r#"SELECT 1 FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "invGroups" g ON g."groupID"=t."groupID" WHERE e."itemID"=$1 AND e."ownerID"=$2
-        AND e."locationID"=$3 AND e.flag=0 AND e.quantity=1 AND e.singleton=1 AND g."categoryID"=18 FOR UPDATE OF e"#,
-        &[&(id as i32),&(owner as i32),&(snapshot.system as i32)]).await?.is_none() {return Ok(false)}
-    let live=world.lock().parks.get(&snapshot.system).and_then(|p|p.ships.get(&id))
-        .and_then(|s|s.drone.as_ref()).is_some_and(|d|!d.pending_bay && d.owner==owner
-            && d.persistence.is_some_and(|p|p.generation==snapshot.identity.generation));
-    if !live {return Ok(false)}
-    let state=serde_json::to_string(&State::capture(&snapshot.ship,snapshot.tick)).unwrap();
-    if tx.execute("UPDATE launched_drone_state SET revision=$3,state=$4 WHERE drone_id=$1 AND generation=$2 AND revision<$3
-        AND owner_id=$5 AND system_id=$6",&[&(id as i32),&snapshot.identity.generation,&snapshot.identity.revision,&state,
-        &(owner as i32),&(snapshot.system as i32)]).await?!=1 {return Ok(false)}
-    tx.execute(r#"UPDATE entity SET x=$2,y=$3,z=$4 WHERE "itemID"=$1"#,
-        &[&(id as i32),&snapshot.ship.pos.x,&snapshot.ship.pos.y,&snapshot.ship.pos.z]).await?;
-    if let Some(f)=&snapshot.ship.fight {crate::svc::inflight::write_vitals(&tx,id,f,false).await?;}
-    tx.commit().await?;
-    Ok(true)
+    store.write(|tx| {
+        // The inventory item must still be this owner's drone in space here.
+        let custody=tx.table("entity").get_id(id).is_some_and(|e|e.int("ownerID")==Some(owner)
+            && e.int("locationID")==Some(snapshot.system) && e.int("flag")==Some(0) && e.int("quantity")==Some(1) && e.int("singleton")==Some(1)
+            && e.int("typeID").is_some_and(|t|crate::sde::get().types_in_category(18).contains(&(t as i32))));
+        if !custody {return Ok(false)}
+        let live=world.lock().parks.get(&snapshot.system).and_then(|p|p.ships.get(&id))
+            .and_then(|s|s.drone.as_ref()).is_some_and(|d|!d.pending_bay && d.owner==owner
+                && d.persistence.is_some_and(|p|p.generation==snapshot.identity.generation));
+        if !live {return Ok(false)}
+        let state=serde_json::to_string(&State::capture(&snapshot.ship,snapshot.tick)).unwrap();
+        let Some(record)=tx.table("launched_drone_state").get_id(id).filter(|r|r.int("generation")==Some(snapshot.identity.generation)
+            && r.int("revision").is_some_and(|r|r<snapshot.identity.revision) && r.int("owner_id")==Some(owner)
+            && r.int("system_id")==Some(snapshot.system)).map(|r|r.id) else {return Ok(false)};
+        tx.update("launched_drone_state",record,&[("revision",store::Value::Int(snapshot.identity.revision)),("state",store::Value::Text(state.into()))])?;
+        if let Some(item)=tx.table("entity").get_id(id).map(|r|r.id) {
+            tx.update("entity",item,&[("x",store::Value::Float(snapshot.ship.pos.x)),("y",store::Value::Float(snapshot.ship.pos.y)),
+                ("z",store::Value::Float(snapshot.ship.pos.z))])?;
+        }
+        if let Some(f)=&snapshot.ship.fight {crate::svc::inflight::write_vitals(tx,id,f,false)?;}
+        Ok(true)
+    })
 }
 
-pub async fn checkpoint(world:&World,db:&mut Client) {
+pub async fn checkpoint(world:&World,store:&Store) {
     for snapshot in capture(world,None) {
-        if let Err(e)=save(db,world,snapshot).await {warn!("saving launched drone: {}",crate::logging::chain(&e));}
+        if let Err(e)=save(store,world,snapshot).await {warn!("saving launched drone: {}",crate::logging::chain(&e));}
     }
 }
 
 pub(super) async fn ordered(ctx:&Ctx<'_>,ids:&[i64]) {
-    let snapshots=capture(ctx.world,Some(ids));
-    if snapshots.is_empty() {return}
-    match crate::db::connect(ctx.db_url).await {
-        Ok(mut db)=>for snapshot in snapshots {if let Err(e)=save(&mut db,ctx.world,snapshot).await {warn!("saving drone order: {e}");}},
-        Err(e)=>warn!("saving drone orders: {e}"),
+    for snapshot in capture(ctx.world,Some(ids)) {
+        if let Err(e)=save(ctx.store,ctx.world,snapshot).await {warn!("saving drone order: {e}");}
     }
 }
 
-pub(super) async fn vitals(db:&impl GenericClient,ids:&[i64]) -> Result<HashMap<i64,Vec<(i32,f64)>>,tokio_postgres::Error> {
-    let ids:Vec<i32>=ids.iter().map(|id|*id as i32).collect();
+pub(super) fn vitals(db:&Db,ids:&[i64]) -> HashMap<i64,Vec<(i32,f64)>> {
+    let attributes=db.table("entity_attributes");
     let mut out=HashMap::<i64,Vec<(i32,f64)>>::new();
-    for row in db.query(r#"SELECT "itemID","attributeID",coalesce("valueFloat","valueInt"::float8)
-        FROM entity_attributes WHERE "itemID"=ANY($1) AND "attributeID"=ANY($2)"#,
-        &[&ids,&vec![attr::SHIELD_CHARGE,attr::CHARGE,attr::ARMOR_DAMAGE,attr::DAMAGE]]).await? {
-        if let Some(v)=row.get::<_,Option<f64>>(2).filter(|v|v.is_finite()) {out.entry(row.get::<_,i32>(0) as i64).or_default().push((row.get(1),v));}
+    for id in ids {
+        if out.contains_key(id) {continue}
+        for attribute in [attr::SHIELD_CHARGE,attr::CHARGE,attr::ARMOR_DAMAGE,attr::DAMAGE] {
+            let Some(row)=attributes.get(&[store::Value::Int(*id),store::Value::Int(attribute.into())]) else {continue};
+            if let Some(v)=row.float("valueFloat").or_else(||row.float("valueInt")).filter(|v|v.is_finite()) {out.entry(*id).or_default().push((attribute,v));}
+        }
     }
-    Ok(out)
+    out
 }
 
 pub(super) fn apply_vitals(ship:&mut Ship,values:Option<&Vec<(i32,f64)>>,now:i64) {
@@ -158,97 +149,109 @@ pub(super) fn apply_vitals(ship:&mut Ship,values:Option<&Vec<(i32,f64)>>,now:i64
 
 /// Existing drones from databases predating this table keep their inventory
 /// position and damage. Their unrecorded orders cannot be inferred.
-pub async fn load(ctx:&Ctx<'_>,system:i64) -> Result<Vec<Ship>,tokio_postgres::Error> {
-    let rows=ctx.db.query(r#"SELECT e."itemID",e."typeID",e."ownerID",coalesce(e.x,0),coalesce(e.y,0),coalesce(e.z,0),
-        coalesce(c."corporationID",0),co."allianceID" FROM entity e
-        JOIN "invTypes" t ON t."typeID"=e."typeID" JOIN "invGroups" g ON g."groupID"=t."groupID"
-        LEFT JOIN "character_" c ON c."characterID"=e."ownerID" LEFT JOIN corporation co ON co."corporationID"=c."corporationID"
-        WHERE e."locationID"=$1 AND e.flag=0 AND e.quantity=1 AND e.singleton=1 AND g."categoryID"=18 ORDER BY e."itemID""#,
-        &[&(system as i32)]).await?;
-    let type_ids=rows.iter().map(|r|r.get::<_,i32>(1) as i64).collect::<Vec<_>>();
-    let types=npc::load_types(ctx.db,&type_ids).await?;
-    let mut db=crate::db::connect(ctx.db_url).await?;
+pub async fn load(ctx:&Ctx<'_>,system:i64) -> Result<Vec<Ship>,StoreError> {
+    let rows=ctx.store.read(|db| {
+        let drones=crate::sde::get().types_in_category(18);
+        let (characters,corporations)=(db.table("character_"),db.table("corporation"));
+        let mut rows:Vec<(i64,i64,i64,i64,Option<i64>)>=db.table("entity").find(&["locationID","flag"],&[store::Value::Int(system),store::Value::Int(0)])
+            .filter(|e|e.int("quantity")==Some(1) && e.int("singleton")==Some(1) && e.int("typeID").is_some_and(|t|drones.contains(&(t as i32))))
+            .filter_map(|e|{
+                let owner=e.int("ownerID")?;
+                let corp=characters.get_id(owner).and_then(|c|c.int("corporationID"));
+                let alliance=corp.and_then(|c|corporations.get_id(c)).and_then(|co|co.int("allianceID"));
+                Some((e.int("itemID")?,e.int("typeID")?,owner,corp.unwrap_or(0),alliance))
+            }).collect();
+        rows.sort_by_key(|r|r.0);
+        rows
+    });
+    let type_ids=rows.iter().map(|r|r.1).collect::<Vec<_>>();
+    let types=ctx.store.read(|db|npc::load_types(db,&type_ids))?;
     let mut out=Vec::new(); let now=combat::now_ms();let mut rng=combat::Rng::seeded(now as u64);
-    for r in rows {
-        let id=r.get::<_,i32>(0) as i64;let type_id=r.get::<_,i32>(1) as i64;let owner=r.get::<_,i32>(2) as i64;
+    for (id,type_id,owner,corp_id,alliance_id) in rows {
         let Some(ty)=types.get(&type_id) else {continue};
-        let settings=Settings::load(ctx.db,owner).await?;
-        let owner_ship=ctx.db.query_opt(r#"SELECT c."shipID" FROM "character_" c JOIN entity e ON e."itemID"=c."shipID"
-            WHERE c."characterID"=$1 AND e."ownerID"=$1"#,&[&(owner as i32)]).await?
-            .and_then(|r|r.get::<_,Option<i32>>(0)).map(i64::from);
-        let loadout=crate::dogma::Loadout::load_with_drones(ctx.db,ctx.dogma,owner,owner_ship,&Default::default(),&[id]).await?;
+        let (settings,loadout)=ctx.store.read(|db|{
+            let settings=Settings::load(db,owner);
+            let owner_ship=db.table("character_").get_id(owner).and_then(|c|c.int("shipID"))
+                .filter(|ship|db.table("entity").get_id(*ship).is_some_and(|e|e.int("ownerID")==Some(owner)));
+            crate::dogma::Loadout::load_with_drones(db,ctx.dogma,owner,owner_ship,&Default::default(),&[id]).map(|loadout|(settings,loadout))
+        })?;
         let attributes=loadout.find(id).map(|i|loadout.attributes(i));let ty=ty.with_attributes(attributes.as_ref());
         let range=loadout.character().map_or(20_000.0,|c|loadout.value(c,458).max(0.0));
-        let tx=db.transaction().await?;
-        let Some(item)=tx.query_opt(r#"SELECT x,y,z FROM entity WHERE "itemID"=$1 AND "ownerID"=$2 AND "locationID"=$3
-            AND "typeID"=$4 AND flag=0 AND quantity=1 AND singleton=1 FOR UPDATE"#,
-            &[&(id as i32),&(owner as i32),&(system as i32),&(type_id as i32)]).await? else {continue};
-        let pos=Vec3::new(item.get::<_,Option<f64>>(0).unwrap_or(0.0),item.get::<_,Option<f64>>(1).unwrap_or(0.0),item.get::<_,Option<f64>>(2).unwrap_or(0.0));
-        if !pos.is_finite() {continue}
-        let (identity,state)=match tx.query_opt("SELECT generation,revision,state FROM launched_drone_state WHERE drone_id=$1 AND owner_id=$2 AND system_id=$3",
-            &[&(id as i32),&(owner as i32),&(system as i32)]).await? {
-            Some(row)=>{
-                match serde_json::from_str::<State>(&row.get::<_,String>(2)).ok().filter(State::valid) {
-                    Some(state)=>(Identity{generation:row.get(0),revision:row.get(1)},state),
-                    None=>{
-                        warn!(drone=id,"invalid durable drone state; preserving inventory position and vitals");
-                        (begin(&tx,id,owner,system,None,pos,settings,range).await?,State::initial(owner,None,pos,settings,range))
-                    },
-                }
-            },
-            None=>(begin(&tx,id,owner,system,None,pos,settings,range).await?,State::initial(owner,None,pos,settings,range)),
-        };
-        let stored=vitals(&tx,&[id]).await?;
-        let pilot=Pilot{type_id,group_id:ty.group_id,name:ty.name.clone(),char_id:owner,corp_id:r.get::<_,i32>(6) as i64,
-            alliance_id:r.get::<_,Option<i32>>(7).map(i64::from),security:0.0,bounty:0.0};
-        let mut ship=make(&ty,id,pilot,0,state.controller.unwrap_or(0),pos,now,&mut rng);
-        ship.vel=Vec3::new(state.velocity[0],state.velocity[1],state.velocity[2]);ship.command=Command::Stop;
-        apply_vitals(&mut ship,stored.get(&id),now);
-        if ship.fight.as_ref().is_some_and(|f|f.vitals.hull_damage>=f.vitals.hull_max) {continue}
-        let d=ship.drone.as_mut().unwrap();d.persistence=Some(identity);d.controller=state.controller;d.controller_owner=state.controller_owner;
-        d.controller_client=0;d.assignment=state.assignment;d.order=state.order;d.activity=state.activity;d.mined=state.mined;
-        d.restored_motion=state.motion;
-        d.settings=settings;d.control_range=range;d.next_think_ms=0;
-        tx.commit().await?;out.push(ship);
+        let ship=ctx.store.write(|tx|->Result<Option<Ship>,StoreError> {
+            let Some(item)=tx.table("entity").get_id(id).filter(|e|e.int("ownerID")==Some(owner) && e.int("locationID")==Some(system)
+                && e.int("typeID")==Some(type_id) && e.int("flag")==Some(0) && e.int("quantity")==Some(1) && e.int("singleton")==Some(1)) else {return Ok(None)};
+            let pos=Vec3::new(item.float("x").unwrap_or(0.0),item.float("y").unwrap_or(0.0),item.float("z").unwrap_or(0.0));
+            if !pos.is_finite() {return Ok(None)}
+            let record=tx.table("launched_drone_state").get_id(id).filter(|r|r.int("owner_id")==Some(owner) && r.int("system_id")==Some(system));
+            let recorded=match record {
+                Some(row)=>{
+                    match row.text("state").and_then(|state|serde_json::from_str::<State>(state).ok()).filter(State::valid) {
+                        Some(state)=>Some((Identity{generation:row.int("generation").unwrap_or(0),revision:row.int("revision").unwrap_or(0)},state)),
+                        None=>{
+                            warn!(drone=id,"invalid durable drone state; preserving inventory position and vitals");
+                            None
+                        },
+                    }
+                },
+                None=>None,
+            };
+            let state=recorded.as_ref().map_or_else(||State::initial(owner,None,pos,settings,range),|(_,state)|state.clone());
+            let stored=vitals(tx.db(),&[id]);
+            let pilot=Pilot{type_id,group_id:ty.group_id,name:ty.name.clone(),char_id:owner,corp_id,alliance_id,security:0.0,bounty:0.0};
+            let mut ship=make(&ty,id,pilot,0,state.controller.unwrap_or(0),pos,now,&mut rng);
+            ship.vel=Vec3::new(state.velocity[0],state.velocity[1],state.velocity[2]);ship.command=Command::Stop;
+            apply_vitals(&mut ship,stored.get(&id),now);
+            if ship.fight.as_ref().is_some_and(|f|f.vitals.hull_damage>=f.vitals.hull_max) {return Ok(None)}
+            // A drone without a valid record starts a new generation.
+            let identity=match recorded {
+                Some((identity,_))=>identity,
+                None=>begin(tx,id,owner,system,None,pos,settings,range)?,
+            };
+            let d=ship.drone.as_mut().unwrap();d.persistence=Some(identity);d.controller=state.controller;d.controller_owner=state.controller_owner;
+            d.controller_client=0;d.assignment=state.assignment;d.order=state.order;d.activity=state.activity;d.mined=state.mined;
+            d.restored_motion=state.motion;
+            d.settings=settings;d.control_range=range;d.next_think_ms=0;
+            Ok(Some(ship))
+        })?;
+        out.extend(ship);
     }
     Ok(out)
 }
 
-/// Revalidate under item locks immediately before making loaded drones live.
-/// A scoop, loss, ownership transfer or relaunch during profile loading wins.
-pub async fn install(ctx:&Ctx<'_>,system:i64,ships:Vec<Ship>) -> Result<(),tokio_postgres::Error> {
+/// Revalidate the inventory immediately before making loaded drones live. A
+/// scoop, loss, ownership transfer or relaunch during profile loading wins.
+pub async fn install(ctx:&Ctx<'_>,system:i64,ships:Vec<Ship>) -> Result<(),StoreError> {
     if ships.is_empty() {return Ok(())}
-    let mut db=crate::db::connect(ctx.db_url).await?;
-    let tx=db.transaction().await?;
-    let ids:Vec<i32>=ships.iter().map(|s|s.id as i32).collect();
-    let rows=tx.query(r#"SELECT "itemID","ownerID","typeID",x,y,z FROM entity WHERE "itemID"=ANY($1)
-        AND "locationID"=$2 AND flag=0 AND quantity=1 AND singleton=1 ORDER BY "itemID" FOR UPDATE"#,&[&ids,&(system as i32)]).await?;
-    let records=tx.query("SELECT drone_id,generation,revision,state FROM launched_drone_state WHERE drone_id=ANY($1)",&[&ids]).await?;
-    let records:HashMap<i64,_>=records.into_iter().map(|r|(r.get::<_,i32>(0) as i64,r)).collect();
-    let mut ships:HashMap<i64,Ship>=ships.into_iter().map(|s|(s.id,s)).collect();
-    let stored=vitals(&tx,&ids.iter().map(|i|*i as i64).collect::<Vec<_>>()).await?;
-    let now=combat::now_ms();let mut valid=Vec::new();
-    for row in rows {
-        let id=row.get::<_,i32>(0) as i64;
-        let Some(mut ship)=ships.remove(&id) else {continue};
-        let d=ship.drone.as_mut().unwrap();
-        let Some(record)=records.get(&id).filter(|r|d.persistence.is_some_and(|p|p.generation==r.get::<_,i64>(1))) else {continue};
-        if d.owner!=row.get::<_,i32>(1) as i64 || ship.pilot.type_id!=row.get::<_,i32>(2) as i64 {continue}
-        let Ok(state)=serde_json::from_str::<State>(&record.get::<_,String>(3)) else {continue};
-        if !state.valid() {continue}
-        ship.pos=Vec3::new(row.get::<_,Option<f64>>(3).unwrap_or(0.0),row.get::<_,Option<f64>>(4).unwrap_or(0.0),row.get::<_,Option<f64>>(5).unwrap_or(0.0));
-        if !ship.pos.is_finite() {continue}
-        ship.vel=Vec3::new(state.velocity[0],state.velocity[1],state.velocity[2]);
-        d.persistence=Some(Identity{generation:record.get(1),revision:record.get(2)});
-        d.client_id=0;d.controller_client=0;ship.client_id=0;
-        d.controller=state.controller;d.controller_owner=state.controller_owner;d.assignment=state.assignment;
-        d.order=state.order;d.activity=state.activity;d.mined=state.mined;
-        d.restored_motion=(state.position==[ship.pos.x,ship.pos.y,ship.pos.z]).then_some(state.motion).flatten();
-        apply_vitals(&mut ship,stored.get(&id),now);
-        if ship.fight.as_ref().is_some_and(|f|f.vitals.hull_damage>=f.vitals.hull_max) {continue}
-        valid.push(ship);
-    }
-    {
+    // The drones go live while the store is held, so an inventory change
+    // either came first and is seen here, or comes after and sees them live.
+    ctx.store.read(|db| {
+        let mut ids:Vec<i64>=ships.iter().map(|s|s.id).collect();
+        ids.sort_unstable();ids.dedup();
+        let (entity,records)=(db.table("entity"),db.table("launched_drone_state"));
+        let mut ships:HashMap<i64,Ship>=ships.into_iter().map(|s|(s.id,s)).collect();
+        let stored=vitals(db,&ids);
+        let now=combat::now_ms();let mut valid=Vec::new();
+        for row in ids.iter().filter_map(|id|entity.get_id(*id)).filter(|e|e.int("locationID")==Some(system) && e.int("flag")==Some(0)
+            && e.int("quantity")==Some(1) && e.int("singleton")==Some(1)) {
+            let Some(id)=row.int("itemID") else {continue};
+            let Some(mut ship)=ships.remove(&id) else {continue};
+            let d=ship.drone.as_mut().unwrap();
+            let Some(record)=records.get_id(id).filter(|r|d.persistence.is_some_and(|p|Some(p.generation)==r.int("generation"))) else {continue};
+            if Some(d.owner)!=row.int("ownerID") || Some(ship.pilot.type_id)!=row.int("typeID") {continue}
+            let Some(Ok(state))=record.text("state").map(serde_json::from_str::<State>) else {continue};
+            if !state.valid() {continue}
+            ship.pos=Vec3::new(row.float("x").unwrap_or(0.0),row.float("y").unwrap_or(0.0),row.float("z").unwrap_or(0.0));
+            if !ship.pos.is_finite() {continue}
+            ship.vel=Vec3::new(state.velocity[0],state.velocity[1],state.velocity[2]);
+            d.persistence=Some(Identity{generation:record.int("generation").unwrap_or(0),revision:record.int("revision").unwrap_or(0)});
+            d.client_id=0;d.controller_client=0;ship.client_id=0;
+            d.controller=state.controller;d.controller_owner=state.controller_owner;d.assignment=state.assignment;
+            d.order=state.order;d.activity=state.activity;d.mined=state.mined;
+            d.restored_motion=(state.position==[ship.pos.x,ship.pos.y,ship.pos.z]).then_some(state.motion).flatten();
+            apply_vitals(&mut ship,stored.get(&id),now);
+            if ship.fight.as_ref().is_some_and(|f|f.vitals.hull_damage>=f.vitals.hull_max) {continue}
+            valid.push(ship);
+        }
         let mut w=ctx.world.lock();let mut out=Out::default();let mut inserted=Vec::new();
         if let Some(park)=w.parks.get_mut(&system) {
             for ship in valid {
@@ -269,10 +272,8 @@ pub async fn install(ctx:&Ctx<'_>,system:i64,ships:Vec<Ship>) -> Result<(),tokio
             }
         }
         out.deliver(&w);
-    }
-    // This transaction only reads. Releasing its locks after insertion lets
-    // any waiting inventory operation observe and remove the live drone.
-    tx.commit().await
+    });
+    Ok(())
 }
 
 /// Sessions are ephemeral. Bind to current piloted hulls, reject capsules,
@@ -322,17 +323,21 @@ mod tests {
         let f=crate::test_support::Database::load().await;
         let owner=f.id().await as i64;let home=f.id().await as i64;let id=f.id().await as i64;
         let other=f.id().await as i64;let other_ship=f.id().await as i64;
-        for (id,ty,who,location) in [(owner,1377,owner,home),(home,626,owner,SYSTEM),(id,2454,owner,SYSTEM),
-            (other,1377,other,other_ship),(other_ship,626,other,SYSTEM)] {
-            f.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton,x,y,z)
-                VALUES($1,$2,$3,$4,0,1,1,123,234,345)"#,&[&(id as i32),&ty,&(who as i32),&(location as i32)]).await.unwrap();
-        }
-        for (item,attribute,value) in [(owner,attr::MAX_ACTIVE_DRONES,5.0),(other,attr::MAX_ACTIVE_DRONES,5.0),
-            (home,283,100.0),(other_ship,283,100.0),(id,attr::CAPACITOR_CAPACITY,100.0),(id,attr::RECHARGE_RATE,0.0),
-            (id,attr::SHIELD_CAPACITY,200.0),(id,attr::SHIELD_RECHARGE_RATE,0.0)] {
-            f.db.execute(r#"INSERT INTO entity_attributes("itemID","attributeID","valueFloat") VALUES($1,$2,$3)"#,
-                &[&(item as i32),&attribute,&value]).await.unwrap();
-        }
+        f.store.write(|tx|->Result<(),StoreError> {
+            for (id,ty,who,location) in [(owner,1377,owner,home),(home,626,owner,SYSTEM),(id,2454,owner,SYSTEM),
+                (other,1377,other,other_ship),(other_ship,626,other,SYSTEM)] {
+                tx.insert("entity",&[("itemID",store::Value::Int(id)),("typeID",store::Value::Int(ty)),("ownerID",store::Value::Int(who)),
+                    ("locationID",store::Value::Int(location)),("flag",store::Value::Int(0)),("quantity",store::Value::Int(1)),("singleton",store::Value::Int(1)),
+                    ("x",store::Value::Float(123.0)),("y",store::Value::Float(234.0)),("z",store::Value::Float(345.0))])?;
+            }
+            for (item,attribute,value) in [(owner,attr::MAX_ACTIVE_DRONES,5.0),(other,attr::MAX_ACTIVE_DRONES,5.0),
+                (home,283,100.0),(other_ship,283,100.0),(id,attr::CAPACITOR_CAPACITY,100.0),(id,attr::RECHARGE_RATE,0.0),
+                (id,attr::SHIELD_CAPACITY,200.0),(id,attr::SHIELD_RECHARGE_RATE,0.0)] {
+                tx.insert("entity_attributes",&[("itemID",store::Value::Int(item)),("attributeID",store::Value::Int(attribute.into())),
+                    ("valueFloat",store::Value::Float(value))])?;
+            }
+            Ok(())
+        }).unwrap();
         let mut park=Park::new(SYSTEM,vec![],0);
         for (ship,who,client) in [(home,owner,77),(other_ship,other,88)] {
             park.ships.insert(ship,Ship::new(ship,client,ShipStats::new(100.0,1e6,1.0,100.0,1.0),
@@ -342,6 +347,25 @@ mod tests {
         f.world.lock().parks.insert(SYSTEM,park);
         f.world.lock().gangs.test_members(vec![owner,other]);
         (f,owner,home,id,other,other_ship)
+    }
+
+    fn records(f:&crate::test_support::Database,id:i64)->usize {
+        f.store.read(|db|db.table("launched_drone_state").find(&["drone_id"],&[store::Value::Int(id)]).count())
+    }
+
+    fn x(f:&crate::test_support::Database,id:i64)->Option<f64> {
+        f.store.read(|db|db.table("entity").get_id(id).and_then(|e|e.float("x")))
+    }
+
+    /// Move the drone away and back to the same owner and system, an ABA
+    /// transition, and launch it again.
+    fn relaunch(f:&crate::test_support::Database,id:i64,owner:i64,home:i64,at:Vec3)->Identity {
+        f.store.write(|tx|{
+            let row=tx.table("entity").get_id(id).unwrap().id;
+            tx.update("entity",row,&[("locationID",store::Value::Int(home)),("flag",store::Value::Int(87))])?;
+            tx.update("entity",row,&[("locationID",store::Value::Int(SYSTEM)),("flag",store::Value::Int(0)),("x",store::Value::Float(at.x))])?;
+            begin(tx,id,owner,SYSTEM,Some(home),at,Settings::default(),20000.0)
+        }).unwrap()
     }
 
     fn session(owner:i64,home:i64)->crate::session::Session {
@@ -436,13 +460,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE with imported static data"]
     async fn restart_restores_drone_orders_damage_charges_and_current_control() {
         let (f,owner,home,id,other,other_ship)=fixture().await;
         prepared(&f,owner,home,id).await;
         f.world.lock().parks.get_mut(&SYSTEM).unwrap().ships.get_mut(&id).unwrap().drone.as_mut().unwrap()
             .assignment=Some(Assignment::Guard{pilot:other,ship:other_ship});
-        let mut db=crate::db::connect(&f.url).await.unwrap();checkpoint(&f.world,&mut db).await;
+        checkpoint(&f.world,&f.store).await;
         let stale=capture(&f.world,Some(&[id])).pop().unwrap();
         f.world.lock().parks.get_mut(&SYSTEM).unwrap().ships.remove(&id);
         let s=session(owner,home);let ctx=f.ctx(&s);
@@ -459,7 +482,7 @@ mod tests {
         }
         // Ownership transition invalidates an already captured old-owner save.
         assert_eq!(abandon(&ctx,&[id]).await,Value::Dict(vec![]));
-        assert!(!save(&mut db,&f.world,stale).await.unwrap());
+        assert!(!save(&f.store,&f.world,stale).await.unwrap());
         f.world.lock().parks.get_mut(&SYSTEM).unwrap().ships.remove(&id);
         install(&ctx,SYSTEM,load(&ctx,SYSTEM).await.unwrap()).await.unwrap();
         {
@@ -469,7 +492,7 @@ mod tests {
         let s2=session(other,other_ship);let ctx2=f.ctx(&s2);
         assert!(matches!(scoop(&ctx2,vec![id]).await,Outcome::Value(_)));
         assert!(!load(&ctx,SYSTEM).await.unwrap().iter().any(|s|s.id==id));
-        assert_eq!(f.db.query_one("SELECT count(*) FROM launched_drone_state WHERE drone_id=$1",&[&(id as i32)]).await.unwrap().get::<_,i64>(0),0);
+        assert_eq!(records(&f,id),0);
         assert!(matches!(launch(&ctx2,vec![id]).await,Outcome::Value(_)));
         let w=f.world.lock();let v=&w.parks[&SYSTEM].ships[&id].fight.as_ref().unwrap().vitals;
         assert_eq!((v.armor_damage,v.hull_damage),(3.0,2.0));
@@ -477,62 +500,45 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE with imported static data"]
     async fn delayed_drone_snapshots_cannot_undo_moves_relaunches_or_newer_snapshots() {
         let (f,owner,home,id,_,_)=fixture().await;
         prepared(&f,owner,home,id).await;
         let old=capture(&f.world,Some(&[id])).pop().unwrap();
         f.world.lock().parks.get_mut(&SYSTEM).unwrap().ships.get_mut(&id).unwrap().pos.x=999.0;
         let newer=capture(&f.world,Some(&[id])).pop().unwrap();
-        let mut worker=crate::db::connect(&f.url).await.unwrap();
-        assert!(save(&mut worker,&f.world,newer).await.unwrap());
-        assert!(!save(&mut worker,&f.world,old.clone()).await.unwrap());
-        assert_eq!(f.db.query_one(r#"SELECT x FROM entity WHERE "itemID"=$1"#,&[&(id as i32)]).await.unwrap().get::<_,f64>(0),999.0);
+        assert!(save(&f.store,&f.world,newer).await.unwrap());
+        assert!(!save(&f.store,&f.world,old.clone()).await.unwrap());
+        assert_eq!(x(&f,id),Some(999.0));
+        // A snapshot captured before the drone went away and came back is
+        // of an older generation.
         let snapshot=capture(&f.world,Some(&[id])).pop().unwrap();
-        let mut blocker=crate::db::connect(&f.url).await.unwrap();let blocker=blocker.transaction().await.unwrap();
-        blocker.query_one(r#"SELECT "itemID" FROM entity WHERE "itemID"=$1 FOR UPDATE"#,&[&(id as i32)]).await.unwrap();
-        let pid:i32=worker.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        let write=save(&mut worker,&f.world,snapshot.clone());
-        let transition=async {
-            tokio::time::timeout(std::time::Duration::from_secs(5),async {
-                loop {
-                    let wait:Option<String>=f.db.query_one("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1",&[&pid]).await.unwrap().get(0);
-                    if wait.as_deref()==Some("Lock") {break} tokio::task::yield_now().await;
-                }
-            }).await.unwrap();
-            // Away and back to the same owner/system is an ABA transition.
-            blocker.execute(r#"UPDATE entity SET "locationID"=$2,flag=87 WHERE "itemID"=$1"#,&[&(id as i32),&(home as i32)]).await.unwrap();
-            blocker.execute(r#"UPDATE entity SET "locationID"=$2,flag=0,x=777 WHERE "itemID"=$1"#,&[&(id as i32),&(SYSTEM as i32)]).await.unwrap();
-            begin(&blocker,id,owner,SYSTEM,Some(home),Vec3::new(777.0,0.0,0.0),Settings::default(),20000.0).await.unwrap();
-            blocker.commit().await.unwrap();
-        };
-        let (saved,())=tokio::join!(write,transition);assert!(!saved.unwrap());
-        assert_eq!(f.db.query_one(r#"SELECT x FROM entity WHERE "itemID"=$1"#,&[&(id as i32)]).await.unwrap().get::<_,f64>(0),777.0);
-        f.db.execute(r#"DELETE FROM entity WHERE "itemID"=$1"#,&[&(id as i32)]).await.unwrap();
-        assert!(!save(&mut worker,&f.world,snapshot).await.unwrap());
-        assert_eq!(f.db.query_one("SELECT count(*) FROM launched_drone_state WHERE drone_id=$1",&[&(id as i32)]).await.unwrap().get::<_,i64>(0),0);
+        relaunch(&f,id,owner,home,Vec3::new(777.0,0.0,0.0));
+        assert!(!save(&f.store,&f.world,snapshot.clone()).await.unwrap());
+        assert_eq!(x(&f,id),Some(777.0));
+        f.store.write(|tx|tx.delete_where("entity",&["itemID"],&[store::Value::Int(id)])).unwrap();
+        assert!(!save(&f.store,&f.world,snapshot).await.unwrap());
+        assert_eq!(records(&f,id),0);
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE with imported static data"]
     async fn drone_restore_rechecks_inventory_after_profile_loading() {
         let (f,owner,home,id,other,other_ship)=fixture().await;
         let session=session(owner,home);let ctx=f.ctx(&session);
         let loaded=load(&ctx,SYSTEM).await.unwrap();
-        f.db.execute(r#"UPDATE entity SET "ownerID"=$2,"locationID"=$3,flag=87 WHERE "itemID"=$1"#,
-            &[&(id as i32),&(other as i32),&(other_ship as i32)]).await.unwrap();
+        f.store.write(|tx|{let row=tx.table("entity").get_id(id).unwrap().id;
+            tx.update("entity",row,&[("ownerID",store::Value::Int(other)),("locationID",store::Value::Int(other_ship)),("flag",store::Value::Int(87))])}).unwrap();
         install(&ctx,SYSTEM,loaded).await.unwrap();
         assert!(!f.world.lock().parks[&SYSTEM].ships.contains_key(&id));
         assert!(!load(&ctx,SYSTEM).await.unwrap().iter().any(|s|s.id==id));
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE with imported static data"]
     async fn corrupt_drone_state_recovers_inventory_without_reusing_obsolete_orders() {
         let (f,owner,home,id,_,_)=fixture().await;prepared(&f,owner,home,id).await;
-        let mut db=crate::db::connect(&f.url).await.unwrap();checkpoint(&f.world,&mut db).await;
+        checkpoint(&f.world,&f.store).await;
         let obsolete=capture(&f.world,Some(&[id])).pop().unwrap();
-        f.db.execute("UPDATE launched_drone_state SET state='invalid JSON' WHERE drone_id=$1",&[&(id as i32)]).await.unwrap();
+        f.store.write(|tx|{let row=tx.table("launched_drone_state").get_id(id).unwrap().id;
+            tx.update("launched_drone_state",row,&[("state",store::Value::Text("invalid JSON".into()))])}).unwrap();
         f.world.lock().parks.get_mut(&SYSTEM).unwrap().ships.remove(&id);
         let session=session(owner,home);let ctx=f.ctx(&session);
         install(&ctx,SYSTEM,load(&ctx,SYSTEM).await.unwrap()).await.unwrap();
@@ -542,37 +548,22 @@ mod tests {
             assert_ne!(d.generation(),Some(obsolete.identity.generation));
             assert_eq!(ship.fight.as_ref().unwrap().vitals.hull_damage,2.0);
         }
-        assert!(!save(&mut db,&f.world,obsolete).await.unwrap());
+        assert!(!save(&f.store,&f.world,obsolete).await.unwrap());
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE with imported static data"]
     async fn delayed_drone_loss_does_not_destroy_a_relaunched_generation() {
         let (f,owner,home,id,_,_)=fixture().await;prepared(&f,owner,home,id).await;
         let generation=f.world.lock().parks[&SYSTEM].ships[&id].drone.as_ref().unwrap().generation();
-        let mut blocker=crate::db::connect(&f.url).await.unwrap();let tx=blocker.transaction().await.unwrap();
-        tx.query_one(r#"SELECT "itemID" FROM entity WHERE "itemID"=$1 FOR UPDATE"#,&[&(id as i32)]).await.unwrap();
-        let mut worker=crate::db::connect(&f.url).await.unwrap();let pid:i32=worker.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        let loss=destroy_lost(&mut worker,SYSTEM,owner,id,generation);
-        let relaunch=async {
-            tokio::time::timeout(std::time::Duration::from_secs(5),async {
-                loop {
-                    let wait:Option<String>=f.db.query_one("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1",&[&pid]).await.unwrap().get(0);
-                    if wait.as_deref()==Some("Lock") {break} tokio::task::yield_now().await;
-                }
-            }).await.unwrap();
-            tx.execute(r#"UPDATE entity SET "locationID"=$2,flag=87 WHERE "itemID"=$1"#,&[&(id as i32),&(home as i32)]).await.unwrap();
-            tx.execute(r#"UPDATE entity SET "locationID"=$2,flag=0 WHERE "itemID"=$1"#,&[&(id as i32),&(SYSTEM as i32)]).await.unwrap();
-            let next=begin(&tx,id,owner,SYSTEM,Some(home),Vec3::ZERO,Settings::default(),20000.0).await.unwrap();
-            tx.commit().await.unwrap();next.generation
-        };
-        let (lost,current)=tokio::join!(loss,relaunch);
-        assert!(lost.unwrap().is_none());assert_ne!(generation,Some(current));
-        assert!(f.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(id as i32)]).await.unwrap().is_some());
-        assert!(destroy_lost(&mut worker,SYSTEM,owner+1,id,Some(current)).await.unwrap().is_none());
-        assert!(destroy_lost(&mut worker,SYSTEM+1,owner,id,Some(current)).await.unwrap().is_none());
-        assert!(destroy_lost(&mut worker,SYSTEM,owner,id,Some(current)).await.unwrap().is_some());
-        assert!(f.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(id as i32)]).await.unwrap().is_none());
-        assert_eq!(f.db.query_one("SELECT count(*) FROM launched_drone_state WHERE drone_id=$1",&[&(id as i32)]).await.unwrap().get::<_,i64>(0),0);
+        // The drone went away and came back, launched again, before the
+        // loss of the old generation was destroyed.
+        let current=relaunch(&f,id,owner,home,Vec3::ZERO).generation;
+        assert!(destroy_lost(&f.store,SYSTEM,owner,id,generation).await.unwrap().is_none());assert_ne!(generation,Some(current));
+        assert!(f.store.read(|db|db.table("entity").get_id(id).is_some()));
+        assert!(destroy_lost(&f.store,SYSTEM,owner+1,id,Some(current)).await.unwrap().is_none());
+        assert!(destroy_lost(&f.store,SYSTEM+1,owner,id,Some(current)).await.unwrap().is_none());
+        assert!(destroy_lost(&f.store,SYSTEM,owner,id,Some(current)).await.unwrap().is_some());
+        assert!(f.store.read(|db|db.table("entity").get_id(id).is_none()));
+        assert_eq!(records(&f,id),0);
     }
 }

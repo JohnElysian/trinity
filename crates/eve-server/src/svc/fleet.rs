@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::membership::Refused;
 use super::{bound, gang, rows::key_val};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{Db, StoreError, Value as StoreValue};
 use crate::world::{Move, WorldState};
 use eve_marshal::Value;
 
@@ -530,27 +531,30 @@ async fn invite(call: &Call, ctx: &Ctx<'_>, me: i64) -> Refused<Value> {
         f.authorize_member(me, &m)?;
         (id, m, bot, w.gangs.get(id).unwrap().members.clone())
     };
-    let mut enemies = Vec::new();
-    for member in members {
-        enemies.extend(super::war::enemies_of(gang::side_of(ctx.db, member).await));
-    }
-    enemies.sort_unstable();
-    enemies.dedup();
-    let brought = super::war::enemies_of(gang::side_of(ctx.db, target).await)
-        .into_iter()
-        .filter(|e| !enemies.contains(e))
-        .collect::<Vec<_>>();
+    let (enemies, brought) = ctx.store.read(|db| {
+        let mut enemies = Vec::new();
+        for member in members {
+            enemies.extend(super::war::enemies_of(gang::side_of(db, member)));
+        }
+        enemies.sort_unstable();
+        enemies.dedup();
+        let brought = super::war::enemies_of(gang::side_of(db, target))
+            .into_iter()
+            .filter(|e| !enemies.contains(e))
+            .collect::<Vec<_>>();
+        (enemies, brought)
+    });
     if call.arg_id(4) == 0 && !brought.is_empty() {
-        let names = gang::names_of(ctx.db, &brought).await;
+        let names = ctx.store.read(|db| gang::names_of(db, &brought));
         return Err(gang::message_with(
             "GangCandidateDodgyN",
             &[("corpNames", Value::text(names.join(", ")))],
         ));
     }
-    let name = gang::name_of(ctx.db, me).await;
-    let enemy_names = gang::names_of(ctx.db, &enemies).await;
+    let (name, enemy_names) = ctx.store.read(|db| (gang::name_of(db, me), gang::names_of(db, &enemies)));
     let mut w = ctx.world.lock();
-    // Revalidate after database awaits: the fleet or destination may have changed.
+    // Revalidate after reading the database with the world unlocked: the
+    // fleet or destination may have changed.
     let f = fleet(&w, id)?;
     if f.invitations.contains_key(&target) {
         return Err(Outcome::custom("That pilot has already been invited."));
@@ -1000,31 +1004,41 @@ pub fn bonuses(w: &WorldState, me: i64) -> BTreeMap<i32, f64> {
     bonuses
 }
 
-pub async fn refresh_skills(
+pub fn refresh_skills(
     world: &crate::world::World,
-    db: &tokio_postgres::Client,
-) -> Result<(), tokio_postgres::Error> {
+    db: &Db,
+) -> Result<(), StoreError> {
     let ids = world
         .lock()
         .gangs
         .gangs
         .values()
         .filter_map(|g| g.fleet.as_ref())
-        .flat_map(|f| f.members.keys().map(|id| *id as i32))
-        .collect::<Vec<_>>();
+        .flat_map(|f| f.members.keys().copied())
+        .collect::<BTreeSet<_>>();
     if ids.is_empty() {
         return Ok(());
     }
-    let rows = db.query(r#"SELECT e."ownerID", e."typeID", max(coalesce(a."valueInt", a."valueFloat"::bigint, 0))
-        FROM entity e JOIN entity_attributes a ON a."itemID" = e."itemID" AND a."attributeID" = 280
-        WHERE e."ownerID" = ANY($1) AND e.flag IN (7,61) AND e."typeID" = ANY($2)
-        GROUP BY e."ownerID", e."typeID""#, &[&ids, &vec![3348i32,3349,3350,11574,20494,20495,22536,24764]]).await?;
+    // Each member's trained level of each fleet command skill: the highest
+    // level attribute (280) among their skills of that type.
+    const COMMAND_SKILLS: [i64; 8] = [3348, 3349, 3350, 11574, 20494, 20495, 22536, 24764];
+    let (entity, attributes) = (db.table("entity"), db.table("entity_attributes"));
     let mut skills = BTreeMap::<i64, BTreeMap<i32, i64>>::new();
-    for row in rows {
-        skills
-            .entry(row.get::<_, i32>(0) as i64)
-            .or_default()
-            .insert(row.get(1), row.get::<_, i64>(2).clamp(0, 5));
+    for owner in &ids {
+        for type_id in COMMAND_SKILLS {
+            for e in entity.find(&["ownerID", "typeID"], &[StoreValue::Int(*owner), StoreValue::Int(type_id)]) {
+                if !matches!(e.int("flag"), Some(7 | 61)) {
+                    continue;
+                }
+                let Some(level) = attributes.get(&[e.value("itemID").clone(), StoreValue::Int(280)]).map(|a| {
+                    a.int("valueInt").or_else(|| a.float("valueFloat").map(|f| f.round_ties_even() as i64)).unwrap_or(0).clamp(0, 5)
+                }) else {
+                    continue;
+                };
+                let best = skills.entry(*owner).or_default().entry(type_id as i32).or_insert(level);
+                *best = (*best).max(level);
+            }
+        }
     }
     for g in world.lock().gangs.gangs.values_mut() {
         if let Some(f) = &mut g.fleet {
@@ -1040,14 +1054,14 @@ pub async fn refresh_skills(
 
 /// Recompute external dogma modifiers after membership, position or skill
 /// changes. Catalog state also serves fitting and item-info RPCs consistently.
-pub async fn update_bonuses(world: &crate::world::World, db: &tokio_postgres::Client, catalog: &crate::dogma::Catalog) {
+pub fn update_bonuses(world: &crate::world::World, db: &Db, catalog: &crate::dogma::Catalog) {
     let next = {
         let w = world.lock();
         w.gangs.gangs.values().filter_map(|g| g.fleet.as_ref()).flat_map(|f| f.members.keys())
             .map(|id| (*id, bonuses(&w, *id))).filter(|(_, b)| !b.is_empty()).collect()
     };
     for (char_id, previous) in catalog.replace_fleet_bonuses(next) {
-        if let Err(e) = super::inflight::fleet_refit(db, catalog, world, char_id, &previous).await {
+        if let Err(e) = super::inflight::fleet_refit(db, catalog, world, char_id, &previous) {
             tracing::warn!("updating fleet bonuses for {char_id}: {e}");
             catalog.restore_fleet_bonuses(char_id, previous);
         }
@@ -1059,7 +1073,7 @@ pub async fn gang_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         call.method.as_str(),
         "GetActiveStatus" | "RegisterForDamageUpdates"
     ) {
-        if let Err(e) = refresh_skills(ctx.world, ctx.db).await {
+        if let Err(e) = ctx.store.read(|db| refresh_skills(ctx.world, db)) {
             return Some(Outcome::custom(format!("Could not load fleet skills: {e}")));
         }
     }
@@ -1399,18 +1413,19 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn command_skills_enable_squad_bonuses_only_while_commander_is_in_space() {
+        use crate::store::Value::Int;
         let db = crate::test_support::Database::load().await;
-        let commander = db.id().await;
-        let member = db.id().await;
-        for (skill, level) in [(3348i32, 1i64), (3350, 4)] {
-            let item = db.id().await;
-            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES ($1,$2,$3,$3,7,1,1)"#, &[&item, &skill, &commander]).await.unwrap();
-            db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,280,$2)"#, &[&item, &level]).await.unwrap();
+        let commander = i64::from(db.id().await);
+        let member = i64::from(db.id().await);
+        for (skill, level) in [(3348i64, 1i64), (3350, 4)] {
+            let item = i64::from(db.id().await);
+            db.store.write(|tx| {
+                tx.insert("entity", &[("itemID", Int(item)), ("typeID", Int(skill)), ("ownerID", Int(commander)), ("locationID", Int(commander)),
+                    ("flag", Int(7)), ("quantity", Int(1)), ("singleton", Int(1))])?;
+                tx.insert("entity_attributes", &[("itemID", Int(item)), ("attributeID", Int(280)), ("valueInt", Int(level))])
+            }).unwrap();
         }
-        let (commander, member) = (i64::from(commander), i64::from(member));
         let (mut commander_rx, _member_rx) = {
             let mut w = db.world.lock();
             let c = w.connect(1);
@@ -1434,29 +1449,23 @@ mod tests {
             w.gangs.gangs.get_mut(&id).unwrap().members.push(member);
             (c, m)
         };
-        refresh_skills(&db.world, &db.db).await.unwrap();
-        let ship = db.id().await;
-        db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-            VALUES ($1,606,$2,30004971,0,1,1)"#, &[&ship, &(member as i32)]).await.unwrap();
-        let base = crate::dogma::Loadout::load(&db.db,&db.dogma,member,Some(ship as i64),&Default::default()).await.unwrap();
+        db.store.read(|d| refresh_skills(&db.world, d)).unwrap();
+        let ship = i64::from(db.id().await);
+        db.store.write(|tx| tx.insert("entity", &[("itemID", Int(ship)), ("typeID", Int(606)), ("ownerID", Int(member)), ("locationID", Int(30004971)),
+            ("flag", Int(0)), ("quantity", Int(1)), ("singleton", Int(1))])).unwrap();
+        let base = db.store.read(|d| crate::dogma::Loadout::load(d,&db.dogma,member,Some(ship),&Default::default())).unwrap();
         let shield = base.value(base.ship().unwrap(),263);
         assert!(shield > 0.0);
-        let profile = super::super::inflight::profile(&db.db,&db.dogma,member,ship as i64,&Default::default(),crate::combat::now_ms()).await.unwrap().unwrap();
-        let mut live = crate::ballpark::Ship::new(ship as i64,2,profile.stats,profile.pilot,Default::default(),Default::default());
+        let profile = db.store.read(|d| super::super::inflight::profile(d,&db.dogma,member,ship,&Default::default(),crate::combat::now_ms())).unwrap().unwrap();
+        let mut live = crate::ballpark::Ship::new(ship,2,profile.stats,profile.pilot,Default::default(),Default::default());
         live.fight = Some(profile.fighter);
         let mut park = crate::ballpark::Park::new(30004971,vec![],0);
-        park.ships.insert(ship as i64,live);
+        park.ships.insert(ship,live);
         db.world.lock().parks.insert(30004971,park);
-        // A failed query must leave the previous catalog state available so
-        // the following heartbeat retries, instead of stranding a live ship.
-        let unavailable = crate::db::connect(&db.url).await.unwrap();
-        unavailable.batch_execute("SET search_path TO pg_catalog").await.unwrap();
-        update_bonuses(&db.world,&unavailable,&db.dogma).await;
-        assert!(db.dogma.fleet_bonuses(member).is_empty());
-        update_bonuses(&db.world,&db.db,&db.dogma).await;
-        let boosted = crate::dogma::Loadout::load(&db.db,&db.dogma,member,Some(ship as i64),&Default::default()).await.unwrap();
+        db.store.read(|d| update_bonuses(&db.world,d,&db.dogma));
+        let boosted = db.store.read(|d| crate::dogma::Loadout::load(d,&db.dogma,member,Some(ship),&Default::default())).unwrap();
         assert!((boosted.value(boosted.ship().unwrap(),263) - shield * 1.08).abs() < 0.0001);
-        assert!((db.world.lock().parks[&30004971].ships[&(ship as i64)].fight.as_ref().unwrap().vitals.shield.max - shield * 1.08).abs() < 0.0001);
+        assert!((db.world.lock().parks[&30004971].ships[&ship].fight.as_ref().unwrap().vitals.shield.max - shield * 1.08).abs() < 0.0001);
         {
             let mut w = db.world.lock();
             assert_eq!(bonuses(&w, member).get(&263), Some(&8.0));
@@ -1466,10 +1475,10 @@ mod tests {
             assert!(bonuses(&w, member).is_empty());
             pulse(&mut w, 2_000);
         }
-        update_bonuses(&db.world,&db.db,&db.dogma).await;
-        let restored = crate::dogma::Loadout::load(&db.db,&db.dogma,member,Some(ship as i64),&Default::default()).await.unwrap();
+        db.store.read(|d| update_bonuses(&db.world,d,&db.dogma));
+        let restored = db.store.read(|d| crate::dogma::Loadout::load(d,&db.dogma,member,Some(ship),&Default::default())).unwrap();
         assert!((restored.value(restored.ship().unwrap(),263) - shield).abs() < 0.0001);
-        assert!((db.world.lock().parks[&30004971].ships[&(ship as i64)].fight.as_ref().unwrap().vitals.shield.max - shield).abs() < 0.0001);
+        assert!((db.world.lock().parks[&30004971].ships[&ship].fight.as_ref().unwrap().vitals.shield.max - shield).abs() < 0.0001);
         let mut squad_updates = Vec::new();
         while let Ok(push) = commander_rx.try_recv() {
             if let crate::world::Push::Notify(n) = push {

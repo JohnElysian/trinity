@@ -235,8 +235,46 @@ pub struct World {
 }
 
 impl World {
-    pub fn lock(&self) -> MutexGuard<'_, WorldState> {
-        self.state.lock().expect("world lock poisoned")
+    pub fn lock(&self) -> WorldGuard<'_> {
+        let guard = self.state.lock().expect("world lock poisoned");
+        WORLD_HELD.with(|h| h.set(h.get() + 1));
+        WorldGuard { guard }
+    }
+}
+
+thread_local! {
+    /// How many world guards this thread holds.
+    static WORLD_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread holds the world lock. The store is never entered
+/// while it does: a store write may lock the world (store first, then
+/// world), so the other order could deadlock.
+pub fn world_held() -> bool {
+    WORLD_HELD.with(|h| h.get() > 0)
+}
+
+/// The locked world.
+pub struct WorldGuard<'a> {
+    guard: MutexGuard<'a, WorldState>,
+}
+
+impl Drop for WorldGuard<'_> {
+    fn drop(&mut self) {
+        WORLD_HELD.with(|h| h.set(h.get() - 1));
+    }
+}
+
+impl std::ops::Deref for WorldGuard<'_> {
+    type Target = WorldState;
+    fn deref(&self) -> &WorldState {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WorldGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WorldState {
+        &mut self.guard
     }
 }
 

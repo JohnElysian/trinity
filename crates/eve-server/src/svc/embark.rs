@@ -3,22 +3,22 @@
 //! boarded by two pilots or destroyed halfway through the transfer.
 
 use std::collections::BTreeSet;
-use tokio_postgres::GenericClient;
 use tracing::warn;
 
 use crate::ballpark::{Ship, Vec3};
 use crate::items::{ItemTxn, NewItem};
 use crate::services::Ctx;
+use crate::store::{self, Db, StoreError};
 use super::{inflight, moves::{refuse, MoveError}, space};
 
 const CAPSULE: i64 = 670;
 /// Trinity const.maxBoardingDistance.
 const BOARD_RANGE: f64 = 6550.0;
 
-pub async fn can_fly(db: &impl GenericClient, pilot: i64, type_id: i64) -> Result<(), MoveError> {
-    let required = super::fitting::required_skill_levels(db, type_id).await?;
-    let types: Vec<i32> = required.keys().copied().collect();
-    let trained = super::skills::levels(db, pilot, &types).await?;
+pub fn can_fly(db: &Db, pilot: i64, type_id: i64) -> Result<(), MoveError> {
+    let required = super::fitting::required_skill_levels(db, type_id)?;
+    let types: Vec<_> = required.keys().copied().collect();
+    let trained = super::skills::levels(db, pilot, &types)?;
     for (skill, level) in required {
         if trained.get(&skill).copied().unwrap_or(0) < level {
             return refuse(format!("You need skill {skill} trained to level {level} to pilot this ship."));
@@ -29,8 +29,8 @@ pub async fn can_fly(db: &impl GenericClient, pilot: i64, type_id: i64) -> Resul
 
 /// An empty hull keeps its property owner but receives no former pilot's
 /// skills or implants. Its pilot field is only ownership metadata.
-pub(crate) async fn empty_profile(db: &impl GenericClient, ctx: &Ctx<'_>, hull: &Ship) -> Result<Ship, MoveError> {
-    let Some(profile) = inflight::profile(db, ctx.dogma, 0, hull.id, &BTreeSet::new(), crate::combat::now_ms()).await? else {
+pub(crate) fn empty_profile(db: &Db, ctx: &Ctx<'_>, hull: &Ship) -> Result<Ship, MoveError> {
+    let Some(profile) = inflight::profile(db, ctx.dogma, 0, hull.id, &BTreeSet::new(), crate::combat::now_ms())? else {
         return refuse("The abandoned ship could not be loaded.");
     };
     let mut empty = hull.clone();
@@ -51,30 +51,30 @@ pub(crate) async fn empty_profile(db: &impl GenericClient, ctx: &Ctx<'_>, hull: 
 
 /// Reconstruct only ships that are nobody's active hull. Offline characters'
 /// active ships remain owned by their login path, never become boardable.
-pub async fn load_empty(ctx: &Ctx<'_>, system: i64) -> Result<Vec<Ship>, tokio_postgres::Error> {
-    let rows = ctx.db.query(r#"SELECT e."itemID",e."ownerID",e.x,e.y,e.z,
-        COALESCE(c."corporationID",0),co."allianceID"
-        FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "invGroups" g ON g."groupID"=t."groupID"
-        LEFT JOIN "character_" c ON c."characterID"=e."ownerID"
-        LEFT JOIN corporation co ON co."corporationID"=c."corporationID"
-        WHERE e."locationID"=$1 AND e.flag=0 AND e.singleton=1 AND g."categoryID"=6
-          AND NOT EXISTS (SELECT 1 FROM "character_" p WHERE p."shipID"=e."itemID")"#, &[&(system as i32)]).await?;
-    let mut ships = Vec::new();
-    for row in rows {
-        let id = i64::from(row.get::<_, i32>(0));
-        let pos = Vec3::new(row.get(2), row.get(3), row.get(4));
-        if !pos.is_finite() { continue; }
-        let Some(mut p) = inflight::profile(ctx.db, ctx.dogma, 0, id, &BTreeSet::new(), crate::combat::now_ms()).await? else { continue; };
-        p.pilot.char_id = i64::from(row.get::<_, i32>(1));
-        p.pilot.corp_id = i64::from(row.get::<_, i32>(5));
-        p.pilot.alliance_id = row.get::<_, Option<i32>>(6).map(i64::from);
-        let mut ship = Ship::new(id, 0, p.stats, p.pilot, pos, Vec3::ZERO);
-        ship.fight = Some(p.fighter);
-        ship.unpiloted = true;
-        ships.push(ship);
-    }
-    Ok(ships)
+pub async fn load_empty(ctx: &Ctx<'_>, system: i64) -> Result<Vec<Ship>, StoreError> {
+    let ships = crate::sde::get().types_in_category(6);
+    ctx.store.read(|db| {
+        let characters = db.table("character_");
+        let corporations = db.table("corporation");
+        let mut empty = Vec::new();
+        for e in db.table("entity").find(&["locationID", "flag"], &[store::Value::Int(system), store::Value::Int(0)]) {
+            let (Some(id), Some(owner), Some(type_id)) = (e.int("itemID"), e.int("ownerID"), e.int("typeID")) else { continue };
+            if e.int("singleton") != Some(1) || !ships.contains(&(type_id as i32)) { continue; }
+            if characters.find(&["shipID"], &[store::Value::Int(id)]).next().is_some() { continue; }
+            let pos = Vec3::new(e.float("x").unwrap_or(0.0), e.float("y").unwrap_or(0.0), e.float("z").unwrap_or(0.0));
+            if !pos.is_finite() { continue; }
+            let Some(mut p) = inflight::profile(db, ctx.dogma, 0, id, &BTreeSet::new(), crate::combat::now_ms())? else { continue; };
+            let corp = characters.get_id(owner).and_then(|c| c.int("corporationID"));
+            p.pilot.char_id = owner;
+            p.pilot.corp_id = corp.unwrap_or(0);
+            p.pilot.alliance_id = corp.and_then(|corp| corporations.get_id(corp)).and_then(|co| co.int("allianceID"));
+            let mut ship = Ship::new(id, 0, p.stats, p.pilot, pos, Vec3::ZERO);
+            ship.fight = Some(p.fighter);
+            ship.unpiloted = true;
+            empty.push(ship);
+        }
+        Ok(empty)
+    })
 }
 
 fn ready_in(ctx: &Ctx<'_>, w: &crate::world::WorldState, system: i64, current: i64, target: Option<i64>, reserved: bool) -> Result<(), MoveError> {
@@ -115,7 +115,7 @@ fn ready(ctx: &Ctx<'_>, system: i64, current: i64, target: Option<i64>) -> Resul
 }
 
 /// Change the cockpit profile without rewinding damage, charge or position
-/// accumulated during the database transaction.
+/// accumulated while the transfer was prepared.
 pub(crate) fn with_profile(live: &Ship, prepared: &Ship) -> Ship {
     let mut ship=live.clone();
     if let Some(fighter)=&prepared.fight {
@@ -136,87 +136,93 @@ pub async fn switch(ctx: &Ctx<'_>, target: Option<i64>) -> Result<i64, MoveError
         };
     if target == Some(current) { return Ok(current); }
     ready(ctx, system, current, target)?;
-    let mut db = crate::db::connect(ctx.db_url).await?;
-    let mut txn = ItemTxn::begin(&mut db).await?;
-    if !super::login::lock_character_lifecycle(txn.tx(), pilot as i32).await? {
-        return refuse("That character is no longer available.");
-    }
-    let state = txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2 AND "stationID"=0 AND "solarSystemID"=$3 FOR UPDATE"#,
-        &[&(pilot as i32), &(current as i32), &(system as i32)]).await?;
-    if state.is_none() { return refuse("Your ship or location changed. Try again."); }
-    let mut ids = vec![current];
-    ids.extend(target);
-    ids.sort_unstable();
-    for id in ids { if txn.item(id).await?.is_none() { return refuse("That ship no longer exists."); } }
-    let old = txn.item(current).await?.unwrap();
-    if old.owner_id != pilot || old.location_id != system { return refuse("You do not control that ship."); }
     let mut recipients = vec![ctx.client_id];
-    if let Some(target) = target {
-        let hull = txn.item(target).await?.unwrap();
-        if hull.category_id != 6 || !hull.singleton || hull.flag != 0 || hull.location_id != system {
-            return refuse("You can only board an assembled ship here in space.");
+    // Whether this transfer reserved the live hulls, which a failure must
+    // release (and only then: another transfer may hold them).
+    let mut reserved = false;
+    let done = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
+        if !super::login::lock_character_lifecycle(txn.db(), pilot)? {
+            return refuse("That character is no longer available.");
         }
-        if txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "shipID"=$1"#, &[&(target as i32)]).await?.is_some() {
-            return refuse("That ship already has a pilot.");
+        let state = txn.db().table("character_").get_id(pilot).filter(|c| {
+            c.int("shipID") == Some(current) && c.int("stationID") == Some(0) && c.int("solarSystemID") == Some(system)
+        });
+        if state.is_none() { return refuse("Your ship or location changed. Try again."); }
+        let mut ids = vec![current];
+        ids.extend(target);
+        ids.sort_unstable();
+        for id in ids { if txn.item(id)?.is_none() { return refuse("That ship no longer exists."); } }
+        let old = txn.item(current)?.unwrap();
+        if old.owner_id != pilot || old.location_id != system { return refuse("You do not control that ship."); }
+        if let Some(target) = target {
+            let hull = txn.item(target)?.unwrap();
+            if hull.category_id != 6 || !hull.singleton || hull.flag != 0 || hull.location_id != system {
+                return refuse("You can only board an assembled ship here in space.");
+            }
+            if txn.db().table("character_").find(&["shipID"], &[store::Value::Int(target)]).next().is_some() {
+                return refuse("That ship already has a pilot.");
+            }
+            can_fly(txn.db(), pilot, hull.type_id)?;
+            recipients.extend(ctx.world.lock().clients_of(hull.owner_id));
         }
-        can_fly(txn.tx(), pilot, hull.type_id).await?;
-        recipients.extend(ctx.world.lock().clients_of(hull.owner_id));
-    }
-    // Revalidate after waiting for SQL locks, then reserve both live hulls in
-    // one short world-lock section. No database await holds the world lock.
-    ready(ctx, system, current, target)?;
-    let (old_live, target_live) = {
-        let mut w = ctx.world.lock();
-        ready_in(ctx,&w,system,current,target,false)?;
-        let Some(park) = w.parks.get_mut(&system) else { return refuse("The ballpark changed."); };
-        let old=park.ships.get_mut(&current).unwrap();old.identity_reserved=true;
-        let old=old.clone();
-        let target=target.map(|id| {let hull=park.ships.get_mut(&id).unwrap();hull.identity_reserved=true;hull.clone()});
-        (old,target)
-    };
-    let done = async {
-        if let Some(f) = &old_live.fight { inflight::write_vitals(txn.tx(), current, f, false).await?; }
-        txn.set_position(current, old_live.pos.tuple()).await?;
+        // Revalidate against the live ships, then reserve both live hulls in
+        // one short world-lock section.
+        ready(ctx, system, current, target)?;
+        let (old_live, target_live) = {
+            let mut w = ctx.world.lock();
+            ready_in(ctx,&w,system,current,target,false)?;
+            let Some(park) = w.parks.get_mut(&system) else { return refuse("The ballpark changed."); };
+            let old=park.ships.get_mut(&current).unwrap();old.identity_reserved=true;
+            let old=old.clone();
+            let target=target.map(|id| {let hull=park.ships.get_mut(&id).unwrap();hull.identity_reserved=true;hull.clone()});
+            (old,target)
+        };
+        reserved = true;
+        if let Some(f) = &old_live.fight { inflight::write_vitals(txn.tx(), current, f, false)?; }
+        txn.set_position(current, old_live.pos.tuple())?;
         let next = match target_live.as_ref() {
             Some(hull) => {
-                if let Some(f) = &hull.fight { inflight::write_vitals(txn.tx(), hull.id, f, false).await?; }
-                txn.set_position(hull.id, hull.pos.tuple()).await?;
-                // All carried property follows the hull. Lock and reread each
-                // child so an item that moved out while waiting is not seized.
+                if let Some(f) = &hull.fight { inflight::write_vitals(txn.tx(), hull.id, f, false)?; }
+                txn.set_position(hull.id, hull.pos.tuple())?;
+                // All carried property follows the hull; each child is
+                // reread so only what is still inside is handed over.
                 let mut parents = vec![hull.id];
                 let mut seen = BTreeSet::new();
                 while let Some(parent) = parents.pop() {
                     if !seen.insert(parent) { continue; }
-                    txn.set_owner(parent, pilot).await?;
-                    let children = txn.tx().query(r#"SELECT "itemID" FROM entity WHERE "locationID"=$1 ORDER BY "itemID""#, &[&(parent as i32)]).await?;
-                    for row in children {
-                        let id = i64::from(row.get::<_, i32>(0));
+                    txn.set_owner(parent, pilot)?;
+                    let mut children: Vec<i64> = txn.db().table("entity").find(&["locationID"], &[store::Value::Int(parent)]).filter_map(|e| e.int("itemID")).collect();
+                    children.sort_unstable();
+                    for id in children {
                         if id == pilot { continue; }
-                        if txn.item(id).await?.is_some_and(|i| i.location_id==parent) { parents.push(id); }
+                        if txn.item(id)?.is_some_and(|i| i.location_id==parent) { parents.push(id); }
                     }
                 }
                 hull.id
             }
             None => {
-                let id = txn.create(NewItem { type_id: CAPSULE, owner_id: pilot, location_id: system, flag: 0, quantity: 1, singleton: true }).await?;
-                txn.set_position(id, old_live.pos.tuple()).await?;
+                let id = txn.create(NewItem { type_id: CAPSULE, owner_id: pilot, location_id: system, flag: 0, quantity: 1, singleton: true })?;
+                txn.set_position(id, old_live.pos.tuple())?;
                 id
             }
         };
         let mut empty = if old.type_id == CAPSULE {
-            txn.destroy(current).await?;
+            txn.destroy(current)?;
             None
         } else {
-            Some(empty_profile(txn.tx(), ctx, &old_live).await?)
+            Some(empty_profile(txn.db(), ctx, &old_live)?)
         };
         if let Some(empty) = &mut empty {
-            if let Some(f) = &empty.fight { inflight::write_vitals(txn.tx(), current, f, false).await?; }
+            if let Some(f) = &empty.fight { inflight::write_vitals(txn.tx(), current, f, false)?; }
         }
-        txn.tx().execute(r#"UPDATE "character_" SET "shipID"=$2 WHERE "characterID"=$1"#, &[&(pilot as i32), &(next as i32)]).await?;
+        set_ship(txn.tx(), pilot, next)?;
         // Character inventory location follows the station/system convention
         // used by docking, jumps and clone transfers; shipID is the cockpit.
-        txn.tx().execute(r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#, &[&(pilot as i32), &(system as i32)]).await?;
-        let Some(profile) = inflight::profile(txn.tx(), ctx.dogma, pilot, next, &BTreeSet::new(), crate::combat::now_ms()).await? else {
+        if let Some(row) = txn.db().table("entity").get_id(pilot).map(|e| e.id) {
+            txn.tx().update("entity", row, &[("locationID", store::Value::Int(system))])?;
+        }
+        let Some(profile) = inflight::profile(txn.db(), ctx.dogma, pilot, next, &BTreeSet::new(), crate::combat::now_ms())? else {
             return refuse("The new ship profile could not be loaded.");
         };
         let pos = target_live.as_ref().map_or(old_live.pos, |s|s.pos);
@@ -226,7 +232,7 @@ pub async fn switch(ctx: &Ctx<'_>, target: Option<i64>) -> Result<i64, MoveError
             return refuse("That ship is too damaged for you to board.");
         }
         // Freeze the final durable snapshot as late as possible. The hulls
-        // stayed visible and combat continued while the preceding SQL ran.
+        // stayed visible and combat continued while the transfer was prepared.
         let (latest_old,latest_target)={
             let mut w=ctx.world.lock();
             if let Some(park)=w.parks.get_mut(&system) {park.advance(crate::destiny::tick_now());}
@@ -237,19 +243,19 @@ pub async fn switch(ctx: &Ctx<'_>, target: Option<i64>) -> Result<i64, MoveError
         if let Some(prepared)=&empty {empty=Some(with_profile(&latest_old,prepared));}
         if let Some(latest)=&latest_target {ship=with_profile(latest,&ship);} else {ship.arrive(latest_old.pos);}
         if let Some(hull)=&empty {
-            txn.set_position(current,hull.pos.tuple()).await?;
-            if let Some(f)=&hull.fight {inflight::write_vitals(txn.tx(),current,f,false).await?;}
+            txn.set_position(current,hull.pos.tuple())?;
+            if let Some(f)=&hull.fight {inflight::write_vitals(txn.tx(),current,f,false)?;}
         }
-        txn.set_position(next,ship.pos.tuple()).await?;
-        if let Some(f)=&ship.fight {inflight::write_vitals(txn.tx(),next,f,false).await?;}
-        // A lethal hit or range change while the final writes waited aborts
-        // the transfer; the next heartbeat processes the actual destruction.
+        txn.set_position(next,ship.pos.tuple())?;
+        if let Some(f)=&ship.fight {inflight::write_vitals(txn.tx(),next,f,false)?;}
+        // A lethal hit or range change while the final writes were made
+        // aborts the transfer; the next heartbeat processes the actual
+        // destruction.
         ready_in(ctx,&ctx.world.lock(),system,current,target,true)?;
-        let events = txn.commit().await?;
-        Ok::<_, MoveError>((ship, empty, events))
-    }.await;
+        Ok::<_, MoveError>((ship, empty, old_live, txn.events()))
+    });
     match done {
-        Ok((mut ship, mut empty, events)) => {
+        Ok((mut ship, mut empty, old_live, events)) => {
             let next = ship.id;
             let mut w = ctx.world.lock();
             // Keep damage, charge and position changes that happened during
@@ -280,13 +286,23 @@ pub async fn switch(ctx: &Ctx<'_>, target: Option<i64>) -> Result<i64, MoveError
             Ok(next)
         }
         Err(error) => {
-            let mut w = ctx.world.lock();
-            if let Some(park)=w.parks.get_mut(&system) {
-                if let Some(ship)=park.ships.get_mut(&current) {ship.identity_reserved=false;}
-                if let Some(id)=target {if let Some(ship)=park.ships.get_mut(&id) {ship.identity_reserved=false;}}
+            if reserved {
+                let mut w = ctx.world.lock();
+                if let Some(park)=w.parks.get_mut(&system) {
+                    if let Some(ship)=park.ships.get_mut(&current) {ship.identity_reserved=false;}
+                    if let Some(id)=target {if let Some(ship)=park.ships.get_mut(&id) {ship.identity_reserved=false;}}
+                }
             }
             Err(error)
         }
+    }
+}
+
+/// The character's active ship is now `ship`.
+fn set_ship(tx: &mut store::Tx<'_>, pilot: i64, ship: i64) -> Result<(), StoreError> {
+    match tx.table("character_").get_id(pilot).map(|c| c.id) {
+        Some(row) => tx.update("character_", row, &[("shipID", store::Value::Int(ship))]),
+        None => Ok(()),
     }
 }
 
@@ -297,36 +313,37 @@ pub async fn station_switch(ctx: &Ctx<'_>, target: Option<i64>) -> Result<i64, M
         return refuse("You must be docked to use the station hangar.");
     };
     if target == Some(current) { return Ok(current); }
-    let mut db=crate::db::connect(ctx.db_url).await?;
-    let mut txn=ItemTxn::begin(&mut db).await?;
-    if !super::login::lock_character_lifecycle(txn.tx(),pilot as i32).await? { return refuse("That character is no longer available."); }
-    if txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2 AND "stationID"=$3 FOR UPDATE"#,
-        &[&(pilot as i32),&(current as i32),&(station as i32)]).await?.is_none() {
-        return refuse("Your ship or station changed. Try again.");
-    }
-    let mut ids=vec![current];ids.extend(target);ids.sort_unstable();
-    for id in ids { if txn.item(id).await?.is_none() { return refuse("That ship no longer exists."); } }
-    let old=txn.item(current).await?.unwrap();
-    if old.owner_id!=pilot || old.location_id!=station || old.flag!=4 || !old.singleton || old.category_id!=6 {
-        return refuse("You do not control that ship in this station.");
-    }
-    if target.is_none() && old.type_id==CAPSULE { return Ok(current); }
-    let next=if let Some(target)=target {
-        let hull=txn.item(target).await?.unwrap();
-        if hull.owner_id!=pilot || hull.location_id!=station || hull.flag!=4 || !hull.singleton || hull.category_id!=6 {
-            return refuse("You can only board your assembled ships in this station.");
+    let switched=ctx.store.write(|tx| {
+        let mut txn=ItemTxn::new(tx);
+        if !super::login::lock_character_lifecycle(txn.db(),pilot)? { return refuse("That character is no longer available."); }
+        if txn.db().table("character_").get_id(pilot).filter(|c|c.int("shipID")==Some(current) && c.int("stationID")==Some(station)).is_none() {
+            return refuse("Your ship or station changed. Try again.");
         }
-        if txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "shipID"=$1 AND "characterID"<>$2"#,&[&(target as i32),&(pilot as i32)]).await?.is_some() {
-            return refuse("That ship already has a pilot.");
+        let mut ids=vec![current];ids.extend(target);ids.sort_unstable();
+        for id in ids { if txn.item(id)?.is_none() { return refuse("That ship no longer exists."); } }
+        let old=txn.item(current)?.unwrap();
+        if old.owner_id!=pilot || old.location_id!=station || old.flag!=4 || !old.singleton || old.category_id!=6 {
+            return refuse("You do not control that ship in this station.");
         }
-        can_fly(txn.tx(),pilot,hull.type_id).await?;
-        target
-    } else {
-        txn.create(NewItem {type_id:CAPSULE,owner_id:pilot,location_id:station,flag:4,quantity:1,singleton:true}).await?
-    };
-    if old.type_id==CAPSULE { txn.destroy(current).await?; }
-    txn.tx().execute(r#"UPDATE "character_" SET "shipID"=$2 WHERE "characterID"=$1"#,&[&(pilot as i32),&(next as i32)]).await?;
-    let events=txn.commit().await?;
+        if target.is_none() && old.type_id==CAPSULE { return Ok(None); }
+        let next=if let Some(target)=target {
+            let hull=txn.item(target)?.unwrap();
+            if hull.owner_id!=pilot || hull.location_id!=station || hull.flag!=4 || !hull.singleton || hull.category_id!=6 {
+                return refuse("You can only board your assembled ships in this station.");
+            }
+            if txn.db().table("character_").find(&["shipID"],&[store::Value::Int(target)]).any(|c|c.int("characterID")!=Some(pilot)) {
+                return refuse("That ship already has a pilot.");
+            }
+            can_fly(txn.db(),pilot,hull.type_id)?;
+            target
+        } else {
+            txn.create(NewItem {type_id:CAPSULE,owner_id:pilot,location_id:station,flag:4,quantity:1,singleton:true})?
+        };
+        if old.type_id==CAPSULE { txn.destroy(current)?; }
+        set_ship(txn.tx(),pilot,next)?;
+        Ok::<_, MoveError>(Some((next,txn.events())))
+    })?;
+    let Some((next,events))=switched else { return Ok(current) };
     crate::items::notify(ctx.world,ctx.client_id,events);
     Ok(next)
 }
@@ -342,31 +359,44 @@ pub fn error_text(error: MoveError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Store, Value as V};
     use crate::{session::Session, test_support::Database};
 
-    async fn pilot(f: &Database, ship_type: i32, client: i64) -> Session {
-        let who = f.id().await;
-        let hull = f.id().await;
-        f.db.execute(r#"INSERT INTO "character_" ("characterID","accountID","characterName","shipID","stationID","solarSystemID","corporationID") VALUES ($1,$1,$2,$3,0,30000141,1000002)"#,
-            &[&who,&format!("Embark fixture {who}"),&hull]).await.unwrap();
-        f.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,singleton,quantity,x,y,z) VALUES ($1,$2,$3,30000141,0,1,1,9000,100,200)"#,
-            &[&hull,&ship_type,&who]).await.unwrap();
-        for (skill, level) in super::super::fitting::required_skill_levels(&f.db, 601).await.unwrap() {
-            let id=f.id().await;
-            f.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,singleton,quantity) VALUES ($1,$2,$3,$3,7,1,1)"#,&[&id,&skill,&who]).await.unwrap();
-            f.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,280,$2)"#,&[&id,&level]).await.unwrap();
+    fn write(store:&Store,f:impl FnOnce(&mut store::Tx)->Result<(),StoreError>) {store.write(f).unwrap()}
+    fn item(f:&Database,id:i64,type_id:i64,owner:i64,location:i64,flag:i64,singleton:i64,quantity:i64) {
+        write(&f.store,|tx|{tx.insert("entity",&[("itemID",V::Int(id)),("typeID",V::Int(type_id)),("ownerID",V::Int(owner)),("locationID",V::Int(location)),
+            ("flag",V::Int(flag)),("singleton",V::Int(singleton)),("quantity",V::Int(quantity))])?;Ok(())});
+    }
+    fn set(f:&Database,table:&str,id:i64,sets:&[(&str,V)]) {
+        write(&f.store,|tx|{let row=tx.table(table).get_id(id).unwrap().id;tx.update(table,row,sets)});
+    }
+    fn exists(f:&Database,id:i64)->bool {f.store.read(|db|db.table("entity").get_id(id).is_some())}
+
+    async fn pilot(f: &Database, ship_type: i64, client: i64) -> Session {
+        let who = f.id().await as i64;
+        let hull = f.id().await as i64;
+        write(&f.store,|tx|{
+            tx.insert("character_",&[("characterID",V::Int(who)),("accountID",V::Int(who)),("characterName",V::Text(format!("Embark fixture {who}").into())),
+                ("shipID",V::Int(hull)),("stationID",V::Int(0)),("solarSystemID",V::Int(30000141)),("corporationID",V::Int(1000002))])?;
+            tx.insert("entity",&[("itemID",V::Int(hull)),("typeID",V::Int(ship_type)),("ownerID",V::Int(who)),("locationID",V::Int(30000141)),("flag",V::Int(0)),
+                ("singleton",V::Int(1)),("quantity",V::Int(1)),("x",V::Float(9000.0)),("y",V::Float(100.0)),("z",V::Float(200.0))])?;
+            Ok(())
+        });
+        for (skill, level) in f.store.read(|db|super::super::fitting::required_skill_levels(db, 601)).unwrap() {
+            let id=f.id().await as i64;
+            item(f,id,i64::from(skill),who,who,7,1,1);
+            write(&f.store,|tx|{tx.insert("entity_attributes",&[("itemID",V::Int(id)),("attributeID",V::Int(280)),("valueInt",V::Int(level))])?;Ok(())});
         }
-        let session=Session {char_id:Some(who as i64),ship_id:Some(hull as i64),solar_system_id:Some(30000141),solar_system_id2:Some(30000141),corp_id:Some(1000002),..Default::default()};
+        let session=Session {char_id:Some(who),ship_id:Some(hull),solar_system_id:Some(30000141),solar_system_id2:Some(30000141),corp_id:Some(1000002),..Default::default()};
         let mut ctx=f.ctx(&session); ctx.client_id=client;
-        let mut ship=inflight::ship_for_space(&ctx,who as i64,hull as i64).await.unwrap();
+        let mut ship=inflight::ship_for_space(&ctx,who,hull).await.unwrap();
         ship.client_id=client;
         let mut w=f.world.lock();
-        w.parks.entry(30000141).or_insert_with(||crate::ballpark::Park::new(30000141,vec![],crate::destiny::tick_now())).ships.insert(hull as i64,ship);
+        w.parks.entry(30000141).or_insert_with(||crate::ballpark::Park::new(30000141,vec![],crate::destiny::tick_now())).ships.insert(hull,ship);
         session
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn eject_reconstruct_and_reboard_preserve_hull_and_remove_empty_capsule() {
         let f=Database::load().await;
         let mut session=pilot(&f,601,1).await;
@@ -389,114 +419,56 @@ mod tests {
         assert!(switch(&f.ctx(&session),Some(original)).await.is_err(),"boarding is range limited");
         f.world.lock().parks.get_mut(&30000141).unwrap().ships.get_mut(&original).unwrap().pos=Vec3::new(9000.0,100.0,200.0);
         assert_eq!(switch(&f.ctx(&session),Some(original)).await.unwrap_or_else(|e|panic!("{}",error_text(e))),original);
-        assert!(f.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(capsule as i32)]).await.unwrap().is_none());
-        let saved:i32=f.db.query_one(r#"SELECT "shipID" FROM "character_" WHERE "characterID"=$1"#,&[&(session.char_id.unwrap() as i32)]).await.unwrap().get(0);
-        assert_eq!(i64::from(saved),original);
+        assert!(!exists(&f,capsule));
+        let saved=f.store.read(|db|db.table("character_").get_id(session.char_id.unwrap()).unwrap().int("shipID"));
+        assert_eq!(saved,Some(original));
         let w=f.world.lock(); let park=&w.parks[&30000141];
         assert!(park.ships[&original].is_player());
         assert!(!park.ships.contains_key(&capsule));
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn only_one_pilot_can_board_a_hull_and_its_nested_cargo() {
         let f=Database::load().await;
         let owner=pilot(&f,601,1).await;
         let hull=owner.ship_id.unwrap();
-        let container=f.id().await;
-        let cargo=f.id().await;
-        f.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,singleton,quantity) VALUES ($1,3293,$3,$4,5,1,1),($2,34,$3,$1,5,0,42)"#,&[&container,&cargo,&(owner.char_id.unwrap() as i32),&(hull as i32)]).await.unwrap();
+        let container=f.id().await as i64;
+        let cargo=f.id().await as i64;
+        item(&f,container,3293,owner.char_id.unwrap(),hull,5,1,1);
+        item(&f,cargo,34,owner.char_id.unwrap(),container,5,0,42);
         let capsule=switch(&f.ctx(&owner),None).await.unwrap_or_else(|e|panic!("{}",error_text(e)));
-        let a=pilot(&f,CAPSULE as i32,2).await;
-        let b=pilot(&f,CAPSULE as i32,3).await;
+        let a=pilot(&f,CAPSULE,2).await;
+        let b=pilot(&f,CAPSULE,3).await;
         let mut ca=f.ctx(&a);ca.client_id=2;
         let mut cb=f.ctx(&b);cb.client_id=3;
         let (ra,rb)=tokio::join!(switch(&ca,Some(hull)),switch(&cb,Some(hull)));
         assert_eq!(usize::from(ra.is_ok())+usize::from(rb.is_ok()),1,"exactly one claimant wins");
         let winner=if ra.is_ok(){a.char_id.unwrap()}else{b.char_id.unwrap()};
-        let rows=f.db.query(r#"SELECT "ownerID" FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![hull as i32,container,cargo]]).await.unwrap();
-        assert_eq!(rows.len(),3);
-        assert!(rows.iter().all(|r|i64::from(r.get::<_,i32>(0))==winner));
-        let original_owner_ship:i32=f.db.query_one(r#"SELECT "shipID" FROM "character_" WHERE "characterID"=$1"#,&[&(owner.char_id.unwrap() as i32)]).await.unwrap().get(0);
-        assert_eq!(i64::from(original_owner_ship),capsule);
+        let owners:Vec<Option<i64>>=f.store.read(|db|[hull,container,cargo].iter().map(|id|db.table("entity").get_id(*id).and_then(|e|e.int("ownerID"))).collect());
+        assert_eq!(owners,vec![Some(winner);3]);
+        let original_owner_ship=f.store.read(|db|db.table("character_").get_id(owner.char_id.unwrap()).unwrap().int("shipID"));
+        assert_eq!(original_owner_ship,Some(capsule));
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn rejected_commit_restores_live_ship_and_rolls_back_capsule_creation() {
-        let f=Database::load().await;
-        let session=pilot(&f,601,1).await;
-        let who=session.char_id.unwrap();let hull=session.ship_id.unwrap();
-        let before:i64=f.db.query_one(r#"SELECT count(*) FROM entity WHERE "ownerID"=$1 AND "typeID"=670"#,&[&(who as i32)]).await.unwrap().get(0);
-        let name=format!("embark_fixture_{who}");
-        f.db.batch_execute(&format!("ALTER TABLE character_ ADD CONSTRAINT {name} CHECK (\"characterID\" <> {who} OR \"shipID\" = {hull})")).await.unwrap();
-        let result=switch(&f.ctx(&session),None).await;
-        f.db.batch_execute(&format!("ALTER TABLE character_ DROP CONSTRAINT {name}")).await.unwrap();
-        assert!(matches!(result,Err(MoveError::Db(_))));
-        let after:i64=f.db.query_one(r#"SELECT count(*) FROM entity WHERE "ownerID"=$1 AND "typeID"=670"#,&[&(who as i32)]).await.unwrap().get(0);
-        assert_eq!(before,after);
-        assert!(f.world.lock().parks[&30000141].ships[&hull].is_player());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn station_evacuation_and_boarding_enforce_ownership_and_skills() {
         let f=Database::load().await;
         let mut session=pilot(&f,601,1).await;
         let who=session.char_id.unwrap();let hull=session.ship_id.unwrap();
         session.station_id=Some(60014659);session.solar_system_id=None;
-        f.db.execute(r#"UPDATE "character_" SET "stationID"=60014659 WHERE "characterID"=$1"#,&[&(who as i32)]).await.unwrap();
-        f.db.execute(r#"UPDATE entity SET "locationID"=60014659,flag=4 WHERE "itemID"=$1"#,&[&(hull as i32)]).await.unwrap();
+        set(&f,"character_",who,&[("stationID",V::Int(60014659))]);
+        set(&f,"entity",hull,&[("locationID",V::Int(60014659)),("flag",V::Int(4))]);
         f.world.lock().parks.get_mut(&30000141).unwrap().ships.remove(&hull);
         let pod=station_switch(&f.ctx(&session),None).await.unwrap_or_else(|e|panic!("{}",error_text(e)));
         session.ship_id=Some(pod);
         assert_eq!(station_switch(&f.ctx(&session),None).await.unwrap_or_else(|e|panic!("{}",error_text(e))),pod,"already in capsule does not duplicate it");
-        let battleship=f.id().await;
-        f.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,singleton,quantity) VALUES ($1,638,$2,60014659,4,1,1)"#,&[&battleship,&(who as i32)]).await.unwrap();
-        assert!(station_switch(&f.ctx(&session),Some(battleship as i64)).await.is_err(),"untrained pilots cannot board a battleship");
-        f.db.execute(r#"UPDATE entity SET "ownerID"=1 WHERE "itemID"=$1"#,&[&(hull as i32)]).await.unwrap();
+        let battleship=f.id().await as i64;
+        item(&f,battleship,638,who,60014659,4,1,1);
+        assert!(station_switch(&f.ctx(&session),Some(battleship)).await.is_err(),"untrained pilots cannot board a battleship");
+        set(&f,"entity",hull,&[("ownerID",V::Int(1))]);
         assert!(station_switch(&f.ctx(&session),Some(hull)).await.is_err(),"station hangars do not allow another owner's hull");
-        f.db.execute(r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,&[&(hull as i32),&(who as i32)]).await.unwrap();
+        set(&f,"entity",hull,&[("ownerID",V::Int(who))]);
         assert_eq!(station_switch(&f.ctx(&session),Some(hull)).await.unwrap_or_else(|e|panic!("{}",error_text(e))),hull);
-        assert!(f.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(pod as i32)]).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn failed_transfer_keeps_damage_and_target_locks_during_database_wait() {
-        let f=Database::load().await;
-        let session=pilot(&f,601,1).await;
-        let enemy=pilot(&f,601,2).await;
-        let who=session.char_id.unwrap();let hull=session.ship_id.unwrap();let enemy=enemy.ship_id.unwrap();
-        let name=format!("embark_combat_fixture_{who}");
-        f.db.batch_execute(&format!("ALTER TABLE character_ ADD CONSTRAINT {name} CHECK (\"characterID\" <> {who} OR \"shipID\" = {hull})")).await.unwrap();
-        f.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueFloat") VALUES ($1,3,0) ON CONFLICT ("itemID","attributeID") DO UPDATE SET "valueFloat"=0"#,&[&(hull as i32)]).await.unwrap();
-        let mut blocker=crate::db::connect(&f.url).await.unwrap();
-        let lock=blocker.transaction().await.unwrap();
-        lock.query_one(r#"SELECT "itemID" FROM entity_attributes WHERE "itemID"=$1 AND "attributeID"=3 FOR UPDATE"#,&[&(hull as i32)]).await.unwrap();
-        let ctx=f.ctx(&session);
-        let during=async {
-            tokio::time::timeout(std::time::Duration::from_secs(3),async {
-                loop {
-                    if f.world.lock().parks[&30000141].ships[&hull].identity_reserved {break;}
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            }).await.expect("transfer must reserve while waiting for attribute row");
-            {
-                let mut w=f.world.lock();let park=w.parks.get_mut(&30000141).unwrap();
-                park.ships.get_mut(&hull).unwrap().fight.as_mut().unwrap().vitals.hull_damage=7.0;
-                park.ships.get_mut(&enemy).unwrap().fight.as_mut().unwrap().locks.insert(hull,crate::combat::Lock::Locked);
-                crate::fight::step(park,crate::combat::now_ms(),&mut crate::heartbeat::Out::default());
-                assert!(park.ships[&enemy].fight.as_ref().unwrap().is_locked(hull),"reservation must leave target visible");
-            }
-            lock.rollback().await.unwrap();
-        };
-        let (result,())=tokio::join!(switch(&ctx,None),during);
-        f.db.batch_execute(&format!("ALTER TABLE character_ DROP CONSTRAINT {name}")).await.unwrap();
-        assert!(matches!(result,Err(MoveError::Db(_))));
-        let w=f.world.lock();let park=&w.parks[&30000141];
-        assert_eq!(park.ships[&hull].fight.as_ref().unwrap().vitals.hull_damage,7.0);
-        assert!(!park.ships[&hull].identity_reserved);
-        assert!(park.ships[&enemy].fight.as_ref().unwrap().is_locked(hull));
+        assert!(!exists(&f,pod));
     }
 }

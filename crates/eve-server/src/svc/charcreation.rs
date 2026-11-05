@@ -1,25 +1,27 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use eve_marshal::Value;
 use tracing::{debug, error, info, warn};
 
+use crate::sde::{self, Row};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{Db, Store, StoreError, Tx, Value as Cell};
 use crate::svc::inventory::FLAG_HANGAR;
-use crate::svc::rows::{cell, rowset};
+use crate::svc::rows::rowset;
 
 pub async fn character(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
-        "GetCharCreationInfo" => {
-            cached(&CREATION_INFO, CREATION, ctx, "GetCharCreationInfo").await
-        }
+        "GetCharCreationInfo" => cached(&CREATION_INFO, CREATION, "GetCharCreationInfo"),
         // Trinity's creator merges this over GetCharCreationInfo: its careers
         // and specialities, and the skills (with levels) each grants.
         "GetCharNewExtraCreationInfo" => {
-            cached(&EXTRA_CREATION_INFO, EXTRA_CREATION, ctx, "GetCharNewExtraCreationInfo").await
+            cached(&EXTRA_CREATION_INFO, EXTRA_CREATION, "GetCharNewExtraCreationInfo")
         }
-        "GetAppearanceInfo" => cached(&APPEARANCE_INFO, APPEARANCE, ctx, "GetAppearanceInfo").await,
-        "ValidateName" => validate_name(call, ctx).await,
-        "ValidateNameEx" => validate_name_ex(call, ctx).await,
+        "GetAppearanceInfo" => cached(&APPEARANCE_INFO, APPEARANCE, "GetAppearanceInfo"),
+        "ValidateName" => validate_name(call, ctx),
+        "ValidateNameEx" => validate_name_ex(call, ctx),
         "GetCharacterAppearanceList" => {
             let ids: Vec<i32> = call
                 .args
@@ -32,7 +34,7 @@ pub async fn character(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
                         .collect()
                 })
                 .unwrap_or_default();
-            character_appearance_list(ctx, &ids).await
+            character_appearance_list(ctx, &ids)
         }
         "CreateCharacter" => return Some(create_character(call, ctx).await),
         _ => return None,
@@ -42,7 +44,7 @@ pub async fn character(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 struct Catalogue {
     key: &'static str,
-    sql: Option<&'static str>,
+    source: Option<Source>,
     header: &'static [&'static str],
     /// Sent as a list of packed blue.DBRows rather than a util.Rowset: for a
     /// catalogue the client reads through a row's `__header__` (the
@@ -50,25 +52,117 @@ struct Catalogue {
     packed: bool,
 }
 
-const fn c(key: &'static str, header: &'static [&'static str], sql: &'static str) -> Catalogue {
-    Catalogue { key, sql: Some(sql), header, packed: false }
+const fn c(key: &'static str, header: &'static [&'static str], source: Source) -> Catalogue {
+    Catalogue { key, source: Some(source), header, packed: false }
 }
 
-const fn packed(key: &'static str, header: &'static [&'static str], sql: &'static str) -> Catalogue {
-    Catalogue { key, sql: Some(sql), header, packed: true }
+const fn packed(key: &'static str, header: &'static [&'static str], source: Source) -> Catalogue {
+    Catalogue { key, source: Some(source), header, packed: true }
 }
 
 const fn empty(key: &'static str, header: &'static [&'static str]) -> Catalogue {
-    Catalogue { key, sql: None, header, packed: false }
+    Catalogue { key, source: None, header, packed: false }
+}
+
+/// The static table a catalogue's lines come from, and which of its rows
+/// and columns they carry.
+#[derive(Clone, Copy)]
+struct Source {
+    table: &'static str,
+    /// The line's values, one per header name; when not given, the columns
+    /// the header names, as stored.
+    columns: Option<&'static [Col]>,
+    /// Only the looks a player may pick (`npc = 0`); the rest are NPCs'.
+    players_only: bool,
+    /// Sorted by these integer columns; otherwise in the table's own order,
+    /// which the client has always been sent.
+    order_by: &'static [&'static str],
+}
+
+const fn from(table: &'static str) -> Source {
+    Source { table, columns: None, players_only: false, order_by: &[] }
+}
+
+impl Source {
+    const fn columns(self, columns: &'static [Col]) -> Source {
+        Source { columns: Some(columns), ..self }
+    }
+
+    const fn order_by(self, order_by: &'static [&'static str]) -> Source {
+        Source { order_by, ..self }
+    }
+
+    const fn players_only(self) -> Source {
+        Source { players_only: true, ..self }
+    }
+
+    fn lines(&self, header: &[&str]) -> Vec<Value> {
+        let mut rows: Vec<Row> = sde::table(self.table)
+            .rows()
+            .filter(|r| !self.players_only || r.int("npc") == Some(0))
+            .collect();
+        rows.sort_by(|a, b| {
+            self.order_by
+                .iter()
+                .map(|c| nulls_last(a.int(c), b.int(c)))
+                .find(|o| o.is_ne())
+                .unwrap_or(Ordering::Equal)
+        });
+        rows.iter()
+            .map(|r| match self.columns {
+                Some(columns) => Value::List(columns.iter().map(|c| c.cell(r)).collect()),
+                None => Value::List(r.line(header)),
+            })
+            .collect()
+    }
+}
+
+/// How one value of a catalogue line is read from its row.
+#[derive(Clone, Copy)]
+enum Col {
+    /// The column as stored.
+    Plain(&'static str),
+    /// A text column, NULL sent as an empty string.
+    OrEmpty(&'static str),
+    /// A number the table keeps as text, sent as an integer (blank as None).
+    Number(&'static str),
+}
+
+use Col::{Number, OrEmpty, Plain};
+
+impl Col {
+    fn cell(self, r: &Row) -> Value {
+        match self {
+            Plain(c) => r.cell(c),
+            OrEmpty(c) => Value::text(r.text(c).unwrap_or("")),
+            Number(c) => number(r, c).map_or(Value::None, |v| Value::Int(v.into())),
+        }
+    }
+}
+
+/// A number kept in a text column (chrAncestries."typeID2"), blank as None.
+fn number(r: &Row, column: &str) -> Option<i32> {
+    r.text(column).map(|s| s.trim_matches(' ')).filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
+}
+
+/// Ascending, NULLs last, as the database sorts.
+fn nulls_last(a: Option<i64>, b: Option<i64>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+    }
 }
 
 const CREATION: &[Catalogue] = &[
     c(
         "races",
         &["raceID", "raceName", "description", "skillTypeID1", "typeID", "typeQuantity", "graphicID", "shortDescription", "_raceName"],
-        r#"SELECT "raceID","raceName","description","skillTypeID1","typeID","typeQuantity","graphicID",
-                  COALESCE("shortDescription",''),"raceName"
-             FROM "chrRaces" ORDER BY "raceID""#,
+        from("chrRaces").order_by(&["raceID"]).columns(&[
+            Plain("raceID"), Plain("raceName"), Plain("description"), Plain("skillTypeID1"), Plain("typeID"),
+            Plain("typeQuantity"), Plain("graphicID"), OrEmpty("shortDescription"), Plain("raceName"),
+        ]),
     ),
     c(
         "bloodlines",
@@ -79,12 +173,13 @@ const CREATION: &[Catalogue] = &[
             "graphicID", "shortDescription", "shortMaleDescription", "shortFemaleDescription",
             "_bloodlineName",
         ],
-        r#"SELECT "bloodlineID","bloodlineName","raceID","description","maleDescription",
-                  "femaleDescription","shipTypeID","corporationID","perception","willpower",
-                  "charisma","memory","intelligence","bonusTypeID","skillTypeID1","skillTypeID2",
-                  "graphicID",COALESCE("shortDescription",''),COALESCE("shortMaleDescription",''),
-                  COALESCE("shortFemaleDescription",''),"bloodlineName"
-             FROM "chrBloodlines" ORDER BY "bloodlineID""#,
+        from("chrBloodlines").order_by(&["bloodlineID"]).columns(&[
+            Plain("bloodlineID"), Plain("bloodlineName"), Plain("raceID"), Plain("description"), Plain("maleDescription"),
+            Plain("femaleDescription"), Plain("shipTypeID"), Plain("corporationID"), Plain("perception"), Plain("willpower"),
+            Plain("charisma"), Plain("memory"), Plain("intelligence"), Plain("bonusTypeID"), Plain("skillTypeID1"),
+            Plain("skillTypeID2"), Plain("graphicID"), OrEmpty("shortDescription"), OrEmpty("shortMaleDescription"),
+            OrEmpty("shortFemaleDescription"), Plain("bloodlineName"),
+        ]),
     ),
     // nextgencharcreation_base.py GetAttributesFromStep walks an ancestry's
     // `__header__` to find its attribute bonuses by name.
@@ -96,20 +191,22 @@ const CREATION: &[Catalogue] = &[
             "willpower", "charisma", "memory", "intelligence", "skillTypeID1", "skillTypeID2",
             "typeID", "typeQuantity", "typeID2", "typeQuantity2", "graphicID", "shortDescription",
         ],
-        r#"SELECT "ancestryID","ancestryName","bloodlineID","description",
-                  "postPerception","postWillpower","postCharisma","postMemory","postIntelligence",
-                  "perception","willpower","charisma","memory","intelligence",
-                  "skillTypeID1","skillTypeID2","typeID","typeQuantity",
-                  NULLIF(trim("typeID2"::text), '')::integer,"typeQuantity2",
-                  "graphicID",COALESCE("shortDescription",'')
-             FROM "chrAncestries" ORDER BY "ancestryID""#,
+        from("chrAncestries").order_by(&["ancestryID"]).columns(&[
+            Plain("ancestryID"), Plain("ancestryName"), Plain("bloodlineID"), Plain("description"),
+            Plain("postPerception"), Plain("postWillpower"), Plain("postCharisma"), Plain("postMemory"), Plain("postIntelligence"),
+            Plain("perception"), Plain("willpower"), Plain("charisma"), Plain("memory"), Plain("intelligence"),
+            Plain("skillTypeID1"), Plain("skillTypeID2"), Plain("typeID"), Plain("typeQuantity"),
+            Number("typeID2"), Plain("typeQuantity2"),
+            Plain("graphicID"), OrEmpty("shortDescription"),
+        ]),
     ),
     c(
         "attributes",
         &["attributeID", "attributeName", "description", "graphicID", "shortDescription", "_attributeName"],
-        r#"SELECT "attributeID","attributeName","description","graphicID",COALESCE("shortDescription",''),
-                  "attributeName"
-             FROM "chrAttributes" ORDER BY "attributeID""#,
+        from("chrAttributes").order_by(&["attributeID"]).columns(&[
+            Plain("attributeID"), Plain("attributeName"), Plain("description"), Plain("graphicID"), OrEmpty("shortDescription"),
+            Plain("attributeName"),
+        ]),
     ),
     c(
         "schools",
@@ -117,9 +214,7 @@ const CREATION: &[Catalogue] = &[
             "raceID", "schoolID", "schoolName", "description", "graphicID", "corporationID",
             "agentID", "newAgentID", "careerID",
         ],
-        r#"SELECT "raceID","schoolID","schoolName","description","graphicID","corporationID",
-                  "agentID","newAgentID","careerID"
-             FROM "chrSchools" ORDER BY "schoolID""#,
+        from("chrSchools").order_by(&["schoolID"]),
     ),
     c(
         "departments",
@@ -127,9 +222,7 @@ const CREATION: &[Catalogue] = &[
             "schoolID", "departmentID", "departmentName", "description", "skillTypeID1",
             "skillTypeID2", "skillTypeID3", "graphicID",
         ],
-        r#"SELECT "schoolID","departmentID","departmentName","description",
-                  "skillTypeID1","skillTypeID2","skillTypeID3","graphicID"
-             FROM "chrDepartments" ORDER BY "departmentID""#,
+        from("chrDepartments").order_by(&["departmentID"]),
     ),
     c(
         "fields",
@@ -137,9 +230,7 @@ const CREATION: &[Catalogue] = &[
             "departmentID", "fieldID", "fieldName", "description", "skillTypeID1", "skillTypeID2",
             "typeID", "typeQuantity", "graphicID",
         ],
-        r#"SELECT "departmentID","fieldID","fieldName","description",
-                  "skillTypeID1","skillTypeID2","typeID","typeQuantity","graphicID"
-             FROM "chrFields" ORDER BY "fieldID""#,
+        from("chrFields").order_by(&["fieldID"]),
     ),
     c(
         "specialities",
@@ -147,26 +238,20 @@ const CREATION: &[Catalogue] = &[
             "fieldID", "specialityID", "specialityName", "description", "skillTypeID1",
             "skillTypeID2", "typeID", "typeQuantity", "graphicID",
         ],
-        r#"SELECT "fieldID","specialityID","specialityName","description",
-                  "skillTypeID1","skillTypeID2","typeID","typeQuantity","graphicID"
-             FROM "chrSpecialities" ORDER BY "specialityID""#,
+        from("chrSpecialities").order_by(&["specialityID"]),
     ),
-    c("skins", BL_HEADER_SKIN, r#"SELECT "bloodlineID","gender","skinID" FROM "chrBLSkins" WHERE npc = 0"#),
-    c("eyes", BL_HEADER_EYES, r#"SELECT "bloodlineID","gender","eyesID" FROM "chrBLEyes" WHERE npc = 0"#),
-    c("eyebrows", BL_HEADER_EYEBROWS, r#"SELECT "bloodlineID","gender","eyebrowsID" FROM "chrBLEyebrows" WHERE npc = 0"#),
-    c("makeups", BL_HEADER_MAKEUP, r#"SELECT "bloodlineID","gender","makeupID" FROM "chrBLMakeups" WHERE npc = 0"#),
-    c("lipsticks", BL_HEADER_LIPSTICK, r#"SELECT "bloodlineID","gender","lipstickID" FROM "chrBLLipsticks" WHERE npc = 0"#),
-    c("decos", BL_HEADER_DECO, r#"SELECT "bloodlineID","gender","decoID" FROM "chrBLDecos" WHERE npc = 0"#),
-    c("hairs", BL_HEADER_HAIR, r#"SELECT "bloodlineID","gender","hairID" FROM "chrBLHairs" WHERE npc = 0"#),
-    c("beards", BL_HEADER_BEARD, r#"SELECT "bloodlineID","gender","beardID" FROM "chrBLBeards" WHERE npc = 0"#),
-    c("accessories", BL_HEADER_ACCESSORY, r#"SELECT "bloodlineID","gender","accessoryID" FROM "chrBLAccessories" WHERE npc = 0"#),
-    c("costumes", BL_HEADER_COSTUME, r#"SELECT "bloodlineID","gender","costumeID" FROM "chrBLCostumes" WHERE npc = 0"#),
-    c("lights", &["lightID", "lightName"], r#"SELECT "lightID","lightName" FROM "chrBLLights""#),
-    c(
-        "backgrounds",
-        &["backgroundID", "backgroundName"],
-        r#"SELECT "backgroundID","backgroundName" FROM "chrBLBackgrounds""#,
-    ),
+    c("skins", BL_HEADER_SKIN, from("chrBLSkins").players_only()),
+    c("eyes", BL_HEADER_EYES, from("chrBLEyes").players_only()),
+    c("eyebrows", BL_HEADER_EYEBROWS, from("chrBLEyebrows").players_only()),
+    c("makeups", BL_HEADER_MAKEUP, from("chrBLMakeups").players_only()),
+    c("lipsticks", BL_HEADER_LIPSTICK, from("chrBLLipsticks").players_only()),
+    c("decos", BL_HEADER_DECO, from("chrBLDecos").players_only()),
+    c("hairs", BL_HEADER_HAIR, from("chrBLHairs").players_only()),
+    c("beards", BL_HEADER_BEARD, from("chrBLBeards").players_only()),
+    c("accessories", BL_HEADER_ACCESSORY, from("chrBLAccessories").players_only()),
+    c("costumes", BL_HEADER_COSTUME, from("chrBLCostumes").players_only()),
+    c("lights", &["lightID", "lightName"], from("chrBLLights")),
+    c("backgrounds", &["backgroundID", "backgroundName"], from("chrBLBackgrounds")),
     empty("benefits", &["benefitID", "benefitName", "description"]),
     empty("handicaps", &["handicapID", "handicapName", "description"]),
 ];
@@ -183,18 +268,18 @@ const BL_HEADER_ACCESSORY: &[&str] = &["bloodlineID", "gender", "accessoryID"];
 const BL_HEADER_COSTUME: &[&str] = &["bloodlineID", "gender", "costumeID"];
 
 const APPEARANCE: &[Catalogue] = &[
-    c("skins", &["skinID", "skinName"], r#"SELECT "skinID","skinName" FROM "chrSkins""#),
-    c("eyes", &["eyesID", "eyesName"], r#"SELECT "eyesID","eyesName" FROM "chrEyes""#),
-    c("eyebrows", &["eyebrowsID", "eyebrowsName"], r#"SELECT "eyebrowsID","eyebrowsName" FROM "chrEyebrows""#),
-    c("makeups", &["makeupID", "makeupName"], r#"SELECT "makeupID","makeupName" FROM "chrMakeups""#),
-    c("lipsticks", &["lipstickID", "lipstickName"], r#"SELECT "lipstickID","lipstickName" FROM "chrLipsticks""#),
-    c("decos", &["decoID", "decoName"], r#"SELECT "decoID","decoName" FROM "chrDecos""#),
-    c("hairs", &["hairID", "hairName"], r#"SELECT "hairID","hairName" FROM "chrHairs""#),
-    c("beards", &["beardID", "beardName"], r#"SELECT "beardID","beardName" FROM "chrBeards""#),
-    c("accessories", &["accessoryID", "accessoryName"], r#"SELECT "accessoryID","accessoryName" FROM "chrAccessories""#),
-    c("costumes", &["costumeID", "costumeName"], r#"SELECT "costumeID","costumeName" FROM "chrCostumes""#),
-    c("lights", &["lightID", "lightName"], r#"SELECT "lightID","lightName" FROM "chrLights""#),
-    c("backgrounds", &["backgroundID", "backgroundName"], r#"SELECT "backgroundID","backgroundName" FROM "chrBackgrounds""#),
+    c("skins", &["skinID", "skinName"], from("chrSkins")),
+    c("eyes", &["eyesID", "eyesName"], from("chrEyes")),
+    c("eyebrows", &["eyebrowsID", "eyebrowsName"], from("chrEyebrows")),
+    c("makeups", &["makeupID", "makeupName"], from("chrMakeups")),
+    c("lipsticks", &["lipstickID", "lipstickName"], from("chrLipsticks")),
+    c("decos", &["decoID", "decoName"], from("chrDecos")),
+    c("hairs", &["hairID", "hairName"], from("chrHairs")),
+    c("beards", &["beardID", "beardName"], from("chrBeards")),
+    c("accessories", &["accessoryID", "accessoryName"], from("chrAccessories")),
+    c("costumes", &["costumeID", "costumeName"], from("chrCostumes")),
+    c("lights", &["lightID", "lightName"], from("chrLights")),
+    c("backgrounds", &["backgroundID", "backgroundName"], from("chrBackgrounds")),
 ];
 
 /// `specialities` here replaces the old field-based one in the merged info.
@@ -202,31 +287,33 @@ const EXTRA_CREATION: &[Catalogue] = &[
     c(
         "careers",
         &["raceID", "careerID", "careerName", "description", "shortDescription", "graphicID", "schoolID", "_careerName"],
-        r#"SELECT "raceID","careerID","careerName","description",COALESCE("shortDescription",''),"graphicID","schoolID",
-                  "careerName"
-             FROM "chrCareers" ORDER BY "careerID""#,
+        from("chrCareers").order_by(&["careerID"]).columns(&[
+            Plain("raceID"), Plain("careerID"), Plain("careerName"), Plain("description"), OrEmpty("shortDescription"),
+            Plain("graphicID"), Plain("schoolID"), Plain("careerName"),
+        ]),
     ),
     c(
         "specialities",
         &["careerID", "specialityID", "specialityName", "description", "shortDescription", "graphicID", "departmentID", "_specialityName"],
-        r#"SELECT "careerID","specialityID","specialityName","description",COALESCE("shortDescription",''),
-                  "graphicID","departmentID","specialityName"
-             FROM "chrCareerSpecialities" ORDER BY "specialityID""#,
+        from("chrCareerSpecialities").order_by(&["specialityID"]).columns(&[
+            Plain("careerID"), Plain("specialityID"), Plain("specialityName"), Plain("description"), OrEmpty("shortDescription"),
+            Plain("graphicID"), Plain("departmentID"), Plain("specialityName"),
+        ]),
     ),
     c(
         "careerskills",
         &["careerID", "skillTypeID", "levels"],
-        r#"SELECT "careerID","skillTypeID","levels" FROM "chrCareerSkills" ORDER BY "careerID","skillTypeID""#,
+        from("chrCareerSkills").order_by(&["careerID", "skillTypeID"]),
     ),
     c(
         "specialityskills",
         &["specialityID", "skillTypeID", "levels"],
-        r#"SELECT "specialityID","skillTypeID","levels" FROM "chrCareerSpecialitySkills" ORDER BY "specialityID","skillTypeID""#,
+        from("chrCareerSpecialitySkills").order_by(&["specialityID", "skillTypeID"]),
     ),
     c(
         "raceskills",
         &["raceID", "skillTypeID", "levels"],
-        r#"SELECT "raceID","skillTypeID","levels" FROM "chrRaceSkills" ORDER BY "raceID","skillTypeID""#,
+        from("chrRaceSkills").order_by(&["raceID", "skillTypeID"]),
     ),
 ];
 
@@ -234,58 +321,30 @@ static CREATION_INFO: OnceLock<Value> = OnceLock::new();
 static EXTRA_CREATION_INFO: OnceLock<Value> = OnceLock::new();
 static APPEARANCE_INFO: OnceLock<Value> = OnceLock::new();
 
-async fn cached(
-    cell: &'static OnceLock<Value>,
-    specs: &'static [Catalogue],
-    ctx: &Ctx<'_>,
-    what: &str,
-) -> Value {
-    if let Some(v) = cell.get() {
-        return v.clone();
-    }
-    let (built, complete) = build(specs, ctx, what).await;
-    if complete {
-        let _ = cell.set(built.clone());
-    }
-    built
+fn cached(cell: &'static OnceLock<Value>, specs: &'static [Catalogue], what: &str) -> Value {
+    cell.get_or_init(|| build(specs, what)).clone()
 }
 
-async fn build(specs: &[Catalogue], ctx: &Ctx<'_>, what: &str) -> (Value, bool) {
+fn build(specs: &[Catalogue], what: &str) -> Value {
     let mut pairs = Vec::with_capacity(specs.len());
     let mut total = 0usize;
-    let mut complete = true;
     for spec in specs {
-        let value = match spec.sql {
+        let value = match &spec.source {
             None => rowset(spec.header, Vec::new()),
-            Some(sql) => match ctx.db.query(sql, &[]).await {
-                Ok(rows) => {
-                    total += rows.len();
-                    let lines: Vec<Value> = rows
-                        .iter()
-                        .map(|r| {
-                            Value::List((0..spec.header.len()).map(|i| cell(r, i)).collect())
-                        })
-                        .collect();
-                    if spec.packed {
-                        packed_rows(spec.header, lines)
-                    } else {
-                        rowset(spec.header, lines)
-                    }
+            Some(source) => {
+                let lines = source.lines(spec.header);
+                total += lines.len();
+                if spec.packed {
+                    packed_rows(spec.header, lines)
+                } else {
+                    rowset(spec.header, lines)
                 }
-                Err(e) => {
-                    error!(
-                        "{what}: {} failed, serving it empty and NOT caching: {err}",
-                        spec.key, err = crate::logging::chain(&e)
-                    );
-                    complete = false;
-                    rowset(spec.header, Vec::new())
-                }
-            },
+            }
         };
         pairs.push((Value::bytes(spec.key), value));
     }
     debug!("{what}: built {} catalogues, {total} rows", specs.len());
-    (Value::Dict(pairs), complete)
+    Value::Dict(pairs)
 }
 
 /// Query lines as packed DBRows sharing one descriptor.
@@ -305,7 +364,7 @@ fn packed_rows(header: &[&str], lines: Vec<Value>) -> Value {
     )
 }
 
-async fn validate_name(call: &Call, ctx: &Ctx<'_>) -> Value {
+fn validate_name(call: &Call, ctx: &Ctx<'_>) -> Value {
     let Some(name) = call.args.first().and_then(as_text) else {
         warn!("ValidateName: no name argument");
         return Value::Int(0);
@@ -314,27 +373,19 @@ async fn validate_name(call: &Call, ctx: &Ctx<'_>) -> Value {
         debug!("ValidateName({name:?}) -> rejected (shape)");
         return Value::Int(0);
     }
-    let sql = r#"SELECT 1 FROM "character_" WHERE lower("characterName") = lower($1) LIMIT 1"#;
-    match ctx.db.query_opt(sql, &[&name]).await {
-        Ok(None) => {
-            debug!("ValidateName({name:?}) -> ok");
-            Value::Int(1)
-        }
-        Ok(Some(_)) => {
-            debug!("ValidateName({name:?}) -> rejected (taken)");
-            Value::Int(0)
-        }
-        Err(e) => {
-            error!("ValidateName({name:?}): {err}", err = crate::logging::chain(&e));
-            Value::Int(0)
-        }
+    if ctx.store.read(|db| name_taken(db, &name)) {
+        debug!("ValidateName({name:?}) -> rejected (taken)");
+        Value::Int(0)
+    } else {
+        debug!("ValidateName({name:?}) -> ok");
+        Value::Int(1)
     }
 }
 
 /// `ValidateNameEx`: 1 if the name may be taken, else the code the client
 /// turns into its message (nextgencharcreation_step_step.py): -1 too short,
 /// -2 too long, -5 illegal characters, -6 more than one space, -101 taken.
-async fn validate_name_ex(call: &Call, ctx: &Ctx<'_>) -> Value {
+fn validate_name_ex(call: &Call, ctx: &Ctx<'_>) -> Value {
     let Some(name) = call.args.first().and_then(as_text) else {
         return Value::Int(-5);
     };
@@ -343,20 +394,17 @@ async fn validate_name_ex(call: &Call, ctx: &Ctx<'_>) -> Value {
         Some("CharNameInvalidMaxLength") => -2,
         Some("CharNameInvalidMaxSpaces") => -6,
         Some(_) => -5,
-        None => {
-            let sql = r#"SELECT 1 FROM "character_" WHERE lower("characterName") = lower($1) LIMIT 1"#;
-            match ctx.db.query_opt(sql, &[&name]).await {
-                Ok(None) => 1,
-                Ok(Some(_)) => -101,
-                Err(e) => {
-                    error!("ValidateNameEx({name:?}): {err}", err = crate::logging::chain(&e));
-                    -5
-                }
-            }
-        }
+        None if ctx.store.read(|db| name_taken(db, &name)) => -101,
+        None => 1,
     };
     debug!("ValidateNameEx({name:?}) -> {code}");
     Value::Int(code)
+}
+
+/// Whether a character already has this name, letter case aside.
+fn name_taken(db: &Db, name: &str) -> bool {
+    let name = name.to_lowercase();
+    db.table("character_").rows().any(|r| r.text("characterName").is_some_and(|n| n.to_lowercase() == name))
 }
 
 pub(crate) fn name_shape_ok(name: &str) -> bool {
@@ -414,9 +462,15 @@ impl Refusal {
     }
 }
 
-fn db_failed(what: &str, e: tokio_postgres::Error) -> Refusal {
+fn db_failed(what: &str, e: StoreError) -> Refusal {
     error!("CreateCharacter: {what}: {err}", err = crate::logging::chain(&e));
     Refusal::Custom("Character creation failed on the server. Please try again.".into())
+}
+
+impl From<StoreError> for Refusal {
+    fn from(e: StoreError) -> Self {
+        db_failed("store write", e)
+    }
 }
 
 async fn create_character(call: &Call, ctx: &Ctx<'_>) -> Outcome {
@@ -479,7 +533,7 @@ async fn create_character(call: &Call, ctx: &Ctx<'_>) -> Outcome {
         account_id,
     };
 
-    match insert_character(&req, ctx.db_url).await {
+    match insert_character(&req, ctx.store).await {
         Ok(char_id) => {
             info!("CreateCharacter({:?}) -> {char_id}", req.name);
             Outcome::Value(Value::Int(char_id as i64))
@@ -546,31 +600,50 @@ const DGM_SKILL_TIME_CONSTANT: i32 = 275;
 const DGM_SKILL_POINTS: i32 = 276;
 const DGM_SKILL_LEVEL: i32 = 280;
 
+/// One appearance choice: `<stem>ID` in the client's dict, checked against
+/// the static table that lists what may be picked.
 struct Slot {
     stem: &'static str,
     required: bool,
-    sql: &'static str,
+    table: &'static str,
+    /// Listed per bloodline and gender (with the NPC-only looks left out),
+    /// rather than open to everyone.
     keyed: bool,
 }
 
-const fn slot(stem: &'static str, required: bool, sql: &'static str) -> Slot {
-    Slot { stem, required, sql, keyed: true }
+const fn slot(stem: &'static str, required: bool, table: &'static str) -> Slot {
+    Slot { stem, required, table, keyed: true }
 }
 
 const SLOTS: &[Slot] = &[
-    slot("accessory", false, r#"SELECT 1 FROM "chrBLAccessories" WHERE "accessoryID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("beard", false, r#"SELECT 1 FROM "chrBLBeards" WHERE "beardID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("costume", true, r#"SELECT 1 FROM "chrBLCostumes" WHERE "costumeID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("deco", false, r#"SELECT 1 FROM "chrBLDecos" WHERE "decoID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("eyebrows", true, r#"SELECT 1 FROM "chrBLEyebrows" WHERE "eyebrowsID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("eyes", true, r#"SELECT 1 FROM "chrBLEyes" WHERE "eyesID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("hair", true, r#"SELECT 1 FROM "chrBLHairs" WHERE "hairID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("lipstick", false, r#"SELECT 1 FROM "chrBLLipsticks" WHERE "lipstickID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("makeup", false, r#"SELECT 1 FROM "chrBLMakeups" WHERE "makeupID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    slot("skin", true, r#"SELECT 1 FROM "chrBLSkins" WHERE "skinID"=$1 AND "bloodlineID"=$2 AND gender=$3 AND npc=0"#),
-    Slot { stem: "background", required: true, keyed: false, sql: r#"SELECT 1 FROM "chrBLBackgrounds" WHERE "backgroundID"=$1"# },
-    Slot { stem: "light", required: true, keyed: false, sql: r#"SELECT 1 FROM "chrBLLights" WHERE "lightID"=$1"# },
+    slot("accessory", false, "chrBLAccessories"),
+    slot("beard", false, "chrBLBeards"),
+    slot("costume", true, "chrBLCostumes"),
+    slot("deco", false, "chrBLDecos"),
+    slot("eyebrows", true, "chrBLEyebrows"),
+    slot("eyes", true, "chrBLEyes"),
+    slot("hair", true, "chrBLHairs"),
+    slot("lipstick", false, "chrBLLipsticks"),
+    slot("makeup", false, "chrBLMakeups"),
+    slot("skin", true, "chrBLSkins"),
+    Slot { stem: "background", required: true, keyed: false, table: "chrBLBackgrounds" },
+    Slot { stem: "light", required: true, keyed: false, table: "chrBLLights" },
 ];
+
+impl Slot {
+    /// Whether choice `id` is open to a character of this bloodline and gender.
+    fn allows(&self, id: i32, bloodline_id: i32, gender: i32) -> bool {
+        sde::table(self.table).find(&format!("{}ID", self.stem), id.into()).any(|r| self.fits(&r, bloodline_id, gender))
+    }
+
+    /// Whether a row of the slot's table is one this bloodline and gender may pick.
+    fn fits(&self, r: &Row, bloodline_id: i32, gender: i32) -> bool {
+        !self.keyed
+            || (r.int("bloodlineID") == Some(bloodline_id.into())
+                && r.int("gender") == Some(gender.into())
+                && r.int("npc") == Some(0))
+    }
+}
 
 const ROTATIONS: &[&str] = &[
     "headRotation1", "headRotation2", "headRotation3",
@@ -585,212 +658,15 @@ const MORPHS: &[&str] = &[
     "morph4e", "morph4n", "morph4s", "morph4w",
 ];
 
-async fn insert_character(req: &CreateRequest<'_>, db_url: &str) -> Result<i32, Refusal> {
-    let mut client = crate::db::connect(db_url)
-        .await
-        .map_err(|e| db_failed("cannot open a connection for the transaction", e))?;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| db_failed("BEGIN", e))?;
-
+async fn insert_character(req: &CreateRequest<'_>, store: &Store) -> Result<i32, Refusal> {
     let name = &req.name;
     if let Some(msg) = name_shape_error(name) {
         info!("CreateCharacter({name:?}) -> {msg}");
         return Err(Refusal::Message(msg));
     }
-
-    // Keep the three-character limit and case-insensitive name check true
-    // when separate connections submit creation at the same time.
-    if tx.query_opt(r#"SELECT "accountID" FROM account WHERE "accountID"=$1 FOR UPDATE"#,
-        &[&req.account_id]).await.map_err(|e|db_failed("account lock",e))?.is_none() {
-        return Err(Refusal::Custom("That account no longer exists.".into()));
-    }
-    tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended(lower($1::text),0))",&[name]).await
-        .map_err(|e|db_failed("character name lock",e))?;
-
-    let taken = tx
-        .query_opt(
-            r#"SELECT 1 FROM "character_" WHERE lower("characterName") = lower($1) LIMIT 1"#,
-            &[name],
-        )
-        .await
-        .map_err(|e| db_failed("name uniqueness check", e))?;
-    if taken.is_some() {
-        info!("CreateCharacter({name:?}) -> CharNameInvalidTaken");
-        return Err(Refusal::Message("CharNameInvalidTaken"));
-    }
-
-    let used: i64 = tx
-        .query_one(r#"SELECT count(*) FROM "character_" WHERE "accountID" = $1"#, &[&req.account_id])
-        .await
-        .map_err(|e| db_failed("character count", e))?
-        .get(0);
-    if used >= MAX_CHARACTERS_PER_ACCOUNT {
-        info!("CreateCharacter({name:?}): account {} already has {used}", req.account_id);
-        return Err(Refusal::Custom(format!(
-            "This account already has {used} characters, which is the maximum."
-        )));
-    }
-
-    let src = load_sources(&tx, req).await?;
-    validate_points(&req.spent, &src)?;
-    let appearance = read_appearance(&tx, req).await?;
-
-    let now = crate::bulkdata::filetime_now();
-    let char_id = next_id(&tx).await?;
-
-    insert_entity(
-        &tx,
-        Entity {
-            item_id: char_id,
-            name,
-            type_id: src.type_id,
-            owner_id: char_id,
-            location_id: src.station_id,
-            flag: FLAG_NONE,
-            singleton: 1,
-            quantity: 1,
-        },
-    )
-    .await?;
-
-    insert_character_row(&tx, req, &src, &appearance, char_id, now).await?;
-    // How the character was made, for the character sheet.
-    let (career_id, speciality_id) = match req.path {
-        Path::Career(c) => (Some(c.career_id), Some(c.speciality_id)),
-        Path::School { .. } => (None, None),
-    };
-    tx.execute(
-        r#"UPDATE "character_" SET "ancestryID" = $2, "schoolID" = $3, "careerID" = $4, "careerSpecialityID" = $5
-            WHERE "characterID" = $1"#,
-        &[&char_id, &req.ancestry_id, &src.school_id, &career_id, &speciality_id],
-    )
-    .await
-    .map_err(|e| db_failed("character_ creation choices", e))?;
-
-    tx.execute(
-        r#"INSERT INTO "eveStaticOwners" ("ownerID","ownerName","typeID") VALUES ($1,$2,$3)"#,
-        &[&char_id, &name.as_str(), &src.type_id],
-    )
-    .await
-    .map_err(|e| db_failed("eveStaticOwners insert", e))?;
-    tx.execute(
-        r#"INSERT INTO "eveNames" ("itemID","itemName","categoryID","groupID","typeID")
-           VALUES ($1,$2,1,1,$3)"#,
-        &[&char_id, &name.as_str(), &src.type_id],
-    )
-    .await
-    .map_err(|e| db_failed("eveNames insert", e))?;
-
-    for (attribute_id, value) in [
-        (DGM_INTELLIGENCE, src.base.intelligence + req.spent.intelligence + src.post.intelligence),
-        (DGM_CHARISMA, src.base.charisma + req.spent.charisma + src.post.charisma),
-        (DGM_PERCEPTION, src.base.perception + req.spent.perception + src.post.perception),
-        (DGM_MEMORY, src.base.memory + req.spent.memory + src.post.memory),
-        (DGM_WILLPOWER, src.base.willpower + req.spent.willpower + src.post.willpower),
-    ] {
-        insert_attribute(&tx, char_id, attribute_id, value).await?;
-    }
-
-    tx.execute(
-        r#"INSERT INTO "chrCorporationRoles"
-             ("characterID","corprole","rolesAtAll","rolesAtBase","rolesAtHQ","rolesAtOther")
-           VALUES ($1,0,0,0,0,0)"#,
-        &[&char_id],
-    )
-    .await
-    .map_err(|e| db_failed("chrCorporationRoles insert", e))?;
-
-    tx.execute(
-        r#"INSERT INTO "chrEmployment" ("characterID","corporationID","startDate","deleted")
-           VALUES ($1,$2,$3,0)"#,
-        &[&char_id, &src.corporation_id, &now],
-    )
-    .await
-    .map_err(|e| db_failed("chrEmployment insert", e))?;
-
-    for (type_id, level) in &src.skills {
-        let item_id = next_id(&tx).await?;
-        insert_entity(
-            &tx,
-            Entity {
-                item_id,
-                name: "",
-                type_id: *type_id,
-                owner_id: char_id,
-                location_id: char_id,
-                flag: FLAG_SKILL,
-                singleton: 1,
-                quantity: 1,
-            },
-        )
-        .await?;
-        insert_attribute(&tx, item_id, DGM_SKILL_LEVEL, *level).await?;
-        insert_attribute(&tx, item_id, DGM_SKILL_POINTS, skill_points(&tx, *type_id, *level).await?)
-            .await?;
-    }
-
-    let ship_id = next_id(&tx).await?;
-    insert_entity(
-        &tx,
-        Entity {
-            item_id: ship_id,
-            name: "",
-            type_id: src.ship_type_id,
-            owner_id: char_id,
-            location_id: src.station_id,
-            flag: FLAG_HANGAR,
-            singleton: 1,
-            quantity: 1,
-        },
-    )
-    .await?;
-
-    if let (Some(type_id), Some(quantity)) = (src.charge_type_id, src.charge_quantity) {
-        let charge_id = next_id(&tx).await?;
-        insert_entity(
-            &tx,
-            Entity {
-                item_id: charge_id,
-                name: "",
-                type_id,
-                owner_id: char_id,
-                location_id: ship_id,
-                flag: FLAG_CARGO,
-                singleton: 0,
-                quantity,
-            },
-        )
-        .await?;
-    }
-
-    tx.execute(
-        r#"UPDATE "character_" SET "shipID" = $2 WHERE "characterID" = $1"#,
-        &[&char_id, &ship_id],
-    )
-    .await
-    .map_err(|e| db_failed("character_.shipID update", e))?;
-
-    for (type_id, quantity) in &src.equipment {
-        let item_id = next_id(&tx).await?;
-        insert_entity(
-            &tx,
-            Entity {
-                item_id,
-                name: "",
-                type_id: *type_id,
-                owner_id: char_id,
-                location_id: src.station_id,
-                flag: FLAG_HANGAR,
-                singleton: 0,
-                quantity: *quantity,
-            },
-        )
-        .await?;
-    }
-
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    // One write: the three-character limit and the case-insensitive name
+    // check hold for everything it makes.
+    let (char_id, src) = store.write(|tx| create(tx, req))?;
     info!(
         "CreateCharacter({name:?}): id {char_id}, corp {}, station {}, {} skills, ship {}",
         src.corporation_id,
@@ -801,12 +677,196 @@ async fn insert_character(req: &CreateRequest<'_>, db_url: &str) -> Result<i32, 
     Ok(char_id)
 }
 
-async fn next_id(tx: &tokio_postgres::Transaction<'_>) -> Result<i32, Refusal> {
-    let row = tx
-        .query_one("SELECT nextval('dyn_id_seq')::integer", &[])
-        .await
-        .map_err(|e| db_failed("nextval(dyn_id_seq)", e))?;
-    Ok(row.get(0))
+/// Everything a new character is made of, in the creation's write: its
+/// item, character row, names, attributes, roles, employment, skills, ship
+/// and starting kit. Returns its ID and what it was made from.
+fn create(tx: &mut Tx<'_>, req: &CreateRequest<'_>) -> Result<(i32, Sources), Refusal> {
+    let name = &req.name;
+    if tx.table("account").get_id(i64::from(req.account_id)).is_none() {
+        return Err(Refusal::Custom("That account no longer exists.".into()));
+    }
+
+    if name_taken(tx.db(), name) {
+        info!("CreateCharacter({name:?}) -> CharNameInvalidTaken");
+        return Err(Refusal::Message("CharNameInvalidTaken"));
+    }
+
+    let used = tx.table("character_").find(&["accountID"], &[Cell::Int(i64::from(req.account_id))]).count() as i64;
+    if used >= MAX_CHARACTERS_PER_ACCOUNT {
+        info!("CreateCharacter({name:?}): account {} already has {used}", req.account_id);
+        return Err(Refusal::Custom(format!(
+            "This account already has {used} characters, which is the maximum."
+        )));
+    }
+
+    let src = load_sources(tx.db(), req)?;
+    validate_points(&req.spent, &src)?;
+    let appearance = read_appearance(req)?;
+
+    let now = crate::bulkdata::filetime_now();
+    let char_id = next_id(tx)?;
+
+    insert_entity(
+        tx,
+        Entity {
+            item_id: char_id,
+            name,
+            type_id: src.type_id,
+            owner_id: char_id,
+            location_id: src.station_id,
+            flag: FLAG_NONE,
+            singleton: 1,
+            quantity: 1,
+        },
+    )?;
+
+    let character = insert_character_row(tx, req, &src, &appearance, char_id, now)?;
+    // How the character was made, for the character sheet.
+    let (career_id, speciality_id) = match req.path {
+        Path::Career(c) => (Some(c.career_id), Some(c.speciality_id)),
+        Path::School { .. } => (None, None),
+    };
+    let opt = |v: Option<i32>| v.map_or(Cell::Null, |v| Cell::Int(v.into()));
+    tx.update(
+        "character_",
+        character,
+        &[
+            ("ancestryID", Cell::Int(req.ancestry_id.into())),
+            ("schoolID", Cell::Int(src.school_id.into())),
+            ("careerID", opt(career_id)),
+            ("careerSpecialityID", opt(speciality_id)),
+        ],
+    )
+    .map_err(|e| db_failed("character_ creation choices", e))?;
+
+    tx.insert(
+        "eveStaticOwners",
+        &[("ownerID", Cell::Int(char_id.into())), ("ownerName", Cell::Text(name.as_str().into())), ("typeID", Cell::Int(src.type_id.into()))],
+    )
+    .map_err(|e| db_failed("eveStaticOwners insert", e))?;
+    tx.insert(
+        "eveNames",
+        &[
+            ("itemID", Cell::Int(char_id.into())),
+            ("itemName", Cell::Text(name.as_str().into())),
+            ("categoryID", Cell::Int(1)),
+            ("groupID", Cell::Int(1)),
+            ("typeID", Cell::Int(src.type_id.into())),
+        ],
+    )
+    .map_err(|e| db_failed("eveNames insert", e))?;
+
+    for (attribute_id, value) in [
+        (DGM_INTELLIGENCE, src.base.intelligence + req.spent.intelligence + src.post.intelligence),
+        (DGM_CHARISMA, src.base.charisma + req.spent.charisma + src.post.charisma),
+        (DGM_PERCEPTION, src.base.perception + req.spent.perception + src.post.perception),
+        (DGM_MEMORY, src.base.memory + req.spent.memory + src.post.memory),
+        (DGM_WILLPOWER, src.base.willpower + req.spent.willpower + src.post.willpower),
+    ] {
+        insert_attribute(tx, char_id, attribute_id, value)?;
+    }
+
+    tx.insert(
+        "chrCorporationRoles",
+        &[
+            ("characterID", Cell::Int(char_id.into())),
+            ("corprole", Cell::Int(0)),
+            ("rolesAtAll", Cell::Int(0)),
+            ("rolesAtBase", Cell::Int(0)),
+            ("rolesAtHQ", Cell::Int(0)),
+            ("rolesAtOther", Cell::Int(0)),
+        ],
+    )
+    .map_err(|e| db_failed("chrCorporationRoles insert", e))?;
+
+    tx.insert(
+        "chrEmployment",
+        &[
+            ("characterID", Cell::Int(char_id.into())),
+            ("corporationID", Cell::Int(src.corporation_id.into())),
+            ("startDate", Cell::Int(now)),
+            ("deleted", Cell::Int(0)),
+        ],
+    )
+    .map_err(|e| db_failed("chrEmployment insert", e))?;
+
+    for (type_id, level) in &src.skills {
+        let item_id = next_id(tx)?;
+        insert_entity(
+            tx,
+            Entity {
+                item_id,
+                name: "",
+                type_id: *type_id,
+                owner_id: char_id,
+                location_id: char_id,
+                flag: FLAG_SKILL,
+                singleton: 1,
+                quantity: 1,
+            },
+        )?;
+        insert_attribute(tx, item_id, DGM_SKILL_LEVEL, *level)?;
+        insert_attribute(tx, item_id, DGM_SKILL_POINTS, skill_points(*type_id, *level))?;
+    }
+
+    let ship_id = next_id(tx)?;
+    insert_entity(
+        tx,
+        Entity {
+            item_id: ship_id,
+            name: "",
+            type_id: src.ship_type_id,
+            owner_id: char_id,
+            location_id: src.station_id,
+            flag: FLAG_HANGAR,
+            singleton: 1,
+            quantity: 1,
+        },
+    )?;
+
+    if let (Some(type_id), Some(quantity)) = (src.charge_type_id, src.charge_quantity) {
+        let charge_id = next_id(tx)?;
+        insert_entity(
+            tx,
+            Entity {
+                item_id: charge_id,
+                name: "",
+                type_id,
+                owner_id: char_id,
+                location_id: ship_id,
+                flag: FLAG_CARGO,
+                singleton: 0,
+                quantity,
+            },
+        )?;
+    }
+
+    tx.update("character_", character, &[("shipID", Cell::Int(ship_id.into()))])
+        .map_err(|e| db_failed("character_.shipID update", e))?;
+
+    for (type_id, quantity) in &src.equipment {
+        let item_id = next_id(tx)?;
+        insert_entity(
+            tx,
+            Entity {
+                item_id,
+                name: "",
+                type_id: *type_id,
+                owner_id: char_id,
+                location_id: src.station_id,
+                flag: FLAG_HANGAR,
+                singleton: 0,
+                quantity: *quantity,
+            },
+        )?;
+    }
+    Ok((char_id, src))
+}
+
+fn next_id(tx: &mut Tx<'_>) -> Result<i32, Refusal> {
+    let id = tx.nextval("dyn_id_seq").map_err(|e| db_failed("nextval(dyn_id_seq)", e))?;
+    // dyn_id_seq stays below 2^31: the client's item IDs are integers.
+    Ok(id as i32)
 }
 
 struct Entity<'a> {
@@ -820,60 +880,58 @@ struct Entity<'a> {
     quantity: i32,
 }
 
-async fn insert_entity(tx: &tokio_postgres::Transaction<'_>, e: Entity<'_>) -> Result<(), Refusal> {
-    tx.execute(
-        r#"INSERT INTO entity
-             ("itemID","itemName","typeID","ownerID","locationID","flag",
-              "contraband","singleton","quantity","x","y","z","customInfo")
-           VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,0,0,0,NULL)"#,
+fn insert_entity(tx: &mut Tx<'_>, e: Entity<'_>) -> Result<(), Refusal> {
+    tx.insert(
+        "entity",
         &[
-            &e.item_id, &e.name, &e.type_id, &e.owner_id, &e.location_id, &e.flag, &e.singleton,
-            &e.quantity,
+            ("itemID", Cell::Int(e.item_id.into())),
+            ("itemName", Cell::Text(e.name.into())),
+            ("typeID", Cell::Int(e.type_id.into())),
+            ("ownerID", Cell::Int(e.owner_id.into())),
+            ("locationID", Cell::Int(e.location_id.into())),
+            ("flag", Cell::Int(e.flag.into())),
+            ("contraband", Cell::Int(0)),
+            ("singleton", Cell::Int(e.singleton.into())),
+            ("quantity", Cell::Int(e.quantity.into())),
+            ("x", Cell::Float(0.0)),
+            ("y", Cell::Float(0.0)),
+            ("z", Cell::Float(0.0)),
+            ("customInfo", Cell::Null),
         ],
     )
-    .await
     .map_err(|err| db_failed("entity insert", err))?;
     Ok(())
 }
 
-async fn insert_attribute(
-    tx: &tokio_postgres::Transaction<'_>,
-    item_id: i32,
-    attribute_id: i32,
-    value: i32,
-) -> Result<(), Refusal> {
-    tx.execute(
-        r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt","valueFloat")
-           VALUES ($1,$2,$3,NULL)"#,
-        &[&item_id, &attribute_id, &i64::from(value)],
+fn insert_attribute(tx: &mut Tx<'_>, item_id: i32, attribute_id: i32, value: i32) -> Result<(), Refusal> {
+    tx.insert(
+        "entity_attributes",
+        &[
+            ("itemID", Cell::Int(item_id.into())),
+            ("attributeID", Cell::Int(attribute_id.into())),
+            ("valueInt", Cell::Int(value.into())),
+            ("valueFloat", Cell::Null),
+        ],
     )
-    .await
     .map_err(|e| db_failed("entity_attributes insert", e))?;
     Ok(())
 }
 
-async fn skill_points(
-    tx: &tokio_postgres::Transaction<'_>,
-    type_id: i32,
-    level: i32,
-) -> Result<i32, Refusal> {
+fn skill_points(type_id: i32, level: i32) -> i32 {
     if level <= 0 {
-        return Ok(0);
+        return 0;
     }
-    let rank: Option<f64> = tx
-        .query_opt(
-            r#"SELECT COALESCE("valueInt", "valueFloat") FROM "dgmTypeAttributes"
-                WHERE "typeID" = $1 AND "attributeID" = $2"#,
-            &[&type_id, &DGM_SKILL_TIME_CONSTANT],
-        )
-        .await
-        .map_err(|e| db_failed("skillTimeConstant lookup", e))?
-        .map(|r| r.get(0));
+    // The stored integer first, as the skill's rank always was read; the
+    // typed lookup (sde::type_attribute) prefers the float.
+    let rank = sde::table("dgmTypeAttributes")
+        .find("typeID", type_id.into())
+        .find(|r| r.int("attributeID") == Some(DGM_SKILL_TIME_CONSTANT.into()))
+        .and_then(|r| r.float("valueInt").or_else(|| r.float("valueFloat")));
     let rank = rank.unwrap_or_else(|| {
         warn!("CreateCharacter: skill type {type_id} has no skillTimeConstant, rank 1");
         1.0
     });
-    Ok((rank * 250.0 * 2f64.powf(2.5 * (level as f64 - 1.0))).round() as i32)
+    (rank * 250.0 * 2f64.powf(2.5 * (level as f64 - 1.0))).round() as i32
 }
 
 #[derive(Default)]
@@ -903,73 +961,55 @@ struct Sources {
     equipment: Vec<(i32, i32)>,
 }
 
-async fn load_sources(
-    tx: &tokio_postgres::Transaction<'_>,
-    req: &CreateRequest<'_>,
-) -> Result<Sources, Refusal> {
+fn load_sources(db: &Db, req: &CreateRequest<'_>) -> Result<Sources, Refusal> {
     if req.gender != 0 && req.gender != 1 {
         return Err(Refusal::Custom("Unknown gender.".into()));
     }
 
-    let row = tx
-        .query_opt(
-            r#"SELECT b."raceID", t."typeID", b."shipTypeID",
-                      b."intelligence", b."charisma", b."perception", b."memory", b."willpower",
-                      b."skillTypeID1", b."skillTypeID2",
-                      r."skillTypeID1", r."typeID", r."typeQuantity"
-                 FROM "chrBloodlines" b
-                 JOIN "bloodlineTypes" t ON t."bloodlineID" = b."bloodlineID"
-                 JOIN "chrRaces" r ON r."raceID" = b."raceID"
-                WHERE b."bloodlineID" = $1 AND b."raceID" IN (1,2,4,8)"#,
-            &[&req.bloodline_id],
-        )
-        .await
-        .map_err(|e| db_failed("bloodline lookup", e))?;
-    let Some(row) = row else {
+    // A bloodline of the four playable races, with its character type and
+    // its race (whose skill and starting charge it brings).
+    let bloodline = sde::table("chrBloodlines")
+        .find("bloodlineID", req.bloodline_id.into())
+        .find(|b| matches!(b.int("raceID"), Some(1 | 2 | 4 | 8)))
+        .and_then(|b| {
+            let t = sde::table("bloodlineTypes").get("bloodlineID", req.bloodline_id.into())?;
+            let r = sde::table("chrRaces").get("raceID", b.int("raceID")?)?;
+            Some((b, t, r))
+        });
+    let Some((b, t, r)) = bloodline else {
         return Err(Refusal::Custom("Unknown bloodline.".into()));
     };
-    let race_id: i32 = row.get(0);
-    let type_id: i32 = row.get(1);
-    let ship_type_id: i32 = row.get(2);
+    let race_id = required(&b, "raceID")?;
+    let type_id = required(&t, "typeID")?;
+    let ship_type_id = required(&b, "shipTypeID")?;
     let base = Attrs {
-        intelligence: row.get(3),
-        charisma: row.get(4),
-        perception: row.get(5),
-        memory: row.get(6),
-        willpower: row.get(7),
+        intelligence: required(&b, "intelligence")?,
+        charisma: required(&b, "charisma")?,
+        perception: required(&b, "perception")?,
+        memory: required(&b, "memory")?,
+        willpower: required(&b, "willpower")?,
     };
     let mut skills: Vec<i32> = Vec::new();
-    push_skill(&mut skills, row.get::<_, Option<i32>>(10));
-    push_skill(&mut skills, row.get::<_, Option<i32>>(8));
-    push_skill(&mut skills, row.get::<_, Option<i32>>(9));
-    let charge_type_id: Option<i32> = row.get(11);
-    let charge_quantity: Option<i32> = row.get(12);
+    push_skill(&mut skills, int(&r, "skillTypeID1"));
+    push_skill(&mut skills, int(&b, "skillTypeID1"));
+    push_skill(&mut skills, int(&b, "skillTypeID2"));
+    let charge_type_id = int(&r, "typeID");
+    let charge_quantity = int(&r, "typeQuantity");
 
-    let row = tx
-        .query_opt(
-            r#"SELECT COALESCE("postIntelligence",0),COALESCE("postCharisma",0),COALESCE("postPerception",0),
-                      COALESCE("postMemory",0),COALESCE("postWillpower",0),
-                      "skillTypeID1","skillTypeID2","typeID","typeQuantity",
-                      NULLIF(trim("typeID2"::text), '')::integer, "typeQuantity2"
-                 FROM "chrAncestries" WHERE "ancestryID" = $1 AND "bloodlineID" = $2"#,
-            &[&req.ancestry_id, &req.bloodline_id],
-        )
-        .await
-        .map_err(|e| db_failed("ancestry lookup", e))?;
-    let Some(row) = row else {
+    let Some(a) = child("chrAncestries", "ancestryID", req.ancestry_id, "bloodlineID", req.bloodline_id) else {
         return Err(Refusal::Custom("That ancestry does not belong to that bloodline.".into()));
     };
     let post = Attrs {
-        intelligence: row.get(0),
-        charisma: row.get(1),
-        perception: row.get(2),
-        memory: row.get(3),
-        willpower: row.get(4),
+        intelligence: int(&a, "postIntelligence").unwrap_or(0),
+        charisma: int(&a, "postCharisma").unwrap_or(0),
+        perception: int(&a, "postPerception").unwrap_or(0),
+        memory: int(&a, "postMemory").unwrap_or(0),
+        willpower: int(&a, "postWillpower").unwrap_or(0),
     };
-    let ancestry_skills = [row.get::<_, Option<i32>>(5), row.get::<_, Option<i32>>(6)];
+    let ancestry_skills = [int(&a, "skillTypeID1"), int(&a, "skillTypeID2")];
     let ancestry_items = [
-        (row.get::<_, Option<i32>>(7), row.get::<_, Option<i32>>(8)),
-        (row.get::<_, Option<i32>>(9), row.get::<_, Option<i32>>(10)),
+        (int(&a, "typeID"), int(&a, "typeQuantity")),
+        (number(&a, "typeID2"), int(&a, "typeQuantity2")),
     ];
 
     let (school_id, department_id, field_id, speciality_id) = match req.path {
@@ -994,7 +1034,7 @@ async fn load_sources(
                 skills: Vec::new(),
                 equipment: Vec::new(),
             };
-            return career_sources(tx, base, career, ancestry_items).await;
+            return career_sources(db, base, career, ancestry_items);
         }
     };
     for s in ancestry_skills {
@@ -1002,52 +1042,28 @@ async fn load_sources(
     }
 
     let (corporation_id, station_id, solar_system_id, constellation_id, region_id) =
-        school_station(tx, school_id, race_id).await?;
-    let row = tx
-        .query_opt(
-            r#"SELECT "skillTypeID1","skillTypeID2","skillTypeID3"
-                 FROM "chrDepartments" WHERE "departmentID" = $1 AND "schoolID" = $2"#,
-            &[&department_id, &school_id],
-        )
-        .await
-        .map_err(|e| db_failed("department lookup", e))?;
-    let Some(row) = row else {
+        school_station(db, school_id, race_id)?;
+    let Some(row) = child("chrDepartments", "departmentID", department_id, "schoolID", school_id) else {
         return Err(Refusal::Custom("That department does not belong to that school.".into()));
     };
-    push_skill(&mut skills, row.get::<_, Option<i32>>(0));
-    push_skill(&mut skills, row.get::<_, Option<i32>>(1));
-    push_skill(&mut skills, row.get::<_, Option<i32>>(2));
+    push_skill(&mut skills, int(&row, "skillTypeID1"));
+    push_skill(&mut skills, int(&row, "skillTypeID2"));
+    push_skill(&mut skills, int(&row, "skillTypeID3"));
 
     let mut equipment: Vec<(i32, i32)> = Vec::new();
-    let row = tx
-        .query_opt(
-            r#"SELECT "skillTypeID1","skillTypeID2","typeID","typeQuantity"
-                 FROM "chrFields" WHERE "fieldID" = $1 AND "departmentID" = $2"#,
-            &[&field_id, &department_id],
-        )
-        .await
-        .map_err(|e| db_failed("field lookup", e))?;
-    let Some(row) = row else {
+    let Some(row) = child("chrFields", "fieldID", field_id, "departmentID", department_id) else {
         return Err(Refusal::Custom("That field does not belong to that department.".into()));
     };
-    push_skill(&mut skills, row.get::<_, Option<i32>>(0));
-    push_skill(&mut skills, row.get::<_, Option<i32>>(1));
-    push_equipment(&mut equipment, row.get::<_, Option<i32>>(2), row.get::<_, Option<i32>>(3));
+    push_skill(&mut skills, int(&row, "skillTypeID1"));
+    push_skill(&mut skills, int(&row, "skillTypeID2"));
+    push_equipment(&mut equipment, int(&row, "typeID"), int(&row, "typeQuantity"));
 
-    let row = tx
-        .query_opt(
-            r#"SELECT "skillTypeID1","skillTypeID2","typeID","typeQuantity"
-                 FROM "chrSpecialities" WHERE "specialityID" = $1 AND "fieldID" = $2"#,
-            &[&speciality_id, &field_id],
-        )
-        .await
-        .map_err(|e| db_failed("speciality lookup", e))?;
-    let Some(row) = row else {
+    let Some(row) = child("chrSpecialities", "specialityID", speciality_id, "fieldID", field_id) else {
         return Err(Refusal::Custom("That speciality does not belong to that field.".into()));
     };
-    push_skill(&mut skills, row.get::<_, Option<i32>>(0));
-    push_skill(&mut skills, row.get::<_, Option<i32>>(1));
-    push_equipment(&mut equipment, row.get::<_, Option<i32>>(2), row.get::<_, Option<i32>>(3));
+    push_skill(&mut skills, int(&row, "skillTypeID1"));
+    push_skill(&mut skills, int(&row, "skillTypeID2"));
+    push_equipment(&mut equipment, int(&row, "typeID"), int(&row, "typeQuantity"));
 
     Ok(Sources {
         type_id,
@@ -1070,83 +1086,64 @@ async fn load_sources(
 
 /// The school's corporation and its first station in the corporation's home
 /// system: where a new character starts.
-async fn school_station(
-    tx: &tokio_postgres::Transaction<'_>,
-    school_id: i32,
-    race_id: i32,
-) -> Result<(i32, i32, i32, i32, i32), Refusal> {
-    let row = tx
-        .query_opt(
-            r#"SELECT s."corporationID", st."stationID",
-                      st."solarSystemID", st."constellationID", st."regionID"
-                 FROM "chrSchools" s
-                 JOIN "crpNPCCorporations" n ON n."corporationID" = s."corporationID"
-                 JOIN "staStations" st ON st."corporationID" = s."corporationID"
-                                      AND st."solarSystemID" = n."solarSystemID"
-                WHERE s."schoolID" = $1 AND s."raceID" = $2
-                ORDER BY st."stationID"
-                LIMIT 1"#,
-            &[&school_id, &race_id],
-        )
-        .await
-        .map_err(|e| db_failed("school lookup", e))?;
-    let Some(row) = row else {
-        return Err(Refusal::Custom("That school does not belong to that race.".into()));
-    };
-    Ok((row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+fn school_station(db: &Db, school_id: i32, race_id: i32) -> Result<(i32, i32, i32, i32, i32), Refusal> {
+    let home = child("chrSchools", "schoolID", school_id, "raceID", race_id).and_then(|s| {
+        let corporation_id = int(&s, "corporationID")?;
+        let corporation = sde::table("crpNPCCorporations").get("corporationID", corporation_id.into())?;
+        Some((corporation_id, int(&corporation, "solarSystemID")?))
+    });
+    // The corporation's station in that system with the lowest ID.
+    let row = home.and_then(|(corporation_id, solar_system_id)| {
+        db.table("staStations")
+            .find(&["solarSystemID"], &[Cell::Int(solar_system_id.into())])
+            .filter(|r| r.int("corporationID") == Some(corporation_id.into()))
+            .min_by_key(|r| r.int("stationID"))
+            .map(|r| {
+                let id = |column: &str| r.int(column).map_or(0, |v| v as i32);
+                (corporation_id, id("stationID"), id("solarSystemID"), id("constellationID"), id("regionID"))
+            })
+    });
+    row.ok_or_else(|| Refusal::Custom("That school does not belong to that race.".into()))
 }
 
 /// Trinity's path: the career names the school; skills are the race's,
 /// the career's and the speciality's, their levels added where they meet
 /// (as the creator shows them); the kit is the ancestry's two items.
-async fn career_sources(
-    tx: &tokio_postgres::Transaction<'_>,
+fn career_sources(
+    db: &Db,
     mut src: Sources,
     career: Career,
     ancestry_items: [(Option<i32>, Option<i32>); 2],
 ) -> Result<Sources, Refusal> {
-    let school_id: Option<i32> = tx
-        .query_opt(
-            r#"SELECT "schoolID" FROM "chrCareers" WHERE "careerID" = $1 AND "raceID" = $2"#,
-            &[&career.career_id, &src.race_id],
-        )
-        .await
-        .map_err(|e| db_failed("career lookup", e))?
-        .and_then(|r| r.get(0));
+    let school_id = child("chrCareers", "careerID", career.career_id, "raceID", src.race_id)
+        .and_then(|r| int(&r, "schoolID"));
     let Some(school_id) = school_id else {
         return Err(Refusal::Custom("That career does not belong to that race.".into()));
     };
-    let fits = tx
-        .query_opt(
-            r#"SELECT 1 FROM "chrCareerSpecialities" WHERE "specialityID" = $1 AND "careerID" = $2"#,
-            &[&career.speciality_id, &career.career_id],
-        )
-        .await
-        .map_err(|e| db_failed("speciality lookup", e))?;
-    if fits.is_none() {
+    if child("chrCareerSpecialities", "specialityID", career.speciality_id, "careerID", career.career_id).is_none() {
         return Err(Refusal::Custom("That speciality does not belong to that career.".into()));
     }
     let (corporation_id, station_id, solar_system_id, constellation_id, region_id) =
-        school_station(tx, school_id, src.race_id).await?;
+        school_station(db, school_id, src.race_id)?;
 
-    let rows = tx
-        .query(
-            r#"SELECT "skillTypeID", LEAST(sum("levels"), 5)::integer FROM (
-                   SELECT "skillTypeID","levels" FROM "chrRaceSkills" WHERE "raceID" = $1
-                   UNION ALL SELECT "skillTypeID","levels" FROM "chrCareerSkills" WHERE "careerID" = $2
-                   UNION ALL SELECT "skillTypeID","levels" FROM "chrCareerSpecialitySkills" WHERE "specialityID" = $3
-               ) s WHERE "skillTypeID" IS NOT NULL AND "levels" > 0
-               GROUP BY "skillTypeID" ORDER BY "skillTypeID""#,
-            &[&src.race_id, &career.career_id, &career.speciality_id],
-        )
-        .await
-        .map_err(|e| db_failed("career skills", e))?;
-    if rows.is_empty() {
+    let mut levels: BTreeMap<i32, i64> = BTreeMap::new();
+    for (table, column, key) in [
+        ("chrRaceSkills", "raceID", src.race_id),
+        ("chrCareerSkills", "careerID", career.career_id),
+        ("chrCareerSpecialitySkills", "specialityID", career.speciality_id),
+    ] {
+        for r in sde::table(table).find(column, key.into()) {
+            if let (Some(skill), Some(level)) = (int(&r, "skillTypeID"), r.int("levels").filter(|l| *l > 0)) {
+                *levels.entry(skill).or_default() += level;
+            }
+        }
+    }
+    if levels.is_empty() {
         return Err(Refusal::Custom(
             "The server has no career skill data; load Trinity's static data (tools/trinity_static.py).".into(),
         ));
     }
-    src.skills = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    src.skills = levels.into_iter().map(|(skill, level)| (skill, level.min(5) as i32)).collect();
     for (type_id, quantity) in ancestry_items {
         push_equipment(&mut src.equipment, type_id, quantity);
     }
@@ -1157,6 +1154,25 @@ async fn career_sources(
     src.region_id = region_id;
     src.school_id = school_id;
     Ok(src)
+}
+
+/// An `integer` column of a static row.
+fn int(r: &Row, column: &str) -> Option<i32> {
+    r.int(column).map(|v| v as i32)
+}
+
+/// An `integer` column creation cannot do without; NULL is broken data.
+fn required(r: &Row, column: &str) -> Result<i32, Refusal> {
+    int(r, column).ok_or_else(|| {
+        error!("CreateCharacter: {}.{column} is NULL", r.table().name);
+        Refusal::Custom("Character creation failed on the server. Please try again.".into())
+    })
+}
+
+/// The row of `table` keyed `id` (by `key`), if it belongs to `parent_id`
+/// (by `parent`): a department of the chosen school, say.
+fn child(table: &str, key: &str, id: i32, parent: &str, parent_id: i32) -> Option<Row<'static>> {
+    sde::table(table).find(key, id.into()).find(|r| r.int(parent) == Some(parent_id.into()))
 }
 
 fn push_skill(into: &mut Vec<i32>, id: Option<i32>) {
@@ -1221,10 +1237,7 @@ struct Appearance {
     morphs: Vec<Option<f64>>,
 }
 
-async fn read_appearance(
-    tx: &tokio_postgres::Transaction<'_>,
-    req: &CreateRequest<'_>,
-) -> Result<Appearance, Refusal> {
+fn read_appearance(req: &CreateRequest<'_>) -> Result<Appearance, Refusal> {
     let mut ids = Vec::with_capacity(SLOTS.len());
     for s in SLOTS {
         let key = format!("{}ID", s.stem);
@@ -1244,13 +1257,7 @@ async fn read_appearance(
             }
             None => {}
             Some(id) => {
-                let found = if s.keyed {
-                    tx.query_opt(s.sql, &[&id, &req.bloodline_id, &req.gender]).await
-                } else {
-                    tx.query_opt(s.sql, &[&id]).await
-                }
-                .map_err(|e| db_failed("appearance check", e))?;
-                if found.is_none() {
+                if !s.allows(id, req.bloodline_id, req.gender) {
                     return Err(Refusal::Custom(format!(
                         "Appearance value {key} = {id} is not available to this bloodline."
                     )));
@@ -1276,79 +1283,52 @@ async fn read_appearance(
     Ok(Appearance { ids, rotations, morphs })
 }
 
-async fn insert_character_row(
-    tx: &tokio_postgres::Transaction<'_>,
+/// The `character_` row; returns its row.
+fn insert_character_row(
+    tx: &mut Tx<'_>,
     req: &CreateRequest<'_>,
     src: &Sources,
     a: &Appearance,
     char_id: i32,
     now: i64,
-) -> Result<(), Refusal> {
-    let gender = req.gender as i16;
-    let empty = "";
-    tx.execute(
-        r#"INSERT INTO "character_" (
-             "characterID","characterName","accountID","title","description",
-             "bounty","balance","securityRating","petitionMessage","logonMinutes",
-             "corporationID","corporationDateTime","startDateTime","createDateTime",
-             "typeID","raceID","bloodlineID","gender",
-             "accessoryID","beardID","costumeID","decoID","eyebrowsID","eyesID","hairID",
-             "lipstickID","makeupID","skinID","backgroundID","lightID",
-             "headRotation1","headRotation2","headRotation3",
-             "eyeRotation1","eyeRotation2","eyeRotation3",
-             "camPos1","camPos2","camPos3",
-             "morph1e","morph1n","morph1s","morph1w",
-             "morph2e","morph2n","morph2s","morph2w",
-             "morph3e","morph3n","morph3s","morph3w",
-             "morph4e","morph4n","morph4s","morph4w",
-             "stationID","solarSystemID","constellationID","regionID")
-           VALUES (
-             $1,$2,$3,$4,$5,
-             0,$6,0,$7,0,
-             $8,$9,$9,$9,
-             $10,$11,$12,$13,
-             $14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,$25,
-             $26,$27,$28,
-             $29,$30,$31,
-             $32,$33,$34,
-             $35,$36,$37,$38,
-             $39,$40,$41,$42,
-             $43,$44,$45,$46,
-             $47,$48,$49,$50,
-             $51,$52,$53,$54)"#,
-        &[
-            &char_id,
-            &req.name.as_str(),
-            &req.account_id,
-            &empty,
-            &empty,
-            &crate::config::starting_isk(req.account_id as i64),
-            &empty,
-            &src.corporation_id,
-            &now,
-            &src.type_id,
-            &src.race_id,
-            &req.bloodline_id,
-            &gender,
-            &a.ids[0], &a.ids[1], &a.ids[2], &a.ids[3], &a.ids[4], &a.ids[5], &a.ids[6],
-            &a.ids[7], &a.ids[8], &a.ids[9], &a.ids[10], &a.ids[11],
-            &a.rotations[0], &a.rotations[1], &a.rotations[2],
-            &a.rotations[3], &a.rotations[4], &a.rotations[5],
-            &a.rotations[6], &a.rotations[7], &a.rotations[8],
-            &a.morphs[0], &a.morphs[1], &a.morphs[2], &a.morphs[3],
-            &a.morphs[4], &a.morphs[5], &a.morphs[6], &a.morphs[7],
-            &a.morphs[8], &a.morphs[9], &a.morphs[10], &a.morphs[11],
-            &a.morphs[12], &a.morphs[13], &a.morphs[14], &a.morphs[15],
-            &src.station_id,
-            &src.solar_system_id,
-            &src.constellation_id,
-            &src.region_id,
-        ],
-    )
-    .await
-    .map_err(|e| db_failed("character_ insert", e))?;
-    Ok(())
+) -> Result<crate::store::RowId, Refusal> {
+    let int = |v: i32| Cell::Int(v.into());
+    let empty = || Cell::Text("".into());
+    let mut sets: Vec<(&str, Cell)> = vec![
+        ("characterID", int(char_id)),
+        ("characterName", Cell::Text(req.name.as_str().into())),
+        ("accountID", int(req.account_id)),
+        ("title", empty()),
+        ("description", empty()),
+        ("bounty", Cell::Float(0.0)),
+        ("balance", Cell::Float(crate::config::starting_isk(req.account_id.into()))),
+        ("securityRating", Cell::Float(0.0)),
+        ("petitionMessage", empty()),
+        ("logonMinutes", Cell::Int(0)),
+        ("corporationID", int(src.corporation_id)),
+        ("corporationDateTime", Cell::Int(now)),
+        ("startDateTime", Cell::Int(now)),
+        ("createDateTime", Cell::Int(now)),
+        ("typeID", int(src.type_id)),
+        ("raceID", int(src.race_id)),
+        ("bloodlineID", int(req.bloodline_id)),
+        ("gender", int(req.gender)),
+        ("stationID", int(src.station_id)),
+        ("solarSystemID", int(src.solar_system_id)),
+        ("constellationID", int(src.constellation_id)),
+        ("regionID", int(src.region_id)),
+    ];
+    let ids = ["accessoryID", "beardID", "costumeID", "decoID", "eyebrowsID", "eyesID", "hairID", "lipstickID", "makeupID", "skinID", "backgroundID", "lightID"];
+    for (column, id) in ids.into_iter().zip(&a.ids) {
+        sets.push((column, id.map_or(Cell::Null, int)));
+    }
+    for (column, v) in ROTATIONS.iter().zip(&a.rotations) {
+        sets.push((*column, Cell::Float(*v)));
+    }
+    for (column, v) in MORPHS.iter().zip(&a.morphs) {
+        sets.push((*column, v.map_or(Cell::Null, Cell::Float)));
+    }
+    tx.insert("character_", &sets).map_err(|e| db_failed("character_ insert", e))
 }
 
 fn arg_i32(call: &Call, i: usize) -> Option<i32> {
@@ -1371,43 +1351,41 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
-    async fn concurrent_creation_respects_account_slots_and_character_cleanup() {
+    async fn creation_respects_account_slots_and_character_cleanup() {
         let f=crate::test_support::Database::load().await;
         let tag=f.id().await;
-        let account:i32=f.db.query_one(r#"INSERT INTO account ("accountName",password) VALUES ($1,'test') RETURNING "accountID""#,
-            &[&format!("creation-{tag}")]).await.unwrap().get(0);
+        let account=f.store.write(|tx|{
+            let row=tx.insert("account",&[("accountName",Cell::Text(format!("creation-{tag}").into())),("password",Cell::Text("test".into()))])?;
+            Ok::<_,StoreError>(tx.table("account").row(row).and_then(|r|r.int("accountID")).unwrap())
+        }).unwrap() as i32;
         let bloodline=1i32; let gender=0i32;
-        let ancestry:i32=f.db.query_one(r#"SELECT min("ancestryID") FROM "chrAncestries" WHERE "bloodlineID"=$1"#,&[&bloodline]).await.unwrap().get(0);
+        let ancestry=sde::table("chrAncestries").find("bloodlineID",bloodline.into()).filter_map(|r|int(&r,"ancestryID")).min().unwrap();
         let mut appearance=Vec::new();
         for slot in SLOTS.iter().filter(|s|s.required) {
             let field=format!("{}ID",slot.stem);
-            let query=slot.sql.replace("SELECT 1",&format!("SELECT \"{field}\""))
-                .replace(&format!("\"{field}\"=$1 AND "),"")
-                .replace(&format!(" WHERE \"{field}\"=$1"),"")
-                .replace("$2","$1").replace("$3","$2");
-            let query=format!("{query} ORDER BY \"{field}\" LIMIT 1");
-            let rows=if slot.keyed{f.db.query(&query,&[&bloodline,&gender]).await}else{f.db.query(&query,&[]).await}.unwrap();
-            appearance.push((Value::bytes(field),Value::Int(rows[0].get::<_,i32>(0) as i64)));
+            let first=sde::table(slot.table).rows().filter(|r|slot.fits(r,bloodline,gender)).filter_map(|r|r.int(&field)).min().unwrap();
+            assert!(slot.allows(first as i32,bloodline,gender));
+            appearance.push((Value::bytes(field),Value::Int(first)));
         }
         for key in ROTATIONS {appearance.push((Value::bytes(*key),Value::Double(0.0)));}
         let req=|suffix|CreateRequest{name:format!("Pilot{tag}{suffix}"),bloodline_id:bloodline,gender,ancestry_id:ancestry,
             path:Path::Career(Career{career_id:11,speciality_id:11}),
             spent:Spent{intelligence:1,charisma:1,perception:1,memory:1,willpower:1},appearance:&appearance,account_id:account};
-        let requests=[req("A"),req("B"),req("C"),req("D")];
-        let (a,b,c,d)=tokio::join!(insert_character(&requests[0],&f.url),insert_character(&requests[1],&f.url),insert_character(&requests[2],&f.url),insert_character(&requests[3],&f.url));
-        let ids=[a,b,c,d].into_iter().filter_map(Result::ok).collect::<Vec<_>>();
-        assert_eq!(ids.len(),3,"three successful character creations, fourth refused");
-        let session=crate::session::Session{user_id:Some(account as i64),..Default::default()};
-        for id in ids {
-            let ship:i32=f.db.query_one(r#"SELECT "shipID" FROM "character_" WHERE "characterID"=$1"#,&[&id]).await.unwrap().get(0);
-            assert!(f.db.query_one(r#"SELECT count(*) FROM entity WHERE "itemID"=$1"#,&[&ship]).await.unwrap().get::<_,i64>(0)>0);
-            f.db.execute(r#"UPDATE "character_" SET "deletePrepareDateTime"=0 WHERE "characterID"=$1"#,&[&id]).await.unwrap();
-            let call=Call{service:"character".into(),method:"DeleteCharacter".into(),args:vec![Value::Int(id as i64)],kwargs:vec![]};
-            assert!(matches!(super::super::login::character(&call,&f.ctx(&session)).await,Some(Outcome::Value(Value::None))));
-            assert_eq!(f.db.query_one(r#"SELECT count(*) FROM "eveNames" WHERE "itemID"=$1"#,&[&id]).await.unwrap().get::<_,i64>(0),0);
+        let mut ids=Vec::new();
+        for suffix in ["A","B","C","D"] {
+            if let Ok(id)=insert_character(&req(suffix),&f.store).await {ids.push(id);}
         }
-        f.db.execute(r#"DELETE FROM account WHERE "accountID"=$1"#,&[&account]).await.unwrap();
+        assert_eq!(ids.len(),3,"three successful character creations, fourth refused");
+        let session=crate::session::Session{user_id:Some(i64::from(account)),..Default::default()};
+        for id in ids {
+            let id=i64::from(id);
+            let ship=f.store.read(|db|db.table("character_").get_id(id).unwrap().int("shipID").unwrap());
+            assert!(f.store.read(|db|db.table("entity").get_id(ship).is_some()));
+            f.store.write(|tx|{let row=tx.table("character_").get_id(id).unwrap().id;tx.update("character_",row,&[("deletePrepareDateTime",Cell::Int(0))])}).unwrap();
+            let call=Call{service:"character".into(),method:"DeleteCharacter".into(),args:vec![Value::Int(id)],kwargs:vec![]};
+            assert!(matches!(super::super::login::character(&call,&f.ctx(&session)).await,Some(Outcome::Value(Value::None))));
+            assert!(f.store.read(|db|db.table("eveNames").get_id(id).is_none()));
+        }
     }
 
     #[test]
@@ -1468,6 +1446,25 @@ mod tests {
     }
 
     #[test]
+    fn catalogues_and_checks_read_the_static_tables() {
+        for spec in CREATION.iter().chain(EXTRA_CREATION).chain(APPEARANCE) {
+            let Some(source) = &spec.source else { continue };
+            let lines = source.lines(spec.header);
+            assert!(!lines.is_empty(), "{}", spec.key);
+            assert!(lines.iter().all(|l| l.seq().unwrap().len() == spec.header.len()), "{}", spec.key);
+        }
+        let races = from("chrRaces").order_by(&["raceID"]).columns(&[Plain("raceID"), OrEmpty("shortDescription")]).lines(&[]);
+        let ids: Vec<i64> = races.iter().map(|l| l.seq().unwrap()[0].as_i64().unwrap()).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        assert!(races.iter().all(|l| l.seq().unwrap()[1] != Value::None));
+        let skins = from("chrBLSkins").players_only().lines(BL_HEADER_SKIN);
+        assert_eq!(skins.len(), sde::table("chrBLSkins").rows().filter(|r| r.int("npc") == Some(0)).count());
+        assert!(SLOTS.iter().any(|s| s.stem == "light" && s.allows(1, 0, 0)));
+        // Gunnery, rank 1.
+        assert_eq!((skill_points(3300, 1), skill_points(3300, 2), skill_points(3300, 0)), (250, 1414, 0));
+    }
+
+    #[test]
     fn shipped_name_forms_are_accepted() {
         for name in ["EVE System", "Antaken Kamola", "Ansanaisen Eskonainen", "Appi Intaa"] {
             assert!(name_shape_ok(name), "{name:?} is a shipped name and must validate");
@@ -1484,35 +1481,19 @@ const APPEARANCE_HEADER: &[&str] = &[
     "morph4s", "morph4w",
 ];
 
-async fn character_appearance_list(ctx: &Ctx<'_>, ids: &[i32]) -> Value {
+fn character_appearance_list(ctx: &Ctx<'_>, ids: &[i32]) -> Value {
     if ids.is_empty() {
         return Value::List(Vec::new());
     }
-    let sql = r#"SELECT "characterID","gender","accessoryID","beardID","costumeID","decoID",
-                        "eyebrowsID","eyesID","hairID","lipstickID","makeupID","skinID",
-                        "backgroundID","lightID","headRotation1","headRotation2","headRotation3",
-                        "eyeRotation1","eyeRotation2","eyeRotation3","camPos1","camPos2","camPos3",
-                        "morph1e","morph1n","morph1s","morph1w","morph2e","morph2n","morph2s",
-                        "morph2w","morph3e","morph3n","morph3s","morph3w","morph4e","morph4n",
-                        "morph4s","morph4w"
-                   FROM "character_" WHERE "characterID" = ANY($1)"#;
-    let rows = match ctx.db.query(sql, &[&ids]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("character.GetCharacterAppearanceList: {err}", err = crate::logging::chain(&e));
-            Vec::new()
-        }
-    };
-    let out = ids
-        .iter()
-        .map(|id| match rows.iter().find(|r| r.get::<_, i32>(0) == *id) {
-            Some(r) => {
-                let line: Vec<Value> =
-                    (1..=APPEARANCE_HEADER.len()).map(|i| crate::svc::rows::cell(r, i)).collect();
-                crate::svc::rows::rowset(APPEARANCE_HEADER, vec![Value::List(line)])
-            }
-            None => Value::Dict(Vec::new()),
-        })
-        .collect();
-    Value::List(out)
+    ctx.store.read(|db| {
+        let characters = db.table("character_");
+        let out = ids
+            .iter()
+            .map(|id| match characters.get_id(i64::from(*id)) {
+                Some(r) => crate::svc::rows::rowset(APPEARANCE_HEADER, vec![Value::List(r.line(APPEARANCE_HEADER))]),
+                None => Value::Dict(Vec::new()),
+            })
+            .collect();
+        Value::List(out)
+    })
 }

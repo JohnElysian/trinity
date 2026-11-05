@@ -1,7 +1,7 @@
 //! What lives in a solar system's asteroid belts: the asteroids, and the
 //! pirates that wait among them for whoever comes to mine.
 //!
-//! A system's [`Wildlife`] is read from the database when its park is made:
+//! A system's [`Wildlife`] is read from the store when its park is made:
 //! which pirate faction holds it (from the system's or region's faction), the
 //! rats of that faction by hull class, and the ores its security allows. Each
 //! belt gets a field of asteroids at once; its rats spawn when a player comes
@@ -20,6 +20,7 @@ use tracing::{debug, info};
 use crate::ballpark::{Command, Park, Pilot, Ship, ShipStats, Vec3};
 use crate::combat::{self, attr, Action, Active, Charged, Damage, Fighter, Gun, Lock, Vitals, REPEAT_FOREVER};
 use crate::heartbeat::Out;
+use crate::store::{Db, StoreError};
 use crate::svc::space;
 
 /// Players this close to a belt wake its rats.
@@ -319,43 +320,34 @@ pub fn bot_gun(t: &NpcType, ship_id: i64, damage: [f64; 4], gun: Gun, duration: 
 
 // ---- loading ------------------------------------------------------------------------
 
-pub async fn load(db: &tokio_postgres::Client, solar_system_id: i64) -> Result<Wildlife, tokio_postgres::Error> {
-    let row = db
-        .query_opt(
-            r#"SELECT COALESCE(s."security", 0)::float8, COALESCE(s."factionID", r."factionID")
-                 FROM "mapSolarSystems" s
-                 LEFT JOIN "mapRegions" r ON r."regionID" = s."regionID"
-                WHERE s."solarSystemID" = $1"#,
-            &[&(solar_system_id as i32)],
-        )
-        .await?;
-    let (security, faction) = row.map_or((1.0, None), |r| (r.get(0), r.get::<_, Option<i32>>(1).map(i64::from)));
+pub fn load(db: &Db, solar_system_id: i64) -> Result<Wildlife, StoreError> {
+    let system = db.table("mapSolarSystems").get_id(solar_system_id);
+    // A system without a faction of its own takes its region's.
+    let (security, faction) = system.map_or((1.0, None), |r| {
+        let faction = r.int("factionID").or_else(|| {
+            let region = r.int("regionID")?;
+            crate::sde::table("mapRegions").get("regionID", region)?.int("factionID")
+        });
+        (r.float("security").unwrap_or(0.0), faction)
+    });
     let pirates = pirates_for(faction, solar_system_id);
 
-    let types = db
-        .query(
-            r#"SELECT t."typeID", t."groupID", COALESCE(t."typeName", ''), COALESCE(t."radius", 0), COALESCE(t."mass", 0)
-                 FROM "invTypes" t WHERE t."groupID" = ANY($1)"#,
-            &[&&pirates.groups[..]],
-        )
-        .await?;
-    let mut by_id: HashMap<i64, NpcType> = types.iter().map(|r| npc_type(r)).map(|t| (t.type_id, t)).collect();
-    fill_attributes(db, &mut by_id).await?;
+    let sde = crate::sde::get();
+    let by_id: HashMap<i64, NpcType> = pirates
+        .groups
+        .iter()
+        .flat_map(|g| sde.types_in_group(*g as i64))
+        .filter_map(|id| npc_type(*id as i64))
+        .map(|t| (t.type_id, t))
+        .collect();
 
     let missile_ids: Vec<i32> = by_id
         .values()
         .map(|t| t.get(attr::ENTITY_MISSILE_TYPE_ID) as i32)
         .filter(|id| *id > 0)
         .collect();
-    let rows = db
-        .query(
-            r#"SELECT t."typeID", t."groupID", COALESCE(t."typeName", ''), COALESCE(t."radius", 0), COALESCE(t."mass", 0)
-                 FROM "invTypes" t WHERE t."typeID" = ANY($1)"#,
-            &[&missile_ids],
-        )
-        .await?;
-    let mut missiles: HashMap<i64, NpcType> = rows.iter().map(|r| npc_type(r)).map(|t| (t.type_id, t)).collect();
-    fill_attributes(db, &mut missiles).await?;
+    let missiles: HashMap<i64, NpcType> =
+        missile_ids.iter().filter_map(|id| npc_type(*id as i64)).map(|t| (t.type_id, t)).collect();
 
     let mut rats: [Vec<NpcType>; 5] = Default::default();
     for t in by_id.into_values() {
@@ -371,14 +363,14 @@ pub async fn load(db: &tokio_postgres::Client, solar_system_id: i64) -> Result<W
     }
 
     let ore_ids: Vec<i32> = ORES.iter().filter(|(_, floor)| security >= *floor).map(|(id, _)| *id as i32).collect();
-    let ores = db
-        .query(r#"SELECT "typeID", COALESCE("typeName", ''), COALESCE("volume", 1) FROM "invTypes" WHERE "typeID" = ANY($1)"#, &[&ore_ids])
-        .await?
-        .iter()
+    // In the static data's order, as the query this replaced gave them.
+    let ores = crate::sde::table("invTypes")
+        .rows()
+        .filter(|r| r.int("typeID").is_some_and(|id| ore_ids.contains(&(id as i32))))
         .map(|r| Ore {
-            type_id: r.get::<_, i32>(0) as i64,
-            name: r.get(1),
-            volume: r.get::<_, f64>(2).max(0.01),
+            type_id: r.int("typeID").unwrap_or_default(),
+            name: r.text("typeName").unwrap_or_default().to_string(),
+            volume: r.float("volume").unwrap_or(1.0).max(0.01),
         })
         .collect::<Vec<_>>();
 
@@ -388,65 +380,37 @@ pub async fn load(db: &tokio_postgres::Client, solar_system_id: i64) -> Result<W
         pirates.name,
         ores.len()
     );
-    let police: Vec<NpcType> = load_group(db, GROUP_CONCORD).await?;
+    let police: Vec<NpcType> = load_group(GROUP_CONCORD);
     Ok(Wildlife { security, corp_id: pirates.corp_id, rats, missiles, ores, police })
 }
 
 /// Every type in a group, with its attributes.
-async fn load_group(db: &tokio_postgres::Client, group_id: i32) -> Result<Vec<NpcType>, tokio_postgres::Error> {
-    let ids: Vec<i64> = db
-        .query(r#"SELECT "typeID" FROM "invTypes" WHERE "groupID" = $1"#, &[&group_id])
-        .await?
-        .iter()
-        .map(|r| r.get::<_, i32>(0) as i64)
-        .collect();
-    let mut types: Vec<NpcType> = load_types(db, &ids).await?.into_values().collect();
+fn load_group(group_id: i32) -> Vec<NpcType> {
+    let mut types: Vec<NpcType> =
+        crate::sde::get().types_in_group(group_id as i64).iter().filter_map(|id| npc_type(*id as i64)).collect();
     types.sort_by_key(|t| t.type_id);
-    Ok(types)
+    types
 }
 
 /// Types with their attributes, for entities that are not belt rats (drones,
-/// CONCORD).
-pub async fn load_types(db: &tokio_postgres::Client, type_ids: &[i64]) -> Result<HashMap<i64, NpcType>, tokio_postgres::Error> {
-    let ids: Vec<i32> = type_ids.iter().map(|t| *t as i32).collect();
-    let rows = db
-        .query(
-            r#"SELECT t."typeID", t."groupID", COALESCE(t."typeName", ''), COALESCE(t."radius", 0), COALESCE(t."mass", 0)
-                 FROM "invTypes" t WHERE t."typeID" = ANY($1)"#,
-            &[&ids],
-        )
-        .await?;
-    let mut types: HashMap<i64, NpcType> = rows.iter().map(npc_type).map(|t| (t.type_id, t)).collect();
-    fill_attributes(db, &mut types).await?;
-    Ok(types)
+/// CONCORD). The static data is in memory; the store handle and the error
+/// stay for the callers written against the query this once was.
+pub fn load_types(_db: &Db, type_ids: &[i64]) -> Result<HashMap<i64, NpcType>, StoreError> {
+    Ok(type_ids.iter().filter_map(|id| npc_type(*id)).map(|t| (t.type_id, t)).collect())
 }
 
-fn npc_type(r: &tokio_postgres::Row) -> NpcType {
-    NpcType {
-        type_id: r.get::<_, i32>(0) as i64,
-        group_id: r.get::<_, i32>(1) as i64,
-        name: r.get(2),
-        radius: r.get::<_, f64>(3),
-        mass: r.get::<_, f64>(4),
-        attrs: HashMap::new(),
-    }
-}
-
-async fn fill_attributes(db: &tokio_postgres::Client, types: &mut HashMap<i64, NpcType>) -> Result<(), tokio_postgres::Error> {
-    let ids: Vec<i32> = types.keys().map(|id| *id as i32).collect();
-    let rows = db
-        .query(
-            r#"SELECT "typeID", "attributeID", coalesce("valueFloat", "valueInt"::float8)
-                 FROM "dgmTypeAttributes" WHERE "typeID" = ANY($1)"#,
-            &[&ids],
-        )
-        .await?;
-    for r in &rows {
-        if let (Some(t), Some(v)) = (types.get_mut(&(r.get::<_, i32>(0) as i64)), r.get::<_, Option<f64>>(2)) {
-            t.attrs.insert(r.get(1), v);
-        }
-    }
-    Ok(())
+/// A type as the static data describes it, with its attributes; None for a
+/// type it does not know.
+fn npc_type(type_id: i64) -> Option<NpcType> {
+    let r = crate::sde::table("invTypes").get("typeID", type_id)?;
+    Some(NpcType {
+        type_id,
+        group_id: r.int("groupID")?,
+        name: r.text("typeName").unwrap_or_default().to_string(),
+        radius: r.float("radius").unwrap_or(0.0),
+        mass: r.float("mass").unwrap_or(0.0),
+        attrs: crate::sde::get().type_attributes(type_id).iter().copied().collect(),
+    })
 }
 
 // ---- the belts ------------------------------------------------------------------------
@@ -1101,7 +1065,10 @@ fn disengage(park: &mut Park, id: i64, now: i64, out: &mut Out) {
 pub fn killed(park: &mut Park, ship: &Ship, now: i64, out: &mut Out) {
     let Some(brain) = &ship.npc else { return };
     if let Some((mission_id, char_id)) = crate::sites::rat_killed(park, brain.belt, ship.id) {
-        out.jobs.push(crate::heartbeat::Job::SiteCleared { mission_id, char_id });
+        // A tutorial site belongs to no mission: clearing it is only practice.
+        if mission_id != crate::sites::TUTORIAL {
+            out.jobs.push(crate::heartbeat::Job::SiteCleared { mission_id, char_id });
+        }
         return;
     }
     let killer = ship.fight.as_ref().and_then(|f| f.last_attacker).map(|(c, _)| c).filter(|c| *c > 0);

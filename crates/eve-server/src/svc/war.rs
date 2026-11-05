@@ -11,17 +11,18 @@
 //! database, so the wars in force are kept in memory ([`at_war`]), reloaded
 //! by the heartbeat and after every change.
 
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::{error, info};
 
 use crate::ballpark::Pilot;
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Store, StoreError, Tx};
 use crate::svc::bound;
 use crate::svc::membership::{db_failed, message, transfer_refused, Refused};
-use crate::svc::rows::{change, index_rowset, int, line};
+use crate::svc::rows::{change, index_rowset};
 use crate::svc::wallet::{self, Entry};
 use crate::world::World;
 
@@ -39,13 +40,25 @@ pub const BILL_TYPE_WAR: i32 = 4;
 /// eveConstants ownerCONCORD: who war and alliance bills are owed to.
 pub const OWNER_CONCORD: i64 = 1_000_125;
 
+/// The `crpWars` columns the client is sent.
 const WAR_HEADER: &[&str] = &[
     "warID", "declaredByID", "againstID", "timeDeclared", "timeFinished", "retracted", "mutual",
 ];
-const WAR_SELECT: &str = r#"
-    SELECT "warID", "declaredByID", "againstID", "timeDeclared", "timeFinished", "retracted",
-           "mutual"
-      FROM "crpWars""#;
+
+/// A refusal inside a store write, which undoes what the write did.
+struct Undo(Outcome);
+
+impl From<Outcome> for Undo {
+    fn from(refusal: Outcome) -> Self {
+        Undo(refusal)
+    }
+}
+
+impl From<StoreError> for Undo {
+    fn from(e: StoreError) -> Self {
+        Undo(db_failed("changing the wars", e))
+    }
+}
 
 /// warRegistry, bound as (allianceOrCorpID, isMaster).
 pub async fn war_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
@@ -53,19 +66,16 @@ pub async fn war_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let asked = call.arg_i64(0).or(owner).or(ctx.session.corp_id).unwrap_or(0);
     Some(match call.method.as_str() {
         "GetWars" => {
-            let sql = format!(r#"{WAR_SELECT} WHERE "declaredByID" = $1 OR "againstID" = $1 ORDER BY "warID""#);
-            let items = ctx
-                .query(&sql, &[&(asked as i32)])
-                .await
-                .iter()
-                .map(|r| (Value::Int(int(r, 0).unwrap_or(0)), Value::List(line(r))))
-                .collect();
+            let items = ctx.store.read(|db| {
+                let wars = db.table("crpWars");
+                let side = |column: &str| wars.find(&[column], &[store::Value::Int(asked)]);
+                let by_id: BTreeMap<i64, Vec<Value>> =
+                    side("declaredByID").chain(side("againstID")).map(|r| (r.int("warID").unwrap_or(0), r.line(WAR_HEADER))).collect();
+                by_id.into_iter().map(|(id, line)| (Value::Int(id), Value::List(line))).collect()
+            });
             Outcome::Value(index_rowset(WAR_HEADER, "warID", items))
         }
-        "GetCostOfStartingAWarAgainst" => match cost_against(ctx.db, asked).await {
-            Ok(cost) => Outcome::Value(Value::Double(cost)),
-            Err(refusal) => refusal,
-        },
+        "GetCostOfStartingAWarAgainst" => Outcome::Value(Value::Double(ctx.store.read(|db| cost_against(db, asked)))),
         method => Outcome::Unknown(format!("{WAR}::{method}")),
     })
 }
@@ -78,10 +88,7 @@ pub async fn corp_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     }
     let result = async {
         let corp_id = ctx.session.corp_id.unwrap_or(0);
-        let ceo = ctx
-            .query_one(r#"SELECT "ceoID" FROM "corporation" WHERE "corporationID" = $1"#, &[&(corp_id as i32)])
-            .await
-            .and_then(|r| int(&r, 0));
+        let ceo = ctx.store.read(|db| db.table("corporation").get_id(corp_id).and_then(|r| r.int("ceoID")));
         if ctx.session.alliance_id.is_some() || ceo != ctx.session.char_id {
             return Err(message("MustBeActiveCEOToEndWar"));
         }
@@ -97,17 +104,13 @@ pub async fn corp_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 /// The base cost, once more for every other non-mutual war in force
 /// against the victim.
-async fn cost_against(db: &impl GenericClient, against: i64) -> Refused<f64> {
-    let wars: i64 = db
-        .query_one(
-            r#"SELECT count(*) FROM "crpWars"
-                WHERE "againstID" = $1 AND "mutual" = 0 AND "retracted" IS NULL"#,
-            &[&(against as i32)],
-        )
-        .await
-        .map_err(|e| db_failed("counting wars", e))?
-        .get(0);
-    Ok(WAR_BASE_COST * (1 + wars) as f64)
+fn cost_against(db: &Db, against: i64) -> f64 {
+    let wars = db
+        .table("crpWars")
+        .find(&["againstID"], &[store::Value::Int(against)])
+        .filter(|w| w.int("mutual") == Some(0) && w.value("retracted").is_null())
+        .count() as i64;
+    WAR_BASE_COST * (1 + wars) as f64
 }
 
 /// `declarer` (an alliance, or a corporation outside one) declares war on
@@ -117,16 +120,11 @@ pub async fn declare(ctx: &Ctx<'_>, declarer: i64, payer: i64, against: i64) -> 
     if against == declarer {
         return Err(Outcome::custom("You cannot declare war on yourself."));
     }
-    let target = ctx
-        .query_one(
-            r#"SELECT (SELECT 1 FROM alliances WHERE "allianceID" = $1 AND "deleted" = 0),
-                      (SELECT "allianceID" FROM "corporation" WHERE "corporationID" = $1),
-                      (SELECT 1 FROM "crpNPCCorporations" WHERE "corporationID" = $1)"#,
-            &[&(against as i32)],
-        )
-        .await;
-    let column = |i: usize| target.as_ref().and_then(|r| int(r, i));
-    let (is_alliance, corp_alliance, npc) = (column(0).is_some(), column(1), column(2).is_some());
+    let (is_alliance, corp_alliance) = ctx.store.read(|db| {
+        let alliance = db.table("alliances").get_id(against).is_some_and(|a| a.int("deleted") == Some(0));
+        (alliance, db.table("corporation").get_id(against).and_then(|c| c.int("allianceID")))
+    });
+    let npc = crate::sde::table("crpNPCCorporations").get("corporationID", against).is_some();
     if npc {
         return Err(message("CrpCantDeclareWarOnNPCCorp"));
     }
@@ -137,48 +135,72 @@ pub async fn declare(ctx: &Ctx<'_>, declarer: i64, payer: i64, against: i64) -> 
         return Err(message("CrpCanNotSanctionWarAgainstOwner"));
     }
 
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let tx = client.transaction().await.map_err(|e| db_failed("BEGIN", e))?;
     let now = crate::bulkdata::filetime_now();
-    let already = tx
-        .query_opt(
-            r#"SELECT 1 FROM "crpWars"
-                WHERE "declaredByID" = $1 AND "againstID" = $2
-                  AND ("retracted" IS NULL OR "retracted" > $3)"#,
-            &[&(declarer as i32), &(against as i32), &(now - DAY)],
-        )
-        .await
-        .map_err(|e| db_failed("checking for a war", e))?;
-    if already.is_some() {
-        return Err(Outcome::custom("You are already at war with them."));
-    }
-    let cost = cost_against(&tx, against).await?;
-    let entry = Entry { ref_type: REF_WAR_FEE, payer, payee: OWNER_CONCORD, arg_id1: "", reason: "" };
-    wallet::post(&tx, payer, -cost, &entry).await.map_err(transfer_refused)?;
-    wallet::post(&tx, OWNER_CONCORD, cost, &entry).await.map_err(transfer_refused)?;
-    let war_id: i32 = tx
-        .query_one(
-            r#"INSERT INTO "crpWars" ("warID", "declaredByID", "againstID", "timeDeclared", "mutual")
-               VALUES (nextval('dyn_id_seq'), $1, $2, $3, 0)
-               RETURNING "warID""#,
-            &[&(declarer as i32), &(against as i32), &now],
-        )
-        .await
-        .map_err(|e| db_failed("recording the war", e))?
-        .get(0);
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    let (war_id, cost) = ctx
+        .store
+        .write(|tx| {
+            let already = tx
+                .table("crpWars")
+                .find(&["declaredByID"], &[store::Value::Int(declarer)])
+                .any(|w| w.int("againstID") == Some(against) && w.int("retracted").is_none_or(|r| r > now - DAY));
+            if already {
+                return Err(Undo(Outcome::custom("You are already at war with them.")));
+            }
+            let cost = cost_against(tx.db(), against);
+            let entry = Entry { ref_type: REF_WAR_FEE, payer, payee: OWNER_CONCORD, arg_id1: "", reason: "" };
+            wallet::post(tx, payer, -cost, &entry).map_err(transfer_refused)?;
+            wallet::post(tx, OWNER_CONCORD, cost, &entry).map_err(transfer_refused)?;
+            let war_id = tx.nextval("dyn_id_seq").map_err(|e| db_failed("recording the war", e))?;
+            tx.insert(
+                "crpWars",
+                &[
+                    ("warID", store::Value::Int(war_id)),
+                    ("declaredByID", store::Value::Int(declarer)),
+                    ("againstID", store::Value::Int(against)),
+                    ("timeDeclared", store::Value::Int(now)),
+                    ("mutual", store::Value::Int(0)),
+                ],
+            )
+            .map_err(|e| db_failed("recording the war", e))?;
+            Ok((war_id, cost))
+        })
+        .map_err(|Undo(refusal)| refusal)?;
 
     info!("{declarer} declared war on {against} (war {war_id}) for {cost} ISK");
-    let new = war_line(ctx.db, war_id.into()).await?.unwrap_or_default();
-    tell_war(ctx.world, ctx.db, war_id.into(), declarer, against, change(WAR_HEADER, None, Some(&new))).await;
-    refresh(ctx.db).await;
+    ctx.store.read(|db| {
+        let new = war_line(db, war_id).unwrap_or_default();
+        tell_war(ctx.world, db, war_id, declarer, against, change(WAR_HEADER, None, Some(&new)));
+        refresh(db);
+    });
     Ok(Value::None)
+}
+
+/// Ends a war a day from `now`, as retracting it does.
+fn end(tx: &mut Tx<'_>, war_id: i64, now: i64) -> Result<(), StoreError> {
+    match tx.table("crpWars").get_id(war_id).map(|r| r.id) {
+        Some(row) => tx.update("crpWars", row, &[("retracted", store::Value::Int(now)), ("timeFinished", store::Value::Int(now + DAY))]),
+        None => Ok(()),
+    }
+}
+
+/// The war's unpaid bill, gone.
+fn delete_unpaid_bill(tx: &mut Tx<'_>, war_id: i64) -> Result<(), StoreError> {
+    let unpaid: Vec<store::RowId> = tx
+        .table("billsReceivable")
+        .rows()
+        .filter(|b| b.int("billTypeID") == Some(BILL_TYPE_WAR.into()) && b.int("externalID") == Some(war_id) && b.int("paid") == Some(0))
+        .map(|b| b.id)
+        .collect();
+    for row in unpaid {
+        tx.delete("billsReceivable", row)?;
+    }
+    Ok(())
 }
 
 /// RetractWar(warID), by the declarer: the war stops a day later, and its
 /// unpaid bill is forgiven.
 pub async fn retract(ctx: &Ctx<'_>, declarer: i64, war_id: i64) -> Refused<Value> {
-    let old = war_line(ctx.db, war_id).await?.ok_or_else(|| Outcome::custom("There is no such war."))?;
+    let old = ctx.store.read(|db| war_line(db, war_id)).ok_or_else(|| Outcome::custom("There is no such war."))?;
     if old[1].as_i64() != Some(declarer) {
         return Err(message("NotYourWarToEnd"));
     }
@@ -186,37 +208,30 @@ pub async fn retract(ctx: &Ctx<'_>, declarer: i64, war_id: i64) -> Refused<Value
         return Ok(Value::None);
     }
     let now = crate::bulkdata::filetime_now();
-    ctx.db
-        .execute(
-            r#"UPDATE "crpWars" SET "retracted" = $2, "timeFinished" = $3 WHERE "warID" = $1"#,
-            &[&(war_id as i32), &now, &(now + DAY)],
-        )
-        .await
-        .map_err(|e| db_failed("retracting the war", e))?;
-    forgive_bill(ctx.db, war_id).await;
+    ctx.store.write(|tx| end(tx, war_id, now)).map_err(|e| db_failed("retracting the war", e))?;
+    forgive_bill(ctx.store, war_id);
     let mut new = old.clone();
     new[4] = Value::Long(now + DAY);
     new[5] = Value::Long(now);
     info!("{declarer} retracted war {war_id}");
     let against = old[2].as_i64().unwrap_or(0);
-    tell_war(ctx.world, ctx.db, war_id, declarer, against, change(WAR_HEADER, Some(&old), Some(&new))).await;
-    refresh(ctx.db).await;
+    ctx.store.read(|db| {
+        tell_war(ctx.world, db, war_id, declarer, against, change(WAR_HEADER, Some(&old), Some(&new)));
+        refresh(db);
+    });
     Ok(Value::None)
 }
 
 /// A war surrendered in a CEO trade (svc/pvptrade.rs): it ends as a
 /// retracted one does, a day later, and its unpaid bill is forgiven.
-pub async fn prepare_surrender(db: &tokio_postgres::Transaction<'_>, war_id: i64) -> Refused<(i64,i64,Value)> {
-    db.query_opt(r#"SELECT "warID" FROM "crpWars" WHERE "warID"=$1 FOR UPDATE"#,&[&(war_id as i32)]).await.map_err(|e|db_failed("locking the war",e))?;
-    let old = war_line(db, war_id).await?.ok_or_else(|| Outcome::custom("There is no such war."))?;
+pub fn prepare_surrender(tx: &mut Tx<'_>, war_id: i64) -> Refused<(i64,i64,Value)> {
+    let old = war_line(tx.db(), war_id).ok_or_else(|| Outcome::custom("There is no such war."))?;
     if old[5] != Value::None {
         return Err(message("CanNotSurrenderAsWarIsOver"));
     }
     let now = crate::bulkdata::filetime_now();
-    db.execute(r#"UPDATE "crpWars" SET "retracted" = $2, "timeFinished" = $3 WHERE "warID" = $1"#, &[&(war_id as i32), &now, &(now + DAY)])
-        .await
-        .map_err(|e| db_failed("ending the war", e))?;
-    db.execute(r#"DELETE FROM "billsReceivable" WHERE "billTypeID"=$1 AND "externalID"=$2 AND paid=0"#,&[&BILL_TYPE_WAR,&(war_id as i32)]).await.map_err(|e|db_failed("forgiving the war bill",e))?;
+    end(tx, war_id, now).map_err(|e| db_failed("ending the war", e))?;
+    delete_unpaid_bill(tx, war_id).map_err(|e|db_failed("forgiving the war bill",e))?;
     let mut new = old.clone();
     new[4] = Value::Long(now + DAY);
     new[5] = Value::Long(now);
@@ -224,16 +239,16 @@ pub async fn prepare_surrender(db: &tokio_postgres::Transaction<'_>, war_id: i64
     Ok((declarer,against,change(WAR_HEADER, Some(&old), Some(&new))))
 }
 
-pub async fn announce_surrender(world:&World,db:&impl GenericClient,war_id:i64,event:(i64,i64,Value)) {
+pub fn announce_surrender(world:&World,db:&Db,war_id:i64,event:(i64,i64,Value)) {
     let (declarer,against,changes)=event;
     info!("war {war_id} of {declarer} on {against} ends in surrender");
-    tell_war(world, db, war_id, declarer, against, changes).await;
-    refresh(db).await;
+    tell_war(world, db, war_id, declarer, against, changes);
+    refresh(db);
 }
 
 /// The two sides of a war that has not ended: (declarer, against).
-pub async fn sides(db: &impl GenericClient, war_id: i64) -> Option<(i64, i64)> {
-    let w = war_line(db, war_id).await.ok().flatten()?;
+pub fn sides(db: &Db, war_id: i64) -> Option<(i64, i64)> {
+    let w = war_line(db, war_id)?;
     if w[5] != Value::None {
         return None;
     }
@@ -243,56 +258,59 @@ pub async fn sides(db: &impl GenericClient, war_id: i64) -> Option<(i64, i64)> {
 /// ChangeMutualWarFlag(warID, mutual), by the defender. A mutual war is not
 /// billed.
 pub async fn set_mutual(ctx: &Ctx<'_>, defender: i64, war_id: i64, mutual: bool) -> Refused<Value> {
-    let old = war_line(ctx.db, war_id).await?.ok_or_else(|| Outcome::custom("There is no such war."))?;
+    let old = ctx.store.read(|db| war_line(db, war_id)).ok_or_else(|| Outcome::custom("There is no such war."))?;
     if old[2].as_i64() != Some(defender) {
         return Err(message("NotYourWarToEnd"));
     }
-    ctx.db
-        .execute(r#"UPDATE "crpWars" SET "mutual" = $2 WHERE "warID" = $1"#, &[&(war_id as i32), &i16::from(mutual)])
-        .await
+    ctx.store
+        .write(|tx| match tx.table("crpWars").get_id(war_id).map(|r| r.id) {
+            Some(row) => tx.update("crpWars", row, &[("mutual", store::Value::Int(mutual.into()))]),
+            None => Ok(()),
+        })
         .map_err(|e| db_failed("changing the war", e))?;
     if mutual {
-        forgive_bill(ctx.db, war_id).await;
+        forgive_bill(ctx.store, war_id);
     }
     let mut new = old.clone();
     new[6] = Value::Int(mutual.into());
     let declarer = old[1].as_i64().unwrap_or(0);
-    tell_war(ctx.world, ctx.db, war_id, declarer, defender, change(WAR_HEADER, Some(&old), Some(&new))).await;
+    ctx.store.read(|db| tell_war(ctx.world, db, war_id, declarer, defender, change(WAR_HEADER, Some(&old), Some(&new))));
     Ok(Value::None)
 }
 
 /// A corporation joining an alliance hands it its wars, on both sides.
-pub async fn adopt(db: &impl GenericClient, corp_id: i64, alliance_id: i64) -> Refused<()> {
+pub fn adopt(tx: &mut Tx<'_>, corp_id: i64, alliance_id: i64) -> Refused<()> {
     let now = crate::bulkdata::filetime_now();
     for column in ["declaredByID", "againstID"] {
-        let sql = format!(
-            r#"UPDATE "crpWars" SET "{column}" = $2
-                WHERE "{column}" = $1 AND ("retracted" IS NULL OR "retracted" > $3)"#
-        );
-        db.execute(sql.as_str(), &[&(corp_id as i32), &(alliance_id as i32), &(now - DAY)])
-            .await
-            .map_err(|e| db_failed("handing the wars to the alliance", e))?;
+        let held: Vec<store::RowId> = tx
+            .table("crpWars")
+            .find(&[column], &[store::Value::Int(corp_id)])
+            .filter(|w| w.int("retracted").is_none_or(|r| r > now - DAY))
+            .map(|w| w.id)
+            .collect();
+        for row in held {
+            tx.update("crpWars", row, &[(column, store::Value::Int(alliance_id))])
+                .map_err(|e| db_failed("handing the wars to the alliance", e))?;
+        }
     }
     Ok(())
 }
 
-async fn war_line(db: &impl GenericClient, war_id: i64) -> Refused<Option<Vec<Value>>> {
-    let sql = format!(r#"{WAR_SELECT} WHERE "warID" = $1"#);
-    db.query_opt(sql.as_str(), &[&(war_id as i32)]).await.map(|r| r.as_ref().map(line)).map_err(|e| db_failed("reading the war", e))
+fn war_line(db: &Db, war_id: i64) -> Option<Vec<Value>> {
+    db.table("crpWars").get_id(war_id).map(|r| r.line(WAR_HEADER))
 }
 
-async fn forgive_bill(db: &impl GenericClient, war_id: i64) {
-    let sql = r#"DELETE FROM "billsReceivable" WHERE "billTypeID" = $1 AND "externalID" = $2 AND "paid" = 0"#;
-    if let Err(e) = db.execute(sql, &[&BILL_TYPE_WAR, &(war_id as i32)]).await {
+fn forgive_bill(store: &Store, war_id: i64) {
+    if let Err(e) = store.write(|tx| delete_unpaid_bill(tx, war_id)) {
         error!("forgiving the bill of war {war_id}: {}", crate::logging::chain(&e));
     }
 }
 
 /// OnWarChanged(warID, declaredByID, againstID, change), to everyone on
 /// either side.
-async fn tell_war(world: &World, db: &impl GenericClient, war_id: i64, declarer: i64, against: i64, change: Value) {
-    let mut corps = corps_of(db, declarer).await;
-    corps.extend(corps_of(db, against).await);
+fn tell_war(world: &World, db: &Db, war_id: i64, declarer: i64, against: i64, change: Value) {
+    let mut corps = corps_of(db, declarer);
+    corps.extend(corps_of(db, against));
     let w = world.lock();
     let clients: Vec<i64> = corps.iter().flat_map(|c| w.corp_members(*c)).collect();
     let event = Value::Tuple(vec![Value::Int(war_id), Value::Int(declarer), Value::Int(against), change]);
@@ -300,15 +318,9 @@ async fn tell_war(world: &World, db: &impl GenericClient, war_id: i64, declarer:
 }
 
 /// The corporations an owner stands for: an alliance's members, or itself.
-pub async fn corps_of(db: &impl GenericClient, owner: i64) -> Vec<i64> {
-    let sql = r#"SELECT "corporationID" FROM "allianceMembers" WHERE "allianceID" = $1"#;
-    let members: Vec<i64> = match db.query(sql, &[&(owner as i32)]).await {
-        Ok(rows) => rows.iter().filter_map(|r| int(r, 0)).collect(),
-        Err(e) => {
-            error!("listing the members of {owner}: {}", crate::logging::chain(&e));
-            Vec::new()
-        }
-    };
+pub fn corps_of(db: &Db, owner: i64) -> Vec<i64> {
+    let members: Vec<i64> =
+        db.table("allianceMembers").find(&["allianceID"], &[store::Value::Int(owner)]).filter_map(|r| r.int("corporationID")).collect();
     if members.is_empty() { vec![owner] } else { members }
 }
 
@@ -316,26 +328,21 @@ pub async fn corps_of(db: &impl GenericClient, owner: i64) -> Vec<i64> {
 
 /// Bills every non-mutual war in force for the week starting now, and ends
 /// any whose last bill went unpaid. Run by the heartbeat.
-pub async fn bill_wars(world: &World, db: &tokio_postgres::Client) {
+pub async fn bill_wars(world: &World, store: &Store) {
     let now = crate::bulkdata::filetime_now();
-    let sql = format!(r#"{WAR_SELECT} WHERE "retracted" IS NULL AND "mutual" = 0"#);
-    let wars = match db.query(sql.as_str(), &[]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("reading the wars to bill: {}", crate::logging::chain(&e));
-            return;
-        }
-    };
-    for r in wars {
-        let war = line(&r);
-        let (war_id, declarer, against) = (int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0), int(&r, 2).unwrap_or(0));
-        let declared = int(&r, 3).unwrap_or(now);
-        match next_period(db, BILL_TYPE_WAR, war_id, declared + WEEK, now).await {
+    let wars: Vec<Vec<Value>> = store.read(|db| {
+        db.table("crpWars")
+            .rows()
+            .filter(|w| w.value("retracted").is_null() && w.int("mutual") == Some(0))
+            .map(|w| w.line(WAR_HEADER))
+            .collect()
+    });
+    for war in wars {
+        let (war_id, declarer, against) = (war[0].as_i64().unwrap_or(0), war[1].as_i64().unwrap_or(0), war[2].as_i64().unwrap_or(0));
+        let declared = war[3].as_i64().unwrap_or(now);
+        match store.read(|db| next_period(db, BILL_TYPE_WAR, war_id, declared + WEEK, now)) {
             Period::Overdue => {
-                let ended = db
-                    .execute(r#"UPDATE "crpWars" SET "retracted" = $2, "timeFinished" = $3 WHERE "warID" = $1"#, &[&(war_id as i32), &now, &(now + DAY)])
-                    .await;
-                if let Err(e) = ended {
+                if let Err(e) = store.write(|tx| end(tx, war_id, now)) {
                     error!("ending war {war_id}: {}", crate::logging::chain(&e));
                     continue;
                 }
@@ -343,19 +350,25 @@ pub async fn bill_wars(world: &World, db: &tokio_postgres::Client) {
                 let mut new = war.clone();
                 new[4] = Value::Long(now + DAY);
                 new[5] = Value::Long(now);
-                tell_war(world, db, war_id, declarer, against, change(WAR_HEADER, Some(&war), Some(&new))).await;
+                store.read(|db| tell_war(world, db, war_id, declarer, against, change(WAR_HEADER, Some(&war), Some(&new))));
             }
             Period::Due { until } => {
-                let amount = cost_against(db, against).await.unwrap_or(WAR_BASE_COST);
-                if let Some(bill_id) = issue_bill(db, BILL_TYPE_WAR, declarer, amount, until, war_id).await {
-                    let _ = db.execute(r#"UPDATE "crpWars" SET "billID" = $2 WHERE "warID" = $1"#, &[&(war_id as i32), &(bill_id as i32)]).await;
+                let amount = store.read(|db| cost_against(db, against));
+                let billed = store.write(|tx| {
+                    let bill_id = issue_bill(tx, BILL_TYPE_WAR, declarer, amount, until, war_id);
+                    if let (Some(bill_id), Some(row)) = (bill_id, tx.table("crpWars").get_id(war_id).map(|r| r.id)) {
+                        let _ = tx.update("crpWars", row, &[("billID", store::Value::Int(bill_id))]);
+                    }
+                    Ok::<_, StoreError>(bill_id)
+                });
+                if let Ok(Some(_)) = billed {
                     info!("war {war_id}: {declarer} billed {amount} ISK for the week");
                 }
             }
             Period::Covered => {}
         }
     }
-    refresh(db).await;
+    store.read(refresh);
 }
 
 /// Where a recurring bill stands.
@@ -371,30 +384,23 @@ pub enum Period {
 /// Recurring bills of `bill_type` for `external_id`, each due at the end of
 /// the period it pays for; the first period starts at `first`. A new bill is
 /// issued only once the last one is paid and its period over.
-pub async fn next_period(db: &impl GenericClient, bill_type: i32, external_id: i64, first: i64, now: i64) -> Period {
+pub fn next_period(db: &Db, bill_type: i32, external_id: i64, first: i64, now: i64) -> Period {
     let last = db
-        .query_opt(
-            r#"SELECT "dueDateTime", "paid" FROM "billsReceivable"
-                WHERE "billTypeID" = $1 AND "externalID" = $2
-                ORDER BY "billID" DESC LIMIT 1"#,
-            &[&bill_type, &(external_id as i32)],
-        )
-        .await;
+        .table("billsReceivable")
+        .rows()
+        .filter(|b| b.int("billTypeID") == Some(bill_type.into()) && b.int("externalID") == Some(external_id))
+        .max_by_key(|b| b.int("billID"));
     let period = |start: i64| if now >= start { Period::Due { until: start + period_of(bill_type) } } else { Period::Covered };
     match last {
-        Ok(None) => period(first),
-        Ok(Some(r)) => {
-            let due = int(&r, 0).unwrap_or(0);
-            let paid = int(&r, 1).unwrap_or(0) != 0;
+        None => period(first),
+        Some(r) => {
+            let due = r.int("dueDateTime").unwrap_or(0);
+            let paid = r.int("paid").unwrap_or(0) != 0;
             match (paid, now > due) {
                 (false, true) => Period::Overdue,
                 (true, _) => period(due),
                 (false, false) => Period::Covered,
             }
-        }
-        Err(e) => {
-            error!("reading the bills of {external_id}: {}", crate::logging::chain(&e));
-            Period::Covered
         }
     }
 }
@@ -404,13 +410,20 @@ fn period_of(bill_type: i32) -> i64 {
 }
 
 /// A bill to CONCORD; returns its ID.
-pub async fn issue_bill(db: &impl GenericClient, bill_type: i32, debtor: i64, amount: f64, due: i64, external_id: i64) -> Option<i64> {
-    let sql = r#"INSERT INTO "billsReceivable" ("billTypeID", "debtorID", "creditorID", "amount", "dueDateTime", "externalID")
-                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING "billID""#;
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 6] =
-        [&bill_type, &(debtor as i32), &(OWNER_CONCORD as i32), &amount, &due, &(external_id as i32)];
-    match db.query_one(sql, &params).await {
-        Ok(r) => int(&r, 0),
+pub fn issue_bill(tx: &mut Tx<'_>, bill_type: i32, debtor: i64, amount: f64, due: i64, external_id: i64) -> Option<i64> {
+    let bill = tx.insert(
+        "billsReceivable",
+        &[
+            ("billTypeID", store::Value::Int(bill_type.into())),
+            ("debtorID", store::Value::Int(debtor)),
+            ("creditorID", store::Value::Int(OWNER_CONCORD)),
+            ("amount", store::Value::Float(amount)),
+            ("dueDateTime", store::Value::Int(due)),
+            ("externalID", store::Value::Int(external_id)),
+        ],
+    );
+    match bill {
+        Ok(row) => tx.table("billsReceivable").row(row).and_then(|r| r.int("billID")),
         Err(e) => {
             error!("billing {debtor}: {}", crate::logging::chain(&e));
             None
@@ -426,21 +439,16 @@ type Span = (i64, i64, i64, Option<i64>);
 static IN_FORCE: RwLock<Vec<Span>> = RwLock::new(Vec::new());
 
 /// Reloads the wars in force.
-pub async fn refresh(db: &impl GenericClient) {
+pub fn refresh(db: &Db) {
     let since = crate::bulkdata::filetime_now() - DAY;
-    let sql = r#"SELECT "declaredByID", "againstID", "timeDeclared", "retracted" FROM "crpWars"
-                  WHERE "retracted" IS NULL OR "retracted" > $1"#;
-    match db.query(sql, &[&since]).await {
-        Ok(rows) => {
-            let spans = rows
-                .iter()
-                .map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0), int(r, 2).unwrap_or(0), int(r, 3)))
-                .collect();
-            if let Ok(mut w) = IN_FORCE.write() {
-                *w = spans;
-            }
-        }
-        Err(e) => error!("reading the wars in force: {}", crate::logging::chain(&e)),
+    let spans = db
+        .table("crpWars")
+        .rows()
+        .filter(|w| w.int("retracted").is_none_or(|r| r > since))
+        .map(|w| (w.int("declaredByID").unwrap_or(0), w.int("againstID").unwrap_or(0), w.int("timeDeclared").unwrap_or(0), w.int("retracted")))
+        .collect();
+    if let Ok(mut w) = IN_FORCE.write() {
+        *w = spans;
     }
 }
 

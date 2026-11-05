@@ -4,7 +4,8 @@ use eve_marshal::Value;
 use tracing::error;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{index_rowset, line, row};
+use crate::store::{Db, Row, RowId};
+use crate::svc::rows::{index_rowset, row};
 
 const SERVICE: &str = "dogmaIM";
 
@@ -23,11 +24,11 @@ pub async fn dogma_im(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 async fn method_call(ctx: &Ctx<'_>, method: &str, args: &[Value]) -> Outcome {
     match method {
-        "GetAttributeTypes" => Outcome::Value(attribute_types(ctx).await),
+        "GetAttributeTypes" => Outcome::Value(attribute_types()),
 
         "GetSkillPrerequisites" => Outcome::Value(Value::List(Vec::new())),
-        "GetRequiredSkillLevels" => match crate::svc::fitting::required_skill_levels(ctx.db,
-            args.first().and_then(Value::as_i64).unwrap_or(0)).await {
+        "GetRequiredSkillLevels" => match ctx.store.read(|db| crate::svc::fitting::required_skill_levels(db,
+            args.first().and_then(Value::as_i64).unwrap_or(0))) {
             Ok(levels) => Outcome::Value(Value::Dict(levels.into_iter()
                 .map(|(skill, level)| (Value::Int(i64::from(skill)), Value::Int(level))).collect())),
             Err(error) => {
@@ -50,33 +51,24 @@ async fn method_call(ctx: &Ctx<'_>, method: &str, args: &[Value]) -> Outcome {
     }
 }
 
-async fn attribute_types(ctx: &Ctx<'_>) -> Value {
+fn attribute_types() -> Value {
     const HEADER: &[&str] = &[
         "attributeID", "attributeName", "attributeCategory", "description", "maxAttributeID",
         "attributeIdx", "graphicID", "chargeRechargeTimeID", "defaultValue", "published",
         "displayName", "unitID", "stackable", "highIsGood",
     ];
-    const SQL: &str = r#"
-        SELECT "attributeID","attributeName","attributeCategory","description","maxAttributeID",
-               "attributeIdx","graphicID","chargeRechargeTimeID","defaultValue","published",
-               "displayName","unitID","stackable","highIsGood"
-          FROM "dgmAttributeTypes" ORDER BY "attributeID""#;
-    match ctx.db.query(SQL, &[]).await {
-        Ok(rows) => index_rowset(
-            HEADER,
-            "attributeName",
-            rows.iter()
-                .map(|r| {
-                    let l = line(r);
-                    (l.get(1).cloned().unwrap_or(Value::None), Value::List(l))
-                })
-                .collect(),
-        ),
-        Err(e) => {
-            error!("dogmaIM::GetAttributeTypes: {err}", err = crate::logging::chain(&e));
-            index_rowset(HEADER, "attributeName", Vec::new())
-        }
-    }
+    let mut rows: Vec<_> = crate::sde::table("dgmAttributeTypes").rows().collect();
+    rows.sort_by_key(|r| r.int("attributeID"));
+    index_rowset(
+        HEADER,
+        "attributeName",
+        rows.iter()
+            .map(|r| {
+                let l = r.line(HEADER);
+                (l.get(1).cloned().unwrap_or(Value::None), Value::List(l))
+            })
+            .collect(),
+    )
 }
 
 const INVITEM_HEADER: &[&str] = &[
@@ -86,17 +78,21 @@ const INVITEM_HEADER: &[&str] = &[
 
 const INFO_HEADER: &[&str] = &["itemID", "invItem", "attributes", "activeEffects", "time"];
 
-const ITEM_SELECT: &str = r#"
-    SELECT e."itemID", e."typeID", e."ownerID", e."locationID", e."flag", e."contraband",
-           e."singleton", e."quantity", t."groupID", g."categoryID", e."customInfo",
-           (SELECT b.expires FROM character_boosters b WHERE b.item=e."itemID") AS booster_expiry
-      FROM entity e
-      JOIN "invTypes"  t ON t."typeID"  = e."typeID"
-      JOIN "invGroups" g ON g."groupID" = t."groupID"
-     WHERE (e.flag<>88 OR EXISTS(SELECT 1 FROM character_boosters b
-                WHERE b.item=e."itemID" AND b.character=e."ownerID" AND b.character=e."locationID"
-                  AND b.type_id=e."typeID" AND e.quantity=1 AND e.singleton=1
-                  AND b.expires>((extract(epoch FROM clock_timestamp())+11644473600)*10000000)::bigint)) AND "#;
+/// Whether an item is shown: anything but an implanted booster's slot
+/// (flag 88), and there only a booster still running in its own pilot.
+fn shown(db: &Db, e: &Row, now: i64) -> bool {
+    if e.int("flag") != Some(88) {
+        return true;
+    }
+    db.table("character_boosters").get_id(e.int("itemID").unwrap_or(0)).is_some_and(|b| {
+        b.int("character") == e.int("ownerID")
+            && b.int("character") == e.int("locationID")
+            && b.int("type_id") == e.int("typeID")
+            && e.int("quantity") == Some(1)
+            && e.int("singleton") == Some(1)
+            && b.int("expires").is_some_and(|expires| expires > now)
+    })
+}
 
 struct Item {
     item_id: i64,
@@ -145,40 +141,64 @@ async fn ship_info(ctx: &Ctx<'_>) -> Value {
     let (Some(ship_id), Some(char_id)) = (ctx.session.ship_id, ctx.session.char_id) else {
         return Value::Dict(Vec::new());
     };
-    let sql = format!(
-        r#"{ITEM_SELECT} (e."itemID" = $1 OR e."itemID" = $2
-            OR (e."locationID" = $1 AND (e."flag" BETWEEN 11 AND 35 OR e."flag" BETWEEN 92 AND 99)))"#
-    );
-    info_dict(ctx, "ShipGetInfo", &sql, &[ship_id, char_id]).await
-}
-
-fn params(ids: &[i64]) -> Vec<i32> {
-    ids.iter().map(|i| i32::try_from(*i).unwrap_or(0)).collect()
+    // The ship, its pilot, and what is fitted to it (slots and rigs).
+    info_dict(ctx, |db| {
+        let entity = db.table("entity");
+        let mut ids: Vec<RowId> = [ship_id, char_id].iter().filter_map(|id| entity.get_id(*id)).map(|r| r.id).collect();
+        ids.extend(
+            entity
+                .find(&["locationID"], &[crate::store::Value::Int(ship_id)])
+                .filter(|e| e.int("flag").is_some_and(|f| (11..=35).contains(&f) || (92..=99).contains(&f)))
+                .map(|r| r.id),
+        );
+        ids
+    })
+    .await
 }
 
 async fn char_info(ctx: &Ctx<'_>) -> Value {
     let Some(char_id) = ctx.session.char_id else { return Value::Dict(Vec::new()) };
-    let sql = format!(
-        r#"{ITEM_SELECT} (e."itemID" = $1
-            OR (e."locationID" = $1 AND e."flag" IN (7, 61, 88, 89)))"#
-    );
-    info_dict(ctx, "CharGetInfo", &sql, &[char_id]).await
+    // The character, its skills, implants and boosters.
+    info_dict(ctx, |db| {
+        let entity = db.table("entity");
+        let mut ids: Vec<RowId> = entity.get_id(char_id).map(|r| r.id).into_iter().collect();
+        ids.extend(
+            entity
+                .find(&["locationID"], &[crate::store::Value::Int(char_id)])
+                .filter(|e| matches!(e.int("flag"), Some(7 | 61 | 88 | 89)))
+                .map(|r| r.id),
+        );
+        ids
+    })
+    .await
 }
 
 async fn item_info(ctx: &Ctx<'_>, key: Option<&Value>) -> Value {
     let Some(key) = key.and_then(ItemKey::parse) else { return Value::None };
-    let (sql, ids) = match key {
-        ItemKey::Entity(id) => (format!(r#"{ITEM_SELECT} e."itemID" = $1"#), vec![i64::from(id)]),
-        ItemKey::Sublocation { location, flag, type_id } => (
-            format!(r#"{ITEM_SELECT} e."locationID" = $1 AND e."flag" = $2 AND e."typeID" = $3
-                AND g."categoryID" = 8 AND e."singleton" = 0 AND e."quantity" > 0
-                ORDER BY e."itemID" LIMIT 1"#),
-            vec![i64::from(location), i64::from(flag), i64::from(type_id)],
-        ),
-    };
-    let items = match load_items(ctx, "ItemGetInfo", &sql, &ids).await {
-        Some(v) => v,
-        None => return Value::None,
+    let items = match key {
+        ItemKey::Entity(id) => load_items(ctx, |db| {
+            let now = crate::bulkdata::filetime_now();
+            db.table("entity").get_id(i64::from(id)).filter(|e| shown(db, e, now)).map(|r| r.id).into_iter().collect()
+        }),
+        // Only charges (category 8) are addressed this way.
+        ItemKey::Sublocation { type_id, .. }
+            if crate::sde::get().group_and_category(i64::from(type_id)).is_none_or(|(_, category)| category != 8) =>
+        {
+            return Value::None
+        }
+        // The first stack of that charge in that slot.
+        ItemKey::Sublocation { location, flag, type_id } => load_items(ctx, |db| {
+            let now = crate::bulkdata::filetime_now();
+            let v = |n: i32| crate::store::Value::Int(i64::from(n));
+            db.table("entity")
+                .find(&["locationID", "flag"], &[v(location), v(flag)])
+                .filter(|e| e.int("typeID") == Some(i64::from(type_id)) && e.int("singleton") == Some(0) && e.int("quantity").is_some_and(|q| q > 0))
+                .filter(|e| shown(db, e, now))
+                .min_by_key(|e| e.int("itemID"))
+                .map(|e| e.id)
+                .into_iter()
+                .collect()
+        }),
     };
     let Some(item) = items.into_iter().next() else { return Value::None };
     let attrs = computed_attributes(ctx, &[item.item_id]).await;
@@ -187,10 +207,16 @@ async fn item_info(ctx: &Ctx<'_>, key: Option<&Value>) -> Value {
     info_row_for_key(&item, &key, &attrs, now, running.iter().find(|module| module.module_id == item.item_id))
 }
 
-async fn info_dict(ctx: &Ctx<'_>, what: &str, sql: &str, ids: &[i64]) -> Value {
-    let Some(items) = load_items(ctx, what, sql, ids).await else {
-        return Value::Dict(Vec::new());
-    };
+async fn info_dict(ctx: &Ctx<'_>, pick: impl FnOnce(&Db) -> Vec<RowId>) -> Value {
+    let items = load_items(ctx, |db| {
+        let now = crate::bulkdata::filetime_now();
+        let entity = db.table("entity");
+        // Each once, in the table's order.
+        let mut ids = pick(db);
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().filter(|id| entity.row(*id).is_some_and(|e| shown(db, &e, now))).collect()
+    });
     let ids: Vec<i64> = items.iter().map(|i| i.item_id).collect();
     let attrs = computed_attributes(ctx, &ids).await;
     let now = crate::bulkdata::filetime_now();
@@ -233,32 +259,33 @@ fn info_row_for_key(item: &Item, key: &ItemKey, attrs: &BTreeMap<i64, BTreeMap<i
     )
 }
 
-async fn load_items(ctx: &Ctx<'_>, what: &str, sql: &str, ids: &[i64]) -> Option<Vec<Item>> {
-    let vals = params(ids);
-    let bound: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        vals.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-    let rows = match ctx.db.query(sql, &bound).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("dogmaIM::{what}: {err}", err = crate::logging::chain(&e));
-            return None;
-        }
-    };
-    Some(
-        rows.iter()
+/// The entity rows `pick` chooses as items, leaving out what the client is
+/// not shown.
+fn load_items(ctx: &Ctx<'_>, pick: impl FnOnce(&Db) -> Vec<RowId>) -> Vec<Item> {
+    ctx.store.read(|db| {
+        let entity = db.table("entity");
+        let boosters = db.table("character_boosters");
+        pick(db)
+            .into_iter()
+            .filter_map(|id| entity.row(id))
             .filter_map(|r| {
-                let get = |i: usize| r.try_get::<_, i32>(i).ok().map(|v| v as i64);
+                let item_id = r.int("itemID")?;
+                let type_id = r.int("typeID")?;
+                // An item of a type the static data does not know (or whose
+                // group it does not know) is left out, as joining on it did.
+                let (group_id, category_id) = crate::sde::get().group_and_category(type_id)?;
+                let line = crate::items::invitem_line(&r)?;
                 let item = Item {
-                    item_id: get(0)?,
-                    type_id: get(1)?,
-                    owner_id: get(2).unwrap_or(0),
-                    location_id: get(3).unwrap_or(0),
-                    group_id: r.try_get::<_, i32>(8).unwrap_or(0),
-                    category_id: r.try_get::<_, i32>(9).unwrap_or(0),
-                    booster_expiry: r.get(11),
-                    line: line(r).into_iter().take(INVITEM_HEADER.len()).collect(),
+                    item_id,
+                    type_id,
+                    owner_id: r.int("ownerID").unwrap_or(0),
+                    location_id: r.int("locationID").unwrap_or(0),
+                    group_id: group_id as i32,
+                    category_id: category_id as i32,
+                    booster_expiry: boosters.get_id(item_id).and_then(|b| b.int("expires")),
+                    line,
                 };
-                let flag = r.try_get::<_, i32>(4).unwrap_or(0);
+                let flag = r.int("flag").unwrap_or(0);
                 if flag == 5 || flag == 87 {
                     return None;
                 }
@@ -270,8 +297,8 @@ async fn load_items(ctx: &Ctx<'_>, what: &str, sql: &str, ids: &[i64]) -> Option
                 let _ = item.type_id;
                 Some(item)
             })
-            .collect(),
-    )
+            .collect()
+    })
 }
 
 /// Attributes as the dogma engine computes them for the character's loadout
@@ -283,7 +310,7 @@ async fn computed_attributes(ctx: &Ctx<'_>, item_ids: &[i64]) -> BTreeMap<i64, B
     match ctx.session.char_id {
         Some(char_id) => {
             let active = active_modules(ctx);
-            match crate::dogma::Loadout::load(ctx.db, ctx.dogma, char_id, ctx.session.ship_id, &active).await {
+            match ctx.store.read(|db| crate::dogma::Loadout::load(db, ctx.dogma, char_id, ctx.session.ship_id, &active)) {
                 Ok(loadout) => {
                     for id in item_ids {
                         match loadout.find(*id) {
@@ -303,7 +330,7 @@ async fn computed_attributes(ctx: &Ctx<'_>, item_ids: &[i64]) -> BTreeMap<i64, B
         None => rest.extend_from_slice(item_ids),
     }
     if !rest.is_empty() {
-        out.extend(attributes_for(ctx, &rest).await);
+        out.extend(attributes_for(ctx, &rest));
     }
     live_vitals(ctx, &mut out);
     out
@@ -347,52 +374,81 @@ fn live_vitals(ctx: &Ctx<'_>, attrs: &mut BTreeMap<i64, BTreeMap<i32, f64>>) {
     own.insert(attr::DAMAGE, fight.vitals.hull_damage);
 }
 
-async fn attributes_for(
+fn attributes_for(
     ctx: &Ctx<'_>,
     item_ids: &[i64],
 ) -> BTreeMap<i64, BTreeMap<i32, f64>> {
-    const NUMERIC: &str = r#"'^\s*-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?\s*$'"#;
-    let sql = format!(
-        r#"
-        WITH scope AS (
-            SELECT e."itemID", e."typeID" FROM entity e WHERE e."itemID" = ANY($1)
-        ), merged AS (
-            SELECT s."itemID", ta."attributeID", 1 AS arm,
-                   COALESCE(ea."valueFloat", ea."valueInt"::float8,
-                            CASE WHEN ta.value ~ {NUMERIC} THEN ta.value::float8 END) AS v
-              FROM scope s
-              JOIN "dgmTypeAttribs"     ta  ON ta."typeID"      = s."typeID"
-              JOIN "dgmAttributeTypes"  dat ON dat."attributeID" = ta."attributeID"
-              LEFT JOIN entity_attributes ea
-                     ON ea."itemID" = s."itemID" AND ea."attributeID" = ta."attributeID"
-            UNION ALL
-            SELECT ea."itemID", ea."attributeID", 2 AS arm,
-                   COALESCE(ea."valueFloat", ea."valueInt"::float8) AS v
-              FROM entity_attributes ea
-              JOIN scope s ON s."itemID" = ea."itemID"
-              JOIN "dgmAttributeTypes" dat ON dat."attributeID" = ea."attributeID"
-        )
-        SELECT DISTINCT ON ("itemID", "attributeID") "itemID", "attributeID", v
-          FROM merged WHERE v IS NOT NULL ORDER BY "itemID", "attributeID", arm"#
-    );
-    let ids: Vec<i32> = item_ids.iter().filter_map(|i| i32::try_from(*i).ok()).collect();
+    // Each item's own values and, where it has none, its type's
+    // (dgmTypeAttribs, the numeric ones); only attributes the static data
+    // knows.
+    let known = |attr: i32| crate::sde::table("dgmAttributeTypes").get("attributeID", attr as i64).is_some();
     let mut out: BTreeMap<i64, BTreeMap<i32, f64>> = BTreeMap::new();
-    match ctx.db.query(sql.as_str(), &[&ids]).await {
-        Ok(rows) => {
-            for r in &rows {
-                let (Ok(item), Ok(attr), Ok(v)) = (
-                    r.try_get::<_, i32>(0),
-                    r.try_get::<_, i32>(1),
-                    r.try_get::<_, f64>(2),
-                ) else {
-                    continue;
-                };
-                out.entry(item as i64).or_default().insert(attr, v);
+    let mut types: BTreeMap<i64, i64> = BTreeMap::new();
+    ctx.store.read(|db| {
+        let entity = db.table("entity");
+        let attributes = db.table("entity_attributes");
+        for id in item_ids {
+            let Some(e) = entity.get_id(*id) else { continue };
+            types.insert(*id, e.int("typeID").unwrap_or(0));
+            for a in attributes.find(&["itemID"], &[crate::store::Value::Int(*id)]) {
+                let (Some(attr), Some(v)) = (a.int("attributeID"), a.float("valueFloat").or_else(|| a.float("valueInt"))) else { continue };
+                let attr = attr as i32;
+                if known(attr) {
+                    out.entry(*id).or_default().insert(attr, v);
+                }
             }
         }
-        Err(e) => error!("dogmaIM attributes: {err}", err = crate::logging::chain(&e)),
+    });
+    for (item, type_id) in types {
+        for ta in crate::sde::table("dgmTypeAttribs").find("typeID", type_id) {
+            let (Some(attr), Some(v)) = (ta.int("attributeID"), ta.text("value").and_then(numeric)) else { continue };
+            let attr = attr as i32;
+            if known(attr) && !out.get(&item).is_some_and(|own| own.contains_key(&attr)) {
+                out.entry(item).or_default().insert(attr, v);
+            }
+        }
     }
     out
+}
+
+/// A dgmTypeAttribs value as a number, if it reads as one: what matching
+/// `^\s*-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?\s*$` and casting to float8 gave.
+fn numeric(value: &str) -> Option<f64> {
+    let s = value.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
+    let b = s.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > start
+    };
+    if b.first() == Some(&b'-') {
+        i += 1;
+    }
+    if !digits(&mut i) {
+        return None;
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        if !digits(&mut i) {
+            return None;
+        }
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !digits(&mut i) {
+            return None;
+        }
+    }
+    if i != b.len() {
+        return None;
+    }
+    s.parse().ok()
 }
 
 fn attribute_dict(item: &Item, own: Option<&BTreeMap<i32, f64>>) -> Value {
@@ -539,7 +595,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
     async fn fitted_ammo_is_resolved_by_tuple_and_rigs_are_in_ship_info() {
         let database = crate::test_support::Database::load().await;
         let owner = database.id().await;
@@ -552,8 +607,9 @@ mod tests {
             (charge, 230, ship_id, 27, 87, 0),
             (rig, 26286, ship_id, 92, 1, 1),
         ] {
-            database.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)"#, &[&id, &type_id, &owner, &location, &flag, &quantity, &singleton]).await.unwrap();
+            let v = |n: i32| crate::store::Value::Int(i64::from(n));
+            database.store.write(|tx| tx.insert("entity", &[("itemID", v(id)), ("typeID", v(type_id)), ("ownerID", v(owner)),
+                ("locationID", v(location)), ("flag", v(flag)), ("quantity", v(quantity)), ("singleton", v(singleton))])).unwrap();
         }
         let session = crate::session::Session {
             char_id: Some(i64::from(owner)), ship_id: Some(i64::from(ship_id)),
@@ -569,7 +625,10 @@ mod tests {
         assert!(ship.iter().any(|(key, _)| *key == Value::Int(i64::from(rig))), "rig missing from ship snapshot");
         let wrong_type = Value::Tuple(vec![Value::Int(i64::from(ship_id)), Value::Int(27), Value::Int(231)]);
         assert_eq!(item_info(&ctx, Some(&wrong_type)).await, Value::None);
-        database.db.execute(r#"UPDATE entity SET quantity = 0 WHERE "itemID" = $1"#, &[&charge]).await.unwrap();
+        database.store.write(|tx| {
+            let row = tx.table("entity").get_id(i64::from(charge)).unwrap().id;
+            tx.update("entity", row, &[("quantity", crate::store::Value::Int(0))])
+        }).unwrap();
         assert_eq!(item_info(&ctx, Some(&key)).await, Value::None);
     }
 

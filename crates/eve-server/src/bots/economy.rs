@@ -26,11 +26,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tokio_postgres::Client;
 use tracing::{error, info};
 
 use super::behaviour::{Atlas, Bot};
-use crate::svc::rows::{float, int, text};
+use crate::store::{Db, RowId, Store, StoreError, Value};
 
 const GROUP_MINERAL: i32 = 18;
 const CATEGORY_ASTEROID: i32 = 25;
@@ -507,50 +506,73 @@ fn round_price(p: f64) -> f64 {
 
 /// Reads the goods, refining and bills of materials, the NPC prices, and
 /// what the bots already hold.
-pub async fn load(db: &Client, atlas: &Atlas, hull_types: &[i32]) -> Result<Economy, tokio_postgres::Error> {
+pub fn load(db: &Db, atlas: &Atlas, hull_types: &[i32]) -> Economy {
     let mut e = Economy::empty();
     let ores: Vec<i32> = ORES.iter().flat_map(|b| b.iter().copied()).collect();
-    let sql = r#"SELECT t."typeID", t."typeName", COALESCE(t."volume", 1)::float8, g."categoryID", t."groupID",
-                        MIN(o."price") FILTER (WHERE o."bid" = 0), MAX(o."price") FILTER (WHERE o."bid" = 1)
-                   FROM "invTypes" t
-                   JOIN "invGroups" g ON g."groupID" = t."groupID"
-                   LEFT JOIN market_orders o ON o."typeID" = t."typeID" AND o."charID" < $3 AND o."orderState" = 0
-                  WHERE t."typeID" = ANY($1) OR t."groupID" = $2
-                  GROUP BY t."typeID", t."typeName", t."volume", g."categoryID", t."groupID""#;
-    let wanted: Vec<i32> = ores.iter().copied().chain(hull_types.iter().copied()).collect();
-    for r in db.query(sql, &[&wanted, &GROUP_MINERAL, &FIRST_PLAYER_ID]).await? {
-        let type_id = int(&r, 0).unwrap_or(0) as i32;
-        let (Some(ask), Some(bid)) = (float(&r, 5), float(&r, 6)) else { continue };
-        let kind = if int(&r, 3) == Some(CATEGORY_ASTEROID as i64) {
+    let sde = crate::sde::get();
+    let types = crate::sde::table("invTypes");
+    // The ores, the hulls and every mineral, as far as their group is known.
+    let mut wanted: Vec<i32> = ores.iter().chain(hull_types).chain(sde.types_in_group(GROUP_MINERAL as i64)).copied().collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted.retain(|t| sde.group_and_category(*t as i64).is_some());
+    let orders = db.table("market_orders");
+    for &type_id in &wanted {
+        // The NPC market's best ask and bid for the type.
+        let (mut ask, mut bid): (Option<f64>, Option<f64>) = (None, None);
+        for o in orders.find(&["typeID"], &[Value::Int(i64::from(type_id))]) {
+            if !o.int("charID").is_some_and(|c| c < i64::from(FIRST_PLAYER_ID)) || o.int("orderState") != Some(0) {
+                continue;
+            }
+            let Some(price) = o.float("price") else { continue };
+            match o.int("bid") {
+                Some(0) => ask = Some(ask.map_or(price, |a| a.min(price))),
+                Some(1) => bid = Some(bid.map_or(price, |b| b.max(price))),
+                _ => {}
+            }
+        }
+        let (Some(ask), Some(bid)) = (ask, bid) else { continue };
+        let Some((group, category)) = sde.group_and_category(type_id as i64) else { continue };
+        let Some(t) = types.get("typeID", type_id as i64) else { continue };
+        let kind = if category == CATEGORY_ASTEROID as i64 {
             Kind::Ore
-        } else if int(&r, 4) == Some(GROUP_MINERAL as i64) {
+        } else if group == GROUP_MINERAL as i64 {
             Kind::Mineral
         } else {
             Kind::Hull
         };
-        let volume = if kind == Kind::Hull { 2_500.0 } else { float(&r, 2).unwrap_or(1.0) };
-        e.goods.insert(type_id, Good { name: text(&r, 1).unwrap_or_default(), kind, volume, ask, bid: bid.min(ask) });
+        let volume = if kind == Kind::Hull { 2_500.0 } else { t.float("volume").unwrap_or(1.0) };
+        e.goods.insert(type_id, Good { name: t.text("typeName").unwrap_or_default().to_string(), kind, volume, ask, bid: bid.min(ask) });
     }
-    let sql = r#"SELECT r."oreTypeID", r."mineralTypeID", r."amountPerBatch", COALESCE(t."portionSize", 1)
-                   FROM "invOreReprocessing" r JOIN "invTypes" t ON t."typeID" = r."oreTypeID"
-                  WHERE r."oreTypeID" = ANY($1)"#;
-    for r in db.query(sql, &[&ores]).await? {
-        let (ore, mineral, amount, portion) = (int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0) as i32, int(&r, 2).unwrap_or(0), int(&r, 3).unwrap_or(1));
+    // What each ore refines into (invOreReprocessing), with its batch size.
+    let ore_set: HashSet<i64> = ores.iter().map(|o| *o as i64).collect();
+    for r in crate::sde::table("invOreReprocessing").rows() {
+        let Some(ore) = r.int("oreTypeID").filter(|o| ore_set.contains(o)) else { continue };
+        let Some(t) = types.get("typeID", ore) else { continue };
+        let (ore, mineral, amount, portion) =
+            (ore as i32, r.int("mineralTypeID").unwrap_or(0) as i32, r.int("amountPerBatch").unwrap_or(0), t.int("portionSize").unwrap_or(1));
         if !e.goods.contains_key(&mineral) {
             continue;
         }
         let entry = e.refine.entry(ore).or_insert((portion.max(1), Vec::new()));
         entry.1.push((mineral, amount));
     }
-    let sql = r#"SELECT m."typeID", m."requiredTypeID", m."quantity" FROM "TL2MaterialsForTypeWithActivity" m
-                   JOIN "invTypes" t ON t."typeID" = m."requiredTypeID"
-                  WHERE m."activity" = $2 AND m."damagePerJob" = 1 AND t."groupID" = $3 AND m."typeID" = ANY($1)"#;
-    for r in db.query(sql, &[&hull_types, &ACTIVITY_MANUFACTURING, &GROUP_MINERAL]).await? {
-        e.bom.entry(int(&r, 0).unwrap_or(0) as i32).or_default().push((int(&r, 1).unwrap_or(0) as i32, int(&r, 2).unwrap_or(0)));
+    // Each hull's minerals to manufacture.
+    let hull_set: HashSet<i64> = hull_types.iter().map(|h| *h as i64).collect();
+    for m in crate::sde::table("TL2MaterialsForTypeWithActivity").rows() {
+        let Some(hull) = m.int("typeID").filter(|h| hull_set.contains(h)) else { continue };
+        if m.int("activity") != Some(ACTIVITY_MANUFACTURING as i64) || m.float("damagePerJob") != Some(1.0) {
+            continue;
+        }
+        let Some(required) = m.int("requiredTypeID") else { continue };
+        if types.get("typeID", required).and_then(|t| t.int("groupID")) != Some(GROUP_MINERAL as i64) {
+            continue;
+        }
+        e.bom.entry(hull as i32).or_default().push((required as i32, m.int("quantity").unwrap_or(0)));
     }
     e.bom.retain(|h, _| e.goods.contains_key(h));
-    for r in db.query(r#"SELECT "stationID", "typeID", "quantity" FROM "botStock" WHERE "quantity" > 0"#, &[]).await? {
-        e.stock.insert((int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0) as i32), int(&r, 2).unwrap_or(0));
+    for r in db.table("botStock").rows().filter(|r| r.int("quantity").is_some_and(|q| q > 0)) {
+        e.stock.insert((r.int("stationID").unwrap_or(0) as i32, r.int("typeID").unwrap_or(0) as i32), r.int("quantity").unwrap_or(0));
     }
     e.station_system = atlas.station_system.clone();
     e.region_of_system = atlas.systems.iter().map(|(id, s)| (*id, s.region)).collect();
@@ -561,7 +583,7 @@ pub async fn load(db: &Client, atlas: &Atlas, hull_types: &[i32]) -> Result<Econ
         e.bom.len(),
         e.stock.len()
     );
-    Ok(e)
+    e
 }
 
 /// The markets: the trade hubs and the null-sec capitals; each system goes
@@ -606,37 +628,50 @@ pub fn set_hubs(e: &mut Economy, atlas: &Atlas, hubs: Vec<i32>, bots: &[Bot]) {
 // ---- writing it down -----------------------------------------------------------------------
 
 /// Saves the stock that changed and posts corporation income.
-pub async fn flush(e: &mut Economy, db: &Client) -> Result<(), tokio_postgres::Error> {
+pub async fn flush(e: &mut Economy, store: &Store) -> Result<(), StoreError> {
     if !e.dirty.is_empty() {
         let keys: Vec<(i32, i32)> = e.dirty.drain().collect();
-        let stations: Vec<i32> = keys.iter().map(|k| k.0).collect();
-        let types: Vec<i32> = keys.iter().map(|k| k.1).collect();
-        let quantities: Vec<i64> = keys.iter().map(|k| e.stock.get(k).copied().unwrap_or(0)).collect();
-        db.execute(
-            r#"INSERT INTO "botStock" ("stationID", "typeID", "quantity")
-               SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[])
-               ON CONFLICT ("stationID", "typeID") DO UPDATE SET "quantity" = EXCLUDED."quantity""#,
-            &[&stations, &types, &quantities],
-        )
-        .await?;
+        store.write(|tx| -> Result<(), StoreError> {
+            for (station, type_id) in &keys {
+                let quantity = Value::Int(e.stock.get(&(*station, *type_id)).copied().unwrap_or(0));
+                let row = [("stationID", Value::Int(i64::from(*station))), ("typeID", Value::Int(i64::from(*type_id))), ("quantity", quantity.clone())];
+                tx.upsert("botStock", &["stationID", "typeID"], &row, &[("quantity", quantity)])?;
+            }
+            Ok(())
+        })?;
         e.stock.retain(|_, n| *n > 0);
     }
     if !e.corp_income.is_empty() {
-        let (corps, amounts): (Vec<i32>, Vec<f64>) = e.corp_income.drain().unzip();
+        let income: Vec<(i32, f64)> = e.corp_income.drain().collect();
         let now = crate::bulkdata::filetime_now();
         // The corporation's wallet, and a line in its journal.
-        db.execute(
-            r#"WITH u AS (SELECT * FROM unnest($1::int[], $2::float8[]) AS u(corp, amount)),
-                    paid AS (UPDATE "corporation" co SET "balance" = co."balance" + u.amount FROM u
-                              WHERE co."corporationID" = u.corp RETURNING co."corporationID", co."balance", u.amount)
-               INSERT INTO market_journal ("characterID","transDate","refTypeID","ownerID1","ownerID2","argID1",
-                                           "accountID","amount","balance","reason","accountKey")
-               SELECT p."corporationID", $3::bigint, 10, 0, p."corporationID", '', 0, p.amount, p."balance", 'Member tax (simulated pilots)', 1000
-                 FROM paid p
-                WHERE NOT EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = p."corporationID")"#,
-            &[&corps, &amounts, &now],
-        )
-        .await?;
+        store.write(|tx| -> Result<(), StoreError> {
+            for (corp, amount) in &income {
+                let Some(co) = tx.table("corporation").get_id(i64::from(*corp)) else { continue };
+                let (row, balance) = (co.id, co.float("balance").unwrap_or(0.0) + amount);
+                tx.update("corporation", row, &[("balance", Value::Float(balance))])?;
+                if tx.table("botGroups").get_id(i64::from(*corp)).is_some() {
+                    continue;
+                }
+                tx.insert(
+                    "market_journal",
+                    &[
+                        ("characterID", Value::Int(i64::from(*corp))),
+                        ("transDate", Value::Int(now)),
+                        ("refTypeID", Value::Int(10)),
+                        ("ownerID1", Value::Int(0)),
+                        ("ownerID2", Value::Int(i64::from(*corp))),
+                        ("argID1", Value::Text("".into())),
+                        ("accountID", Value::Int(0)),
+                        ("amount", Value::Float(*amount)),
+                        ("balance", Value::Float(balance)),
+                        ("reason", Value::Text("Member tax (simulated pilots)".into())),
+                        ("accountKey", Value::Int(1000)),
+                    ],
+                )?;
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -646,20 +681,20 @@ pub async fn flush(e: &mut Economy, db: &Client) -> Result<(), tokio_postgres::E
 /// bought and sold through them, and the bots' own trade written into the
 /// market's history. Returns the ISK the traders' orders took or gave back
 /// (escrow), by bot index.
-pub async fn tick(e: &mut Economy, db: &Client, db_url: &str, world: &crate::world::World, bots: &[Bot], roll: &mut impl FnMut() -> f64) -> Result<(), tokio_postgres::Error> {
+pub async fn tick(e: &mut Economy, store: &Store, world: &crate::world::World, bots: &[Bot], roll: &mut impl FnMut() -> f64) -> Result<(), StoreError> {
     e.refine_all();
     e.build(roll);
     if e.traders.is_empty() {
         return Ok(());
     }
     let now = crate::bulkdata::filetime_now();
-    reconcile(e, db, bots).await?;
-    absorb(e, db, bots).await?;
-    if let Err(err) = fill_player_bids(e, db, db_url, world, bots).await {
+    store.read(|db| reconcile(e, db, bots));
+    absorb(e, store, bots).await?;
+    if let Err(err) = fill_player_bids(e, store, world, bots).await {
         error!("bots: filling players' buy orders: {}", crate::logging::chain(&err));
     }
-    place(e, db, bots, now).await?;
-    history(e, db, bots, now).await?;
+    place(e, store, bots, now).await?;
+    history(e, store, bots, now).await?;
     let mut board = Vec::new();
     for &hub in &e.hubs {
         for (t, g) in &e.goods {
@@ -674,12 +709,16 @@ pub async fn tick(e: &mut Economy, db: &Client, db_url: &str, world: &crate::wor
 }
 
 /// What players took from the bots' orders since the last look.
-async fn reconcile(e: &mut Economy, db: &Client, bots: &[Bot]) -> Result<(), tokio_postgres::Error> {
-    let ids: Vec<i32> = e.orders.values().map(|o| o.id).collect();
-    let rows = db.query(r#"SELECT "orderID", "volRemaining", "orderState", "escrow", "price" FROM market_orders WHERE "orderID" = ANY($1)"#, &[&ids]).await?;
-    let found: HashMap<i32, (i64, i32, f64, f64)> = rows
-        .iter()
-        .map(|r| (int(r, 0).unwrap_or(0) as i32, (int(r, 1).unwrap_or(0), int(r, 2).unwrap_or(0) as i32, float(r, 3).unwrap_or(0.0), float(r, 4).unwrap_or(0.0))))
+fn reconcile(e: &mut Economy, db: &Db, bots: &[Bot]) {
+    let orders = db.table("market_orders");
+    let found: HashMap<i32, (i64, i32, f64, f64)> = e
+        .orders
+        .values()
+        .filter_map(|o| orders.get_id(i64::from(o.id)))
+        .map(|r| {
+            let order = (r.int("volRemaining").unwrap_or(0), r.int("orderState").unwrap_or(0) as i32, r.float("escrow").unwrap_or(0.0), r.float("price").unwrap_or(0.0));
+            (r.int("orderID").unwrap_or(0) as i32, order)
+        })
         .collect();
     let keys: Vec<(i32, i32, bool)> = e.orders.keys().copied().collect();
     for key in keys {
@@ -715,24 +754,36 @@ async fn reconcile(e: &mut Economy, db: &Client, bots: &[Bot]) -> Result<(), tok
         }
     }
     let _ = bots;
-    Ok(())
 }
 
 /// What players sold into the bots' buy orders: out of the traders'
 /// hangars, into stock.
-async fn absorb(e: &mut Economy, db: &Client, bots: &[Bot]) -> Result<(), tokio_postgres::Error> {
+async fn absorb(e: &mut Economy, store: &Store, bots: &[Bot]) -> Result<(), StoreError> {
     let traders: Vec<i32> = e.traders.values().map(|i| bots[*i as usize].id).collect();
-    let goods: Vec<i32> = e.goods.keys().copied().collect();
-    let rows = db
-        .query(
-            r#"DELETE FROM entity WHERE "ownerID" = ANY($1) AND "flag" = $2 AND "singleton" = 0 AND "typeID" = ANY($3)
-                                    AND "locationID" = ANY($4)
-               RETURNING "locationID", "typeID", "quantity""#,
-            &[&traders, &FLAG_HANGAR, &goods, &e.hubs],
-        )
-        .await?;
-    for r in rows {
-        e.add(int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0) as i32, int(&r, 2).unwrap_or(0));
+    let taken: Vec<(i32, i32, i64)> = store.write(|tx| -> Result<Vec<(i32, i32, i64)>, StoreError> {
+        let rows: Vec<(RowId, (i32, i32, i64))> = {
+            let entity = tx.table("entity");
+            let mut rows = Vec::new();
+            for trader in &traders {
+                for hub in &e.hubs {
+                    let key = [Value::Int(i64::from(*trader)), Value::Int(i64::from(*hub)), Value::Int(i64::from(FLAG_HANGAR))];
+                    for r in entity.find(&["ownerID", "locationID", "flag"], &key) {
+                        let type_id = r.int("typeID").unwrap_or(0) as i32;
+                        if r.int("singleton") == Some(0) && e.goods.contains_key(&type_id) {
+                            rows.push((r.id, (*hub, type_id, r.int("quantity").unwrap_or(0))));
+                        }
+                    }
+                }
+            }
+            rows
+        };
+        for (row, _) in &rows {
+            tx.delete("entity", *row)?;
+        }
+        Ok(rows.into_iter().map(|(_, taken)| taken).collect())
+    })?;
+    for (station, type_id, n) in taken {
+        e.add(station, type_id, n);
     }
     Ok(())
 }
@@ -740,9 +791,9 @@ async fn absorb(e: &mut Economy, db: &Client, bots: &[Bot]) -> Result<(), tokio_
 /// The orders each hub should have: a sell order for all its stock, and
 /// buy orders for the ore and minerals it is short of; set up or brought up
 /// to date.
-async fn place(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(), tokio_postgres::Error> {
+async fn place(e: &mut Economy, store: &Store, bots: &[Bot], now: i64) -> Result<(), StoreError> {
     // (orderID, price, remaining, escrow) for updates; new ones apart.
-    let mut updates: (Vec<i32>, Vec<f64>, Vec<i32>, Vec<f64>) = Default::default();
+    let mut updates: Vec<(i32, f64, i64, f64)> = Vec::new();
     let mut new: Vec<((i32, i32, bool), f64, i64, f64)> = Vec::new();
     let mut spent: HashMap<u32, f64> = HashMap::new();
     // What the book becomes once the database has it: (key, (left, escrow)
@@ -761,12 +812,7 @@ async fn place(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(
             let have = e.stock_at(hub, t);
             let ask = e.ask(hub, t);
             match (e.orders.get(&(hub, t, false)), have > 0) {
-                (Some(o), _) => {
-                    updates.0.push(o.id);
-                    updates.1.push(ask);
-                    updates.2.push(have.min(i32::MAX as i64) as i32);
-                    updates.3.push(0.0);
-                }
+                (Some(o), _) => updates.push((o.id, ask, have.min(i32::MAX as i64), 0.0)),
                 (None, true) => new.push(((hub, t, false), ask, have, 0.0)),
                 (None, false) => {}
             }
@@ -789,10 +835,7 @@ async fn place(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(
             *spent.entry(trader).or_default() += escrow - refund;
             match old {
                 Some(o) => {
-                    updates.0.push(o.id);
-                    updates.1.push(bid);
-                    updates.2.push(want as i32);
-                    updates.3.push(escrow);
+                    updates.push((o.id, bid, want, escrow));
                     after.push(((hub, t, true), (want > 0).then_some((want, escrow))));
                 }
                 None if want > 0 => new.push(((hub, t, true), bid, want, escrow)),
@@ -800,16 +843,27 @@ async fn place(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(
             }
         }
     }
-    if !updates.0.is_empty() {
-        db.execute(
-            r#"UPDATE market_orders o SET "price" = u.price, "volRemaining" = u.remaining,
-                      "volEntered" = GREATEST(o."volEntered", u.remaining), "escrow" = u.escrow, "issued" = $5::bigint,
-                      "orderState" = CASE WHEN u.remaining > 0 THEN $6::int ELSE $7::int END
-                 FROM unnest($1::int[], $2::float8[], $3::int[], $4::float8[]) AS u(id, price, remaining, escrow)
-                WHERE o."orderID" = u.id"#,
-            &[&updates.0, &updates.1, &updates.2, &updates.3, &now, &ORDER_OPEN, &ORDER_DONE],
-        )
-        .await?;
+    if !updates.is_empty() {
+        store.write(|tx| -> Result<(), StoreError> {
+            for (id, price, remaining, escrow) in &updates {
+                let Some(o) = tx.table("market_orders").get_id(i64::from(*id)) else { continue };
+                let (row, entered) = (o.id, o.int("volEntered").unwrap_or(0));
+                let state = if *remaining > 0 { ORDER_OPEN } else { ORDER_DONE };
+                tx.update(
+                    "market_orders",
+                    row,
+                    &[
+                        ("price", Value::Float(*price)),
+                        ("volRemaining", Value::Int(*remaining)),
+                        ("volEntered", Value::Int(entered.max(*remaining))),
+                        ("escrow", Value::Float(*escrow)),
+                        ("issued", Value::Int(now)),
+                        ("orderState", Value::Int(i64::from(state))),
+                    ],
+                )?;
+            }
+            Ok(())
+        })?;
     }
     for (key, left) in after {
         match left {
@@ -825,33 +879,41 @@ async fn place(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(
         }
     }
     if !new.is_empty() {
-        let col = |f: &dyn Fn(&((i32, i32, bool), f64, i64, f64)) -> i32| new.iter().map(f).collect::<Vec<i32>>();
-        let type_ids = col(&|n| n.0 .1);
-        let stations = col(&|n| n.0 .0);
-        let chars = col(&|n| e.traders.get(&n.0 .0).map_or(0, |i| bots[*i as usize].id));
-        let systems = col(&|n| e.station_system.get(&n.0 .0).copied().unwrap_or(0));
-        let regions = col(&|n| e.station_system.get(&n.0 .0).and_then(|s| e.region_of_system.get(s)).copied().unwrap_or(0));
-        let bids: Vec<i16> = new.iter().map(|n| i16::from(n.0 .2)).collect();
-        let prices: Vec<f64> = new.iter().map(|n| n.1).collect();
-        let volumes = col(&|n| n.2.min(i32::MAX as i64) as i32);
-        let escrows: Vec<f64> = new.iter().map(|n| n.3).collect();
-        let ids: Vec<i32> = db
-            .query(
-                r#"INSERT INTO market_orders
-                       ("typeID","charID","regionID","stationID","range","bid","price","volEntered","volRemaining","issued",
-                        "orderState","minVolume","contraband","accountID","duration","isCorp","solarSystemID","escrow","jumps")
-                   SELECT u.type_id, u.char_id, u.region, u.station, $10::int, u.bid, u.price, u.volume, u.volume, $11::bigint,
-                          $12::int, 1, 0, 1000, $13::int, 0, u.system, u.escrow, 1
-                     FROM unnest($1::int[], $2::int[], $3::int[], $4::int[], $5::smallint[], $6::float8[], $7::int[], $8::int[], $9::float8[])
-                          WITH ORDINALITY AS u(type_id, char_id, region, station, bid, price, volume, system, escrow, n)
-                    ORDER BY u.n
-                   RETURNING "orderID""#,
-                &[&type_ids, &chars, &regions, &stations, &bids, &prices, &volumes, &systems, &escrows, &RANGE_STATION, &now, &ORDER_OPEN, &ORDER_DAYS],
-            )
-            .await?
-            .iter()
-            .map(|r| r.get::<_, i32>(0))
-            .collect();
+        let ids: Vec<i32> = store.write(|tx| -> Result<Vec<i32>, StoreError> {
+            let mut ids = Vec::with_capacity(new.len());
+            for ((station, t, bid), price, volume, escrow) in &new {
+                let char_id = e.traders.get(station).map_or(0, |i| bots[*i as usize].id);
+                let system = e.station_system.get(station).copied().unwrap_or(0);
+                let region = e.station_system.get(station).and_then(|s| e.region_of_system.get(s)).copied().unwrap_or(0);
+                let volume = Value::Int((*volume).min(i32::MAX as i64));
+                let row = tx.insert(
+                    "market_orders",
+                    &[
+                        ("typeID", Value::Int(i64::from(*t))),
+                        ("charID", Value::Int(i64::from(char_id))),
+                        ("regionID", Value::Int(i64::from(region))),
+                        ("stationID", Value::Int(i64::from(*station))),
+                        ("range", Value::Int(i64::from(RANGE_STATION))),
+                        ("bid", Value::Int(i64::from(*bid))),
+                        ("price", Value::Float(*price)),
+                        ("volEntered", volume.clone()),
+                        ("volRemaining", volume),
+                        ("issued", Value::Int(now)),
+                        ("orderState", Value::Int(i64::from(ORDER_OPEN))),
+                        ("minVolume", Value::Int(1)),
+                        ("contraband", Value::Int(0)),
+                        ("accountID", Value::Int(1000)),
+                        ("duration", Value::Int(i64::from(ORDER_DAYS))),
+                        ("isCorp", Value::Int(0)),
+                        ("solarSystemID", Value::Int(i64::from(system))),
+                        ("escrow", Value::Float(*escrow)),
+                        ("jumps", Value::Int(1)),
+                    ],
+                )?;
+                ids.push(tx.table("market_orders").row(row).and_then(|r| r.int("orderID")).unwrap_or(0) as i32);
+            }
+            Ok(ids)
+        })?;
         for (n, id) in new.iter().zip(ids) {
             e.orders.insert(n.0, Order { id, listed: n.2, escrow: n.3 });
         }
@@ -866,61 +928,68 @@ async fn place(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(
 }
 
 /// The bots' own orders at start: those their traders hold, open.
-pub async fn adopt_orders(e: &mut Economy, db: &Client, bots: &[Bot]) -> Result<(), tokio_postgres::Error> {
+pub async fn adopt_orders(e: &mut Economy, store: &Store, bots: &[Bot]) -> Result<(), StoreError> {
     let by_char: HashMap<i32, i32> = e.traders.iter().map(|(hub, i)| (bots[*i as usize].id, *hub)).collect();
-    let chars: Vec<i32> = by_char.keys().copied().collect();
-    let rows = db
-        .query(
-            r#"SELECT "orderID", "charID", "stationID", "typeID", "bid", "volRemaining", "escrow" FROM market_orders
-                WHERE "charID" = ANY($1) AND "orderState" = $2"#,
-            &[&chars, &ORDER_OPEN],
-        )
-        .await?;
-    let mut stale = Vec::new();
-    for r in rows {
-        let id = int(&r, 0).unwrap_or(0) as i32;
-        let (char_id, station, t, bid) = (int(&r, 1).unwrap_or(0) as i32, int(&r, 2).unwrap_or(0) as i32, int(&r, 3).unwrap_or(0) as i32, int(&r, 4) == Some(1));
-        if by_char.get(&char_id) != Some(&station) || e.orders.contains_key(&(station, t, bid)) {
-            stale.push(id);
-            continue;
+    let mut chars: Vec<i32> = by_char.keys().copied().collect();
+    chars.sort_unstable();
+    store.write(|tx| -> Result<(), StoreError> {
+        let mut stale = Vec::new();
+        {
+            let orders = tx.table("market_orders");
+            for c in &chars {
+                for r in orders.find(&["charID"], &[Value::Int(i64::from(*c))]).filter(|r| r.int("orderState") == Some(i64::from(ORDER_OPEN))) {
+                    let id = r.int("orderID").unwrap_or(0) as i32;
+                    let (char_id, station, t, bid) = (*c, r.int("stationID").unwrap_or(0) as i32, r.int("typeID").unwrap_or(0) as i32, r.int("bid") == Some(1));
+                    if by_char.get(&char_id) != Some(&station) || e.orders.contains_key(&(station, t, bid)) {
+                        stale.push((r.id, char_id, r.float("escrow").unwrap_or(0.0)));
+                        continue;
+                    }
+                    e.orders.insert((station, t, bid), Order { id, listed: r.int("volRemaining").unwrap_or(0), escrow: r.float("escrow").unwrap_or(0.0) });
+                }
+            }
         }
-        e.orders.insert((station, t, bid), Order { id, listed: int(&r, 5).unwrap_or(0), escrow: float(&r, 6).unwrap_or(0.0) });
-    }
-    if !stale.is_empty() {
         // Orders of traders who are no longer a hub's: closed, escrow returned.
-        db.execute(
-            r#"WITH closed AS (UPDATE market_orders SET "orderState" = $2, "volRemaining" = 0 WHERE "orderID" = ANY($1)
-                               RETURNING "charID", "escrow")
-               UPDATE "character_" c SET "balance" = c."balance" + s.escrow
-                 FROM (SELECT "charID", sum("escrow") AS escrow FROM closed GROUP BY 1) s WHERE c."characterID" = s."charID""#,
-            &[&stale, &ORDER_DONE],
-        )
-        .await?;
-    }
+        let mut refunds: HashMap<i32, f64> = HashMap::new();
+        for (row, char_id, escrow) in stale {
+            tx.update("market_orders", row, &[("orderState", Value::Int(i64::from(ORDER_DONE))), ("volRemaining", Value::Int(0))])?;
+            *refunds.entry(char_id).or_default() += escrow;
+        }
+        for (char_id, escrow) in refunds {
+            let Some(c) = tx.table("character_").get_id(i64::from(char_id)) else { continue };
+            let (row, balance) = (c.id, c.float("balance").unwrap_or(0.0));
+            tx.update("character_", row, &[("balance", Value::Float(balance + escrow))])?;
+        }
+        Ok(())
+    })?;
     e.stats.orders = e.orders.len();
     Ok(())
 }
 
 /// Players' buy orders the bots' stock reaches at their price: filled, as a
 /// seller would, out of the hub's stock.
-async fn fill_player_bids(e: &mut Economy, db: &Client, db_url: &str, world: &crate::world::World, bots: &[Bot]) -> Result<(), tokio_postgres::Error> {
-    let goods: Vec<i32> = e.goods.keys().copied().collect();
-    let sql = r#"SELECT o."orderID", o."charID", o."stationID", o."typeID", o."price", o."volRemaining", o."escrow", o."regionID",
-                        o."solarSystemID", o."range"
-                   FROM market_orders o
-                  WHERE o."bid" = 1 AND o."orderState" = 0 AND o."volRemaining" > 0 AND o."charID" >= $2
-                    AND o."typeID" = ANY($1) AND o."isCorp" = 0
-                    AND NOT EXISTS (SELECT 1 FROM "bots" b WHERE b."characterID" = o."charID")"#;
-    let rows = db.query(sql, &[&goods, &FIRST_PLAYER_ID]).await?;
+async fn fill_player_bids(e: &mut Economy, store: &Store, world: &crate::world::World, bots: &[Bot]) -> Result<(), StoreError> {
+    let mut goods: Vec<i32> = e.goods.keys().copied().collect();
+    goods.sort_unstable();
+    // (order, buyer, station, type, price, remaining, escrow, region, system, range)
+    let rows: Vec<(i32, i32, i32, i32, f64, i64, f64, i32, i32, i32)> = store.read(|db| {
+        let (orders, bot_rows) = (db.table("market_orders"), db.table("bots"));
+        goods
+            .iter()
+            .flat_map(|t| orders.find(&["typeID"], &[Value::Int(i64::from(*t))]))
+            .filter(|o| o.int("bid") == Some(1) && o.int("orderState") == Some(0) && o.int("volRemaining").is_some_and(|v| v > 0) && o.int("isCorp") == Some(0))
+            .filter(|o| o.int("charID").is_some_and(|c| c >= i64::from(FIRST_PLAYER_ID) && bot_rows.get_id(c).is_none()))
+            .map(|o| {
+                let int = |c: &str| o.int(c).unwrap_or(0) as i32;
+                (int("orderID"), int("charID"), int("stationID"), int("typeID"), o.float("price").unwrap_or(0.0), o.int("volRemaining").unwrap_or(0), o.float("escrow").unwrap_or(0.0), int("regionID"), int("solarSystemID"), int("range"))
+            })
+            .collect()
+    });
     if rows.is_empty() {
         return Ok(());
     }
     // (order, buyer, station, type, price, units, remaining, escrow, seller)
     let mut fills: Vec<(i32, i32, i32, i32, f64, i64, i64, f64, i32)> = Vec::new();
-    for r in &rows {
-        let (id, buyer, station, t) = (int(r, 0).unwrap_or(0) as i32, int(r, 1).unwrap_or(0) as i32, int(r, 2).unwrap_or(0) as i32, int(r, 3).unwrap_or(0) as i32);
-        let (price, remaining, escrow) = (float(r, 4).unwrap_or(0.0), int(r, 5).unwrap_or(0), float(r, 6).unwrap_or(0.0));
-        let (region, system, range) = (int(r, 7).unwrap_or(0) as i32, int(r, 8).unwrap_or(0) as i32, int(r, 9).unwrap_or(-1) as i32);
+    for (id, buyer, station, t, price, remaining, escrow, region, system, range) in rows {
         // A hub in the order's reach whose stock and price will do.
         let hub = e.hubs.iter().copied().find(|h| {
             let hs = e.station_system.get(h).copied().unwrap_or(0);
@@ -936,32 +1005,46 @@ async fn fill_player_bids(e: &mut Economy, db: &Client, db_url: &str, world: &cr
     for (id, buyer, station, t, price, n, remaining, escrow, seller) in fills {
         let amount = price * n as f64;
         let left = remaining - n;
-        let mut client = crate::db::connect(db_url).await?;
-        let mut txn = crate::items::ItemTxn::begin(&mut client).await?;
-        let stack = crate::items::NewItem { type_id: t as i64, owner_id: buyer as i64, location_id: station as i64, flag: FLAG_HANGAR as i64, quantity: n, singleton: false };
-        txn.stack_onto(stack).await?;
-        txn.tx()
-            .execute(
-                r#"UPDATE market_orders SET "volRemaining" = $2, "orderState" = $3, "escrow" = $4 WHERE "orderID" = $1"#,
-                &[&id, &(left as i32), &(if left == 0 { ORDER_DONE } else { ORDER_OPEN }), &(escrow - amount).max(0.0)],
-            )
-            .await?;
-        let entry = crate::svc::wallet::Entry { ref_type: REF_MARKET_TRANSACTION, payer: buyer as i64, payee: seller as i64, arg_id1: "", reason: "" };
-        let paid = crate::svc::wallet::post(txn.tx(), seller as i64, amount, &entry).await;
-        if let Err(crate::svc::wallet::Transfer::Db(err)) = paid {
-            return Err(err);
-        }
         let region = e.station_system.get(&station).and_then(|s| e.region_of_system.get(s)).copied().unwrap_or(0);
-        let now = crate::bulkdata::filetime_now();
-        txn.tx()
-            .execute(
-                r#"INSERT INTO market_transactions ("transactionDateTime","typeID","quantity","price","transactionType","clientID",
-                                                    "regionID","stationID","characterID","isCorp","accountKey")
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,1000), ($1,$2,$3,$4,$10,$9,$7,$8,$6,0,1000)"#,
-                &[&now, &t, &(n as i32), &price, &TRANSACTION_PURCHASE, &seller, &region, &station, &buyer, &TRANSACTION_SALE],
-            )
-            .await?;
-        let events = txn.commit().await?;
+        let events = store.write(|tx| -> Result<Vec<eve_marshal::Value>, StoreError> {
+            let mut items = crate::items::ItemTxn::new(tx);
+            let stack = crate::items::NewItem { type_id: t as i64, owner_id: buyer as i64, location_id: station as i64, flag: FLAG_HANGAR as i64, quantity: n, singleton: false };
+            items.stack_onto(stack)?;
+            if let Some(row) = items.db().table("market_orders").get_id(i64::from(id)).map(|r| r.id) {
+                let state = if left == 0 { ORDER_DONE } else { ORDER_OPEN };
+                items.tx().update(
+                    "market_orders",
+                    row,
+                    &[("volRemaining", Value::Int(left)), ("orderState", Value::Int(i64::from(state))), ("escrow", Value::Float((escrow - amount).max(0.0)))],
+                )?;
+            }
+            let entry = crate::svc::wallet::Entry { ref_type: REF_MARKET_TRANSACTION, payer: buyer as i64, payee: seller as i64, arg_id1: "", reason: "" };
+            let paid = crate::svc::wallet::post(items.tx(), seller as i64, amount, &entry);
+            if let Err(crate::svc::wallet::Transfer::Db(err)) = paid {
+                return Err(err);
+            }
+            let now = crate::bulkdata::filetime_now();
+            // The buyer's purchase and the bot's sale.
+            for (kind, client, character) in [(TRANSACTION_PURCHASE, seller, buyer), (TRANSACTION_SALE, buyer, seller)] {
+                items.tx().insert(
+                    "market_transactions",
+                    &[
+                        ("transactionDateTime", Value::Int(now)),
+                        ("typeID", Value::Int(i64::from(t))),
+                        ("quantity", Value::Int(n)),
+                        ("price", Value::Float(price)),
+                        ("transactionType", Value::Int(i64::from(kind))),
+                        ("clientID", Value::Int(i64::from(client))),
+                        ("regionID", Value::Int(i64::from(region))),
+                        ("stationID", Value::Int(i64::from(station))),
+                        ("characterID", Value::Int(i64::from(character))),
+                        ("isCorp", Value::Int(0)),
+                        ("accountKey", Value::Int(1000)),
+                    ],
+                )?;
+            }
+            Ok(items.events())
+        })?;
         e.stats.player_orders_filled += 1;
         e.stats.sold_to_players += amount;
         let w = world.lock();
@@ -976,37 +1059,44 @@ async fn fill_player_bids(e: &mut Economy, db: &Client, db_url: &str, world: &cr
 
 /// The bots' trade among themselves, one line a hub and good, into the
 /// market's transactions (the price history players see).
-async fn history(e: &mut Economy, db: &Client, bots: &[Bot], now: i64) -> Result<(), tokio_postgres::Error> {
+async fn history(e: &mut Economy, store: &Store, bots: &[Bot], now: i64) -> Result<(), StoreError> {
     if e.trades.is_empty() {
         return Ok(());
     }
     let trades: Vec<((i32, i32), (i64, f64))> = e.trades.drain().collect();
-    let mut cols: (Vec<i32>, Vec<i32>, Vec<f64>, Vec<i32>, Vec<i32>, Vec<i32>) = Default::default();
+    let mut lines: Vec<(i32, i64, f64, i32, i32, i32)> = Vec::new();
     for ((station, t), (n, value)) in trades {
         let Some(&trader) = e.traders.get(&station) else { continue };
-        cols.0.push(t);
-        cols.1.push(n.min(i32::MAX as i64) as i32);
-        cols.2.push(value / n.max(1) as f64);
-        cols.3.push(e.station_system.get(&station).and_then(|s| e.region_of_system.get(s)).copied().unwrap_or(0));
-        cols.4.push(station);
-        cols.5.push(bots[trader as usize].id);
+        let region = e.station_system.get(&station).and_then(|s| e.region_of_system.get(s)).copied().unwrap_or(0);
+        lines.push((t, n.min(i32::MAX as i64), value / n.max(1) as f64, region, station, bots[trader as usize].id));
     }
-    db.execute(
-        r#"INSERT INTO market_transactions ("transactionDateTime","typeID","quantity","price","transactionType","clientID",
-                                            "regionID","stationID","characterID","isCorp","accountKey")
-           SELECT $7::bigint, u.t, u.n, u.price, $8::int, 0, u.region, u.station, u.who, 0, 1000
-             FROM unnest($1::int[], $2::int[], $3::float8[], $4::int[], $5::int[], $6::int[]) AS u(t, n, price, region, station, who)"#,
-        &[&cols.0, &cols.1, &cols.2, &cols.3, &cols.4, &cols.5, &now, &TRANSACTION_SALE],
-    )
-    .await?;
-    Ok(())
+    store.write(|tx| -> Result<(), StoreError> {
+        for (t, n, price, region, station, who) in &lines {
+            tx.insert(
+                "market_transactions",
+                &[
+                    ("transactionDateTime", Value::Int(now)),
+                    ("typeID", Value::Int(i64::from(*t))),
+                    ("quantity", Value::Int(*n)),
+                    ("price", Value::Float(*price)),
+                    ("transactionType", Value::Int(i64::from(TRANSACTION_SALE))),
+                    ("clientID", Value::Int(0)),
+                    ("regionID", Value::Int(i64::from(*region))),
+                    ("stationID", Value::Int(i64::from(*station))),
+                    ("characterID", Value::Int(i64::from(*who))),
+                    ("isCorp", Value::Int(0)),
+                    ("accountKey", Value::Int(1000)),
+                ],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// Player corporations' tax rates, for the bots that have joined them.
-pub async fn read_tax_rates(e: &mut Economy, db: &Client, corps: &[i32]) -> Result<(), tokio_postgres::Error> {
-    let rows = db.query(r#"SELECT "corporationID", COALESCE("taxRate", 0)::float8 FROM "corporation" WHERE "corporationID" = ANY($1)"#, &[&corps]).await?;
-    e.tax_rates = rows.iter().map(|r| (int(r, 0).unwrap_or(0) as i32, float(r, 1).unwrap_or(0.0))).collect();
-    Ok(())
+pub fn read_tax_rates(e: &mut Economy, db: &Db, corps: &[i32]) {
+    let table = db.table("corporation");
+    e.tax_rates = corps.iter().filter_map(|c| table.get_id(i64::from(*c)).map(|r| (*c, r.float("taxRate").unwrap_or(0.0)))).collect();
 }
 
 #[cfg(test)]

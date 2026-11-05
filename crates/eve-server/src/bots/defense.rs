@@ -7,14 +7,13 @@
 
 use std::time::{Duration, Instant};
 
-use tokio_postgres::Client;
-
 use super::battle::{self, Report};
 use super::behaviour::{self, Atlas, Bot};
 use super::politics::Politics;
 use super::presence::{Identity, Presence, Rally};
 use crate::ballpark::Vec3;
 use crate::combat::Rng;
+use crate::store::Store;
 use crate::world::World;
 
 /// How long the owners take to answer.
@@ -68,7 +67,7 @@ pub struct Defense {
 pub async fn run(
     defenses: &mut Vec<Defense>,
     world: &World,
-    db: &Client,
+    store: &Store,
     atlas: &Atlas,
     bots: &mut [Bot],
     ids: &[Identity],
@@ -126,10 +125,10 @@ pub async fn run(
         let dir = if dir.len() > 1e-6 { dir.unit() } else { Vec3::new(1.0, 0.0, 0.0) };
         let rally = Rally { anchor: tower, point: at + dir * (field + OUT), orbit: field + OUT, target: Some(attacker) };
         let who = match owners {
-            Owners::Alliance(a) => super::sov::alliance_name(db, a).await,
+            Owners::Alliance(a) => store.read(|db| super::sov::alliance_name(db, a)),
             Owners::Corporation(c) => format!("corporation {c}"),
         };
-        let place = super::sov::system_name(db, system).await;
+        let place = store.read(|db| super::sov::system_name(db, system));
         tracing::info!("bots: {who}'s tower in {place} is under attack; a fleet answers in {}s", RESPONSE.as_secs());
         report.news.push((crate::bulkdata::filetime_now(), format!("{who}'s tower in {place} is under attack: a fleet is on its way")));
         let pilots: u32 = match owners {

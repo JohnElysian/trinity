@@ -1,7 +1,7 @@
 # Trinity (4.10 build 45017) server settings. Restart the server after changing this file.
 # Anything left out takes its default. An RMR_* environment variable, where
 # one is named, overrides the setting. In Docker, docker-compose.yml sets
-# the database, and the container sets bind and web.
+# the data folder, and the container sets bind and web.
 
 server:
   # Where the game client connects (RMR_BIND).
@@ -9,8 +9,12 @@ server:
   # The web dashboard; empty turns it off (RMR_WEB). It has no login, so
   # keep it off the open internet.
   web: 0.0.0.0:8080
-  # The PostgreSQL database (RMR_DATABASE).
-  database: postgres://trinity:trinity@127.0.0.1:5432/trinity
+  # Where the live data is kept: snapshots and the write-ahead log
+  # (RMR_DATA). An empty folder starts a fresh world.
+  data: data
+  # A pg_dump of an older PostgreSQL database to start from instead,
+  # when the data folder is empty (RMR_IMPORT).
+  # import: trinity.sql
   # This node's machoNet ID (RMR_NODE_ID); leave it at 1.
   nodeId: 1
   # Logging in with an unknown username makes that account, with the

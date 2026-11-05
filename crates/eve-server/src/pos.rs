@@ -21,13 +21,12 @@
 use std::sync::OnceLock;
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 
 use crate::ballpark::{Park, Vec3};
 use crate::combat::{attr, Charged, Vitals};
 use crate::destiny::{flags, mode, Ball};
 use crate::heartbeat::{Job, Out};
-use crate::svc::rows::{float, int, text};
+use crate::store::{self, Db, StoreError};
 use crate::svc::space::{self, entry};
 
 /// playerOwned.py STRUCTURE_*.
@@ -299,90 +298,85 @@ pub fn add_entry(tick: i64, s: &Structure) -> Value {
 }
 
 /// The structures in a system, for a new park.
-pub async fn load(db: &impl GenericClient, solar_system_id: i64) -> Result<Vec<Structure>, tokio_postgres::Error> {
-    let rows = db
-        .query(
-            r#"SELECT e."itemID", e."typeID", t."groupID",
-                      COALESCE(NULLIF(e."itemName", ''), t."typeName", ''), e."ownerID",
-                      COALESCE(co."corporationID", ch."corporationID", e."ownerID"),
-                      NULLIF(COALESCE(co."allianceID", cc."allianceID"), 0),
-                      e."x", e."y", e."z", COALESCE(t."radius", 100),
-                      COALESCE(p."state", 0), p."stateTimestamp", p."controlTowerID",
-                      p."shieldCharge", COALESCE(p."armorDamage", 0), COALESCE(p."hullDamage", 0),
-                      COALESCE(p."password", ''), COALESCE(p."allowCorp", 1), COALESCE(p."allowAlliance", 0),
-                      p."sentryStanding", p."sentryStatus", COALESCE(p."sentryStandingDrop", 0),
-                      COALESCE(p."sentryStatusDrop", 0), COALESCE(p."sentryAggression", 0), COALESCE(p."sentryWar", 1),
-                      remote."itemID", remote."locationID", remote."typeID"
-                 FROM entity e
-                 JOIN "invTypes" t ON t."typeID" = e."typeID"
-                 JOIN "invGroups" g ON g."groupID" = t."groupID"
-                 LEFT JOIN "posStructures" p ON p."itemID" = e."itemID"
-                 LEFT JOIN "jumpBridgeLinks" bridge ON bridge."sourceID" = e."itemID"
-                 LEFT JOIN entity remote ON remote."itemID" = bridge."destinationID"
-                 LEFT JOIN "corporation" co ON co."corporationID" = e."ownerID"
-                 LEFT JOIN "character_" ch ON ch."characterID" = e."ownerID"
-                 LEFT JOIN "corporation" cc ON cc."corporationID" = ch."corporationID"
-                WHERE e."locationID" = $1 AND g."categoryID" = $2"#,
-            &[&(solar_system_id as i32), &CATEGORY_STRUCTURE],
-        )
-        .await?;
-    let types: Vec<i32> = rows.iter().filter_map(|r| int(r, 1)).map(|t| t as i32).collect();
-    let delays = delays(db, &types).await?;
-    let health = health(db, &types).await?;
+pub fn load(db: &Db, solar_system_id: i64) -> Result<Vec<Structure>, StoreError> {
+    let sde = crate::sde::get();
+    let structure_types = sde.types_in_category(CATEGORY_STRUCTURE as i64);
+    let corporations = db.table("corporation");
+    let characters = db.table("character_");
+    let entities = db.table("entity");
+    let rows: Vec<store::Row> = entities
+        .find(&["locationID"], &[store::Value::Int(solar_system_id)])
+        .filter(|e| e.int("typeID").is_some_and(|t| structure_types.binary_search(&(t as i32)).is_ok()))
+        .collect();
+    let types: Vec<i32> = rows.iter().filter_map(|r| r.int("typeID")).map(|t| t as i32).collect();
+    let delays = delays(&types);
+    let health = health(&types);
     let now = crate::combat::now_ms();
     let mut structures: Vec<Structure> = rows
         .iter()
-        .map(|r| {
-            let type_id = int(r, 1).unwrap_or(0);
+        .map(|e| {
+            let type_id = e.int("typeID").unwrap_or(0);
+            let known = sde.type_(type_id);
+            let group_id = known.map_or(0, |t| t.group_id as i64);
+            let owner_id = e.int("ownerID").unwrap_or(0);
+            let p = db.table("posStructures").get_id(e.int("itemID").unwrap_or(0));
+            // The owner is a corporation, or a pilot whose corporation counts.
+            let co = corporations.get_id(owner_id);
+            let ch = characters.get_id(owner_id);
+            let cc = ch.and_then(|c| c.int("corporationID")).and_then(|c| corporations.get_id(c));
+            let remote = db
+                .table("jumpBridgeLinks")
+                .get_id(e.int("itemID").unwrap_or(0))
+                .and_then(|b| b.int("destinationID"))
+                .and_then(|d| entities.get_id(d));
+            let flag = |c: &str, default: i64| p.and_then(|p| p.int(c)).unwrap_or(default) == 1;
             Structure {
-                id: int(r, 0).unwrap_or(0),
+                id: e.int("itemID").unwrap_or(0),
                 type_id,
-                group_id: int(r, 2).unwrap_or(0),
-                name: text(r, 3).unwrap_or_default(),
-                owner_id: int(r, 4).unwrap_or(0),
-                corp_id: int(r, 5).unwrap_or(0),
-                alliance_id: int(r, 6),
-                pos: Vec3::new(float(r, 7).unwrap_or(0.0), float(r, 8).unwrap_or(0.0), float(r, 9).unwrap_or(0.0)),
-                radius: float(r, 10).unwrap_or(100.0),
-                state: int(r, 11).unwrap_or(0) as i16,
-                stamp: int(r, 12),
-                tower: int(r, 13),
+                group_id,
+                name: e.text("itemName").filter(|n| !n.is_empty()).map(str::to_string).or_else(|| known.map(|t| t.name.to_string())).unwrap_or_default(),
+                owner_id,
+                corp_id: co.and_then(|c| c.int("corporationID")).or_else(|| ch.and_then(|c| c.int("corporationID"))).unwrap_or(owner_id),
+                alliance_id: co.and_then(|c| c.int("allianceID")).or_else(|| cc.and_then(|c| c.int("allianceID"))).filter(|a| *a != 0),
+                pos: Vec3::new(e.float("x").unwrap_or(0.0), e.float("y").unwrap_or(0.0), e.float("z").unwrap_or(0.0)),
+                radius: sde.table("invTypes").get("typeID", type_id).and_then(|t| t.float("radius")).unwrap_or(100.0),
+                state: p.and_then(|p| p.int("state")).unwrap_or(0) as i16,
+                stamp: p.and_then(|p| p.int("stateTimestamp")),
+                tower: p.and_then(|p| p.int("controlTowerID")),
                 delays: delays.get(&type_id).copied().unwrap_or_default(),
                 vitals: {
                     let mut v = vitals(health.get(&type_id), now);
-                    if let Some(charge) = float(r, 14) {
+                    if let Some(charge) = p.and_then(|p| p.float("shieldCharge")) {
                         v.shield.set(now, charge);
                     }
-                    v.armor_damage = float(r, 15).unwrap_or(0.0);
-                    v.hull_damage = float(r, 16).unwrap_or(0.0);
+                    v.armor_damage = p.and_then(|p| p.float("armorDamage")).unwrap_or(0.0);
+                    v.hull_damage = p.and_then(|p| p.float("hullDamage")).unwrap_or(0.0);
                     v
                 },
                 signature: health.get(&type_id).and_then(|a| a.get(&attr::SIGNATURE_RADIUS)).copied().unwrap_or(0.0),
                 last_attacker: None,
                 reinforce_asked: false,
                 field_radius: health.get(&type_id).and_then(|a| a.get(&ATTR_SHIELD_RADIUS)).copied().unwrap_or(0.0),
-                harmonic: harmonic(&text(r, 17).unwrap_or_default()),
-                allow_corp: int(r, 18) == Some(1),
-                allow_alliance: int(r, 19) == Some(1),
+                harmonic: harmonic(p.and_then(|p| p.text("password")).unwrap_or_default()),
+                allow_corp: flag("allowCorp", 1),
+                allow_alliance: flag("allowAlliance", 0),
                 field: None,
                 sentry: crate::guard::Sentry {
-                    standing: float(r, 20),
-                    status: float(r, 21),
-                    standing_drop: int(r, 22) == Some(1),
-                    status_drop: int(r, 23) == Some(1),
-                    aggression: int(r, 24) == Some(1),
-                    war: int(r, 25) == Some(1),
+                    standing: p.and_then(|p| p.float("sentryStanding")),
+                    status: p.and_then(|p| p.float("sentryStatus")),
+                    standing_drop: flag("sentryStandingDrop", 0),
+                    status_drop: flag("sentryStatusDrop", 0),
+                    aggression: flag("sentryAggression", 0),
+                    war: flag("sentryWar", 1),
                 },
-                guard: health.get(&type_id).and_then(|a| crate::guard::profile(int(r, 2).unwrap_or(0), a)),
-                bridge: match (int(r,26),int(r,27),int(r,28)) {
-                    (Some(id),Some(system),Some(type_id))=>Some((id,system,type_id)),_=>None,
-                },
+                guard: health.get(&type_id).and_then(|a| crate::guard::profile(group_id, a)),
+                bridge: remote.and_then(|r| Some((r.int("itemID")?, r.int("locationID")?, r.int("typeID")?))),
             }
         })
         .collect();
     let batteries: Vec<i64> = structures.iter().filter(|s| s.guard.is_some()).map(|s| s.id).collect();
     if !batteries.is_empty() {
-        let ammo = crate::guard::ammo(db, &batteries).await?;
+        let ammo = crate::guard::ammo(db, &batteries)?;
         for s in &mut structures {
             if let Some(g) = s.guard.as_mut() {
                 g.ammo = ammo.get(&s.id).cloned();
@@ -393,52 +387,40 @@ pub async fn load(db: &impl GenericClient, solar_system_id: i64) -> Result<Vec<S
 }
 
 /// anchoringDelay, onliningDelay and unanchoringDelay of each type, in ticks.
-pub async fn delays(db: &impl GenericClient, types: &[i32]) -> Result<std::collections::HashMap<i64, [i64; 3]>, tokio_postgres::Error> {
-    let rows = db
-        .query(
-            r#"SELECT "typeID", "attributeID", COALESCE("valueFloat", "valueInt"::float8)
-                 FROM "dgmTypeAttributes"
-                WHERE "typeID" = ANY($1) AND "attributeID" = ANY($2)"#,
-            &[&types, &vec![ATTR_ANCHORING_DELAY, ATTR_ONLINING_DELAY, ATTR_UNANCHORING_DELAY]],
-        )
-        .await?;
+pub fn delays(types: &[i32]) -> std::collections::HashMap<i64, [i64; 3]> {
+    let sde = crate::sde::get();
     let mut out: std::collections::HashMap<i64, [i64; 3]> = types.iter().map(|t| (i64::from(*t), [0; 3])).collect();
-    for r in rows {
-        let slot = match int(&r, 1).unwrap_or(0) as i32 {
-            ATTR_ANCHORING_DELAY => 0,
-            ATTR_ONLINING_DELAY => 1,
-            _ => 2,
-        };
-        let ms = float(&r, 2).unwrap_or(0.0) as i64;
-        out.entry(int(&r, 0).unwrap_or(0)).or_default()[slot] = ms * TICKS_PER_MS;
+    for t in types {
+        for &(a, v) in sde.type_attributes(i64::from(*t)) {
+            let slot = match a {
+                ATTR_ANCHORING_DELAY => 0,
+                ATTR_ONLINING_DELAY => 1,
+                ATTR_UNANCHORING_DELAY => 2,
+                _ => continue,
+            };
+            out.entry(i64::from(*t)).or_default()[slot] = (v as i64) * TICKS_PER_MS;
+        }
     }
-    Ok(out)
+    out
 }
 
 /// The attributes a structure fights with, by type.
-pub async fn health(
-    db: &impl GenericClient,
-    types: &[i32],
-) -> Result<std::collections::HashMap<i64, std::collections::HashMap<i32, f64>>, tokio_postgres::Error> {
+pub fn health(types: &[i32]) -> std::collections::HashMap<i64, std::collections::HashMap<i32, f64>> {
     let mut wanted = vec![attr::HP, attr::SHIELD_CAPACITY, attr::ARMOR_HP, attr::SHIELD_RECHARGE_RATE, attr::SIGNATURE_RADIUS, ATTR_SHIELD_RADIUS];
     wanted.extend(crate::guard::profile_attributes());
     wanted.extend(attr::SHIELD_RESONANCE);
     wanted.extend(attr::ARMOR_RESONANCE);
     wanted.extend(attr::HULL_RESONANCE);
-    let rows = db
-        .query(
-            r#"SELECT "typeID", "attributeID", COALESCE("valueFloat", "valueInt"::float8)
-                 FROM "dgmTypeAttributes" WHERE "typeID" = ANY($1) AND "attributeID" = ANY($2)"#,
-            &[&types, &wanted],
-        )
-        .await?;
+    let sde = crate::sde::get();
     let mut out: std::collections::HashMap<i64, std::collections::HashMap<i32, f64>> = std::collections::HashMap::new();
-    for r in rows {
-        if let (Some(t), Some(a), Some(v)) = (int(&r, 0), int(&r, 1), float(&r, 2)) {
-            out.entry(t).or_default().insert(a as i32, v);
+    for t in types {
+        for &(a, v) in sde.type_attributes(i64::from(*t)) {
+            if wanted.contains(&a) {
+                out.entry(i64::from(*t)).or_default().insert(a, v);
+            }
         }
     }
-    Ok(out)
+    out
 }
 
 /// Full health from a type's attributes; resonances default to none.

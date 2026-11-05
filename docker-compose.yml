@@ -1,40 +1,16 @@
 name: trinity
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: trinity-postgres
-    environment:
-      POSTGRES_USER: trinity
-      POSTGRES_PASSWORD: trinity
-      POSTGRES_DB: trinity
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      # Over TCP: during the first-start import postgres only listens on its socket.
-      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "trinity", "-d", "trinity"]
-      interval: 3s
-      timeout: 3s
-      retries: 10
-      start_period: 5m
-
   server:
     build: .
     image: trinity-server
     container_name: trinity-server
-    depends_on:
-      postgres:
-        condition: service_healthy
     # Settings, accounts and bots are in trinity.yml; restart the server after
-    # editing it. The database address here wins over the file's, since the
-    # server reaches postgres by its service name.
+    # editing it. The data folder here wins over the file's, so the game's
+    # data lives in the volume below.
     environment:
       RMR_CONFIG: /app/trinity.yml
-      RMR_DATABASE: postgres://trinity:trinity@postgres:5432/trinity
+      RMR_DATA: /app/data
       # A copy of the log on the host that outlives the container (it is
       # appended to), and the frames the server could not decode.
       RMR_LOG_FILE: /app/logs/server.log
@@ -42,12 +18,16 @@ services:
     volumes:
       - ./trinity.yml:/app/trinity.yml:ro
       - ./logs:/app/logs
+      # The live data: snapshots and the write-ahead log.
+      - data:/app/data
     ports:
       - "26000:26000"
       # The web dashboard: this machine only, since it has no login.
       - "127.0.0.1:8080:8080"
     init: true
+    # Time to save the data on the way down.
+    stop_grace_period: 1m
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  data:

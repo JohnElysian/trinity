@@ -23,7 +23,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use tokio_postgres::GenericClient;
 use tracing::{debug, error};
 
 use crate::ballpark::{Park, Pilot, Ship, Vec3};
@@ -32,7 +31,7 @@ use crate::heartbeat::{Job, Out};
 use crate::npc::combat_ref::Attacker;
 use crate::npc::Missile;
 use crate::pos::Structure;
-use crate::svc::rows::{float, int};
+use crate::store::{Db, Store, StoreError, Value};
 
 const GROUP_MISSILE_SENTRY: i64 = 417;
 const GROUP_PROJECTILE_SENTRY: i64 = 426;
@@ -169,50 +168,50 @@ pub fn profile_attributes() -> Vec<i32> {
 
 /// What each gun and missile battery has in its bay: the first charge, by
 /// item ID.
-pub async fn ammo(db: &impl GenericClient, batteries: &[i64]) -> Result<HashMap<i64, Ammo>, tokio_postgres::Error> {
-    let ids: Vec<i32> = batteries.iter().map(|i| *i as i32).collect();
-    let rows = db
-        .query(
-            r#"SELECT DISTINCT ON (e."locationID") e."locationID", e."itemID", e."typeID", e."quantity", t."groupID"
-                 FROM entity e
-                 JOIN "invTypes" t ON t."typeID" = e."typeID"
-                 JOIN "invGroups" g ON g."groupID" = t."groupID"
-                WHERE e."locationID" = ANY($1) AND g."categoryID" = $2 AND e."quantity" > 0
-                ORDER BY e."locationID", e."itemID""#,
-            &[&ids, &CATEGORY_CHARGE],
-        )
-        .await?;
-    let types: Vec<i32> = rows.iter().filter_map(|r| int(r, 2)).map(|t| t as i32).collect();
+pub fn ammo(db: &Db, batteries: &[i64]) -> Result<HashMap<i64, Ammo>, StoreError> {
+    let sde = crate::sde::get();
+    let charges = sde.types_in_category(CATEGORY_CHARGE as i64);
+    let entity = db.table("entity");
+    // Each battery's charge with the lowest item ID.
+    let mut rows: Vec<(i64, i64, Option<i64>, Option<i64>)> = Vec::new();
+    for battery in batteries {
+        if rows.iter().any(|r| r.0 == *battery) {
+            continue;
+        }
+        let first = entity
+            .find(&["locationID"], &[Value::Int(*battery)])
+            .filter(|e| e.int("typeID").is_some_and(|t| charges.contains(&(t as i32))) && e.int("quantity").is_some_and(|q| q > 0))
+            .filter_map(|e| Some((e.int("itemID")?, e.int("typeID"), e.int("quantity"))))
+            .min_by_key(|e| e.0);
+        if let Some((item, type_id, quantity)) = first {
+            rows.push((*battery, item, type_id, quantity));
+        }
+    }
     let mut wanted = attr::DAMAGE_TYPES.to_vec();
     wanted.extend([attr::EXPLOSION_DELAY, attr::MAX_VELOCITY, attr::AOE_CLOUD_SIZE, attr::AOE_VELOCITY]);
-    let attrs = db
-        .query(
-            r#"SELECT "typeID", "attributeID", COALESCE("valueFloat", "valueInt"::float8)
-                 FROM "dgmTypeAttributes" WHERE "typeID" = ANY($1) AND "attributeID" = ANY($2)"#,
-            &[&types, &wanted],
-        )
-        .await?;
     let mut by_type: HashMap<i64, HashMap<i32, f64>> = HashMap::new();
-    for r in attrs {
-        if let (Some(t), Some(a), Some(v)) = (int(&r, 0), int(&r, 1), float(&r, 2)) {
-            by_type.entry(t).or_default().insert(a as i32, v);
+    for t in rows.iter().filter_map(|r| r.2) {
+        for (a, v) in sde.type_attributes(t) {
+            if wanted.contains(a) {
+                by_type.entry(t).or_default().insert(*a, *v);
+            }
         }
     }
     Ok(rows
         .iter()
         .filter_map(|r| {
-            let type_id = int(r, 2)?;
+            let type_id = r.2?;
             let a = by_type.get(&type_id);
             let v = |id: i32| a.and_then(|a| a.get(&id)).copied().unwrap_or(0.0);
             let flight_ms = v(attr::EXPLOSION_DELAY) as i64;
             Some((
-                int(r, 0)?,
+                r.0,
                 Ammo {
-                    item_id: int(r, 1)?,
+                    item_id: r.1,
                     type_id,
-                    quantity: int(r, 3).unwrap_or(0),
+                    quantity: r.3.unwrap_or(0),
                     damage: attr::DAMAGE_TYPES.map(v),
-                    lasting: int(r, 4) == Some(GROUP_FREQUENCY_CRYSTAL),
+                    lasting: sde.type_(type_id).map(|t| t.group_id as i64) == Some(GROUP_FREQUENCY_CRYSTAL),
                     flight_ms,
                     range: v(attr::MAX_VELOCITY) * flight_ms as f64 / 1_000.0,
                     cloud: v(attr::AOE_CLOUD_SIZE),
@@ -225,7 +224,7 @@ pub async fn ammo(db: &impl GenericClient, batteries: &[i64]) -> Result<HashMap<
 
 /// Reloads what every loaded park's batteries have in their bays (pilots
 /// fill them through the ordinary item moves). Run by the heartbeat.
-pub async fn reload(world: &crate::world::World, db: &impl GenericClient) {
+pub fn reload(world: &crate::world::World, db: &Db) {
     let batteries: Vec<i64> = {
         let w = world.lock();
         w.parks
@@ -238,7 +237,7 @@ pub async fn reload(world: &crate::world::World, db: &impl GenericClient) {
     if batteries.is_empty() {
         return;
     }
-    let loaded = match ammo(db, &batteries).await {
+    let loaded = match ammo(db, &batteries) {
         Ok(a) => a,
         Err(e) => {
             error!("reading the batteries' ammunition: {}", crate::logging::chain(&e));
@@ -260,16 +259,14 @@ pub async fn reload(world: &crate::world::World, db: &impl GenericClient) {
 /// (from, to) -> standing, from ownerStandings; reloaded by the heartbeat.
 static STANDINGS: RwLock<Option<HashMap<(i64, i64), f64>>> = RwLock::new(None);
 
-pub async fn refresh_standings(db: &impl GenericClient) {
-    let sql = r#"SELECT "fromID", "toID", "standing" FROM "ownerStandings""#;
-    match db.query(sql, &[]).await {
-        Ok(rows) => {
-            let map = rows.iter().filter_map(|r| Some(((int(r, 0)?, int(r, 1)?), float(r, 2)?))).collect();
-            if let Ok(mut s) = STANDINGS.write() {
-                *s = Some(map);
-            }
-        }
-        Err(e) => error!("reading owner standings: {}", crate::logging::chain(&e)),
+pub fn refresh_standings(db: &Db) {
+    let map = db
+        .table("ownerStandings")
+        .rows()
+        .filter_map(|r| Some(((r.int("fromID")?, r.int("toID")?), r.float("standing")?)))
+        .collect();
+    if let Ok(mut s) = STANDINGS.write() {
+        *s = Some(map);
     }
 }
 
@@ -445,12 +442,15 @@ pub fn holding(park: &Park) -> Vec<(i64, Action)> {
 }
 
 /// A battery's round count, after a shot.
-pub async fn save_ammo(db: &impl GenericClient, item_id: i64, quantity: i64) {
-    let result = if quantity <= 0 {
-        db.execute(r#"DELETE FROM entity WHERE "itemID" = $1"#, &[&(item_id as i32)]).await
-    } else {
-        db.execute(r#"UPDATE entity SET "quantity" = $2 WHERE "itemID" = $1"#, &[&(item_id as i32), &(quantity as i32)]).await
-    };
+pub async fn save_ammo(store: &Store, item_id: i64, quantity: i64) {
+    let result = store.write(|tx| {
+        let Some(row) = tx.table("entity").get_id(item_id).map(|r| r.id) else { return Ok(()) };
+        if quantity <= 0 {
+            tx.delete("entity", row)
+        } else {
+            tx.update("entity", row, &[("quantity", Value::Int(quantity))])
+        }
+    });
     if let Err(e) = result {
         error!("saving the rounds of {item_id}: {}", crate::logging::chain(&e));
     }

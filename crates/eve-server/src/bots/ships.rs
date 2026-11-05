@@ -17,11 +17,9 @@
 
 use std::collections::HashMap;
 
-use tokio_postgres::Client;
-
 use super::behaviour::Role;
 use crate::combat::Rng;
-use crate::svc::rows::{float, int, text};
+use crate::sde::Row;
 
 const ATTR_LOW_SLOTS: i32 = 12;
 const ATTR_MED_SLOTS: i32 = 13;
@@ -132,42 +130,58 @@ pub fn weight_class(group: i32) -> u8 {
 }
 
 /// Every hull type the ladders draw on.
-pub async fn hull_types(db: &Client) -> Result<Vec<i32>, tokio_postgres::Error> {
-    let sql = r#"SELECT "typeID" FROM "invTypes" WHERE "groupID" = ANY($1) AND "marketGroupID" IS NOT NULL AND "raceID" IS NOT NULL ORDER BY 1"#;
-    Ok(db.query(sql, &[&HULL_GROUPS.to_vec()]).await?.iter().filter_map(|r| int(r, 0)).map(|t| t as i32).collect())
+pub fn hull_types() -> Vec<i32> {
+    hull_rows().iter().filter_map(|t| t.int("typeID")).map(|t| t as i32).collect()
+}
+
+/// A type's largest value of an attribute as an integer (`valueInt`, else
+/// `valueFloat` rounded as SQL's `::int` rounds), 0 without one.
+fn int_attribute(type_id: i64, attribute: i32) -> i64 {
+    crate::sde::table("dgmTypeAttributes")
+        .find("typeID", type_id)
+        .filter(|a| a.int("attributeID") == Some(attribute as i64))
+        .filter_map(|a| a.int("valueInt").or_else(|| a.float("valueFloat").map(|v| v.round_ties_even() as i64)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The marketable types of a race in the hull groups, by type ID.
+fn hull_rows() -> Vec<Row<'static>> {
+    types_of(&HULL_GROUPS, |t| t.int("marketGroupID").is_some() && t.int("raceID").is_some())
+}
+
+/// The invTypes rows of `groups` that `keep` lets through, by type ID.
+fn types_of(groups: &[i32], keep: impl Fn(&Row) -> bool) -> Vec<Row<'static>> {
+    let types = crate::sde::table("invTypes");
+    let mut rows: Vec<Row<'static>> = groups.iter().flat_map(|g| types.find("groupID", *g as i64)).filter(|t| keep(t)).collect();
+    rows.sort_by_key(|t| t.int("typeID"));
+    rows
 }
 
 impl Shipyard {
     /// Every hull of the ladders, with its market price (from `prices`, the
     /// NPC asks), hold and slots; and the modules fittings draw on.
-    pub async fn load(db: &Client, prices: &HashMap<i32, f64>) -> Result<Shipyard, tokio_postgres::Error> {
-        let sql = r#"SELECT t."typeID", t."groupID", t."raceID",
-                            COALESCE(MAX(COALESCE(a."valueFloat", a."valueInt")) FILTER (WHERE a."attributeID" = $2), 0)::float8,
-                            COALESCE(MAX(COALESCE(a."valueFloat", a."valueInt")) FILTER (WHERE a."attributeID" = $3), 0)::float8,
-                            COALESCE(MAX(COALESCE(a."valueFloat", a."valueInt")) FILTER (WHERE a."attributeID" = $4), 0)::float8,
-                            COALESCE(MAX(COALESCE(a."valueFloat", a."valueInt")) FILTER (WHERE a."attributeID" = $5), 0)::float8,
-                            COALESCE(MAX(COALESCE(a."valueFloat", a."valueInt")) FILTER (WHERE a."attributeID" = $6), 0)::float8,
-                            COALESCE(t."capacity", 0)::float8
-                       FROM "invTypes" t
-                       LEFT JOIN "dgmTypeAttributes" a ON a."typeID" = t."typeID"
-                      WHERE t."groupID" = ANY($1) AND t."marketGroupID" IS NOT NULL AND t."raceID" IS NOT NULL
-                      GROUP BY t."typeID" ORDER BY t."typeID""#;
+    pub fn load(prices: &HashMap<i32, f64>) -> Shipyard {
+        let sde = crate::sde::get();
         let mut hulls = HashMap::new();
         let mut by_group_race: HashMap<(i32, i64), Vec<i32>> = HashMap::new();
-        let groups = HULL_GROUPS.to_vec();
-        for r in db.query(sql, &[&groups, &ATTR_CAPACITY, &ATTR_HI_SLOTS, &ATTR_MED_SLOTS, &ATTR_LOW_SLOTS, &ATTR_TURRET_SLOTS]).await? {
-            let type_id = int(&r, 0).unwrap_or(0) as i32;
+        for t in hull_rows() {
+            let type_id = t.int("typeID").unwrap_or(0) as i32;
             let Some(&price) = prices.get(&type_id) else { continue };
-            let capacity = float(&r, 3).filter(|c| *c > 0.0).or_else(|| float(&r, 8)).unwrap_or(0.0);
-            let slot = |i: usize| float(&r, i).unwrap_or(0.0).clamp(0.0, 8.0) as u8;
+            // The type's largest value of an attribute, 0 without one.
+            let attribute = |id: i32| {
+                sde.type_attributes(type_id as i64).iter().filter(|(a, _)| *a == id).map(|(_, v)| *v).reduce(f64::max).unwrap_or(0.0)
+            };
+            let capacity = Some(attribute(ATTR_CAPACITY)).filter(|c| *c > 0.0).unwrap_or_else(|| t.float("capacity").unwrap_or(0.0));
+            let slot = |id: i32| attribute(id).clamp(0.0, 8.0) as u8;
             let hull = Hull {
                 type_id,
-                group: int(&r, 1).unwrap_or(0) as i32,
-                race: int(&r, 2).unwrap_or(0),
+                group: t.int("groupID").unwrap_or(0) as i32,
+                race: t.int("raceID").unwrap_or(0),
                 price,
                 capacity,
-                slots: (slot(4), slot(5), slot(6)),
-                turrets: slot(7),
+                slots: (slot(ATTR_HI_SLOTS), slot(ATTR_MED_SLOTS), slot(ATTR_LOW_SLOTS)),
+                turrets: slot(ATTR_TURRET_SLOTS),
             };
             by_group_race.entry((hull.group, hull.race)).or_default().push(type_id);
             hulls.insert(type_id, hull);
@@ -175,27 +189,21 @@ impl Shipyard {
         for list in by_group_race.values_mut() {
             list.sort_by(|a, b| hulls[a].price.total_cmp(&hulls[b].price).then(a.cmp(b)));
         }
-        let sql = r#"SELECT t."typeID", t."groupID", t."typeName",
-                            COALESCE(MAX(COALESCE(a."valueInt", a."valueFloat"::int)) FILTER (WHERE a."attributeID" = $2), 0),
-                            COALESCE(MAX(COALESCE(a."valueInt", a."valueFloat"::int)) FILTER (WHERE a."attributeID" = $3), 0)
-                       FROM "invTypes" t
-                       LEFT JOIN "dgmTypeAttributes" a ON a."typeID" = t."typeID"
-                      WHERE t."groupID" = ANY($1) AND t."marketGroupID" IS NOT NULL AND t."published" = 1
-                      GROUP BY t."typeID" ORDER BY t."typeID""#;
         let groups = MODULE_GROUPS.iter().copied().chain([MAGNETIC_STABILIZER]).collect::<Vec<i32>>();
-        let modules = db
-            .query(sql, &[&groups, &ATTR_CHARGE_SIZE, &ATTR_META_LEVEL])
-            .await?
+        let modules = types_of(&groups, |t| t.int("marketGroupID").is_some() && t.int("published") == Some(1))
             .iter()
-            .map(|r| Module {
-                type_id: int(r, 0).unwrap_or(0) as i32,
-                group: int(r, 1).unwrap_or(0) as i32,
-                name: text(r, 2).unwrap_or_default(),
-                size: int(r, 3).unwrap_or(0) as i32,
-                meta: int(r, 4).unwrap_or(0) as i32,
+            .map(|t| {
+                let type_id = t.int("typeID").unwrap_or(0);
+                Module {
+                    type_id: type_id as i32,
+                    group: t.int("groupID").unwrap_or(0) as i32,
+                    name: t.text("typeName").unwrap_or_default().to_string(),
+                    size: int_attribute(type_id, ATTR_CHARGE_SIZE) as i32,
+                    meta: int_attribute(type_id, ATTR_META_LEVEL) as i32,
+                }
             })
             .collect();
-        Ok(Shipyard { hulls, by_group_race, modules })
+        Shipyard { hulls, by_group_race, modules }
     }
 
     /// The hull of a role's tier for a race, chosen by `seed` among those of

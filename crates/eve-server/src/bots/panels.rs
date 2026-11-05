@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value as Json};
-use tokio_postgres::Client;
 
 use super::behaviour::{Atlas, Bot};
 use super::control::Following;
@@ -14,7 +13,7 @@ use super::events::Events;
 use super::hire::Hires;
 use super::presence::Identity;
 use super::relations::{Relations, BLUE, BOUNTY, CONTRACT, HOSTILE, WAR};
-use crate::svc::rows::{int, text};
+use crate::store::Db;
 
 /// FILETIME of 1970-01-01, in milliseconds since 1601.
 const UNIX_EPOCH_MS: i64 = 11_644_473_600_000;
@@ -29,15 +28,12 @@ pub struct Names {
     pub stations: HashMap<i32, String>,
 }
 
-pub async fn names(db: &Client) -> Names {
-    let mut n = Names { systems: HashMap::new(), stations: HashMap::new() };
-    if let Ok(rows) = db.query(r#"SELECT "solarSystemID", "solarSystemName" FROM "mapSolarSystems""#, &[]).await {
-        n.systems = rows.iter().map(|r| (int(r, 0).unwrap_or(0) as i32, text(r, 1).unwrap_or_default())).collect();
+pub fn names(db: &Db) -> Names {
+    let name = |r: &crate::store::Row, id: &str, name: &str| (r.int(id).unwrap_or(0) as i32, r.text(name).unwrap_or_default().to_string());
+    Names {
+        systems: db.table("mapSolarSystems").rows().map(|r| name(&r, "solarSystemID", "solarSystemName")).collect(),
+        stations: db.table("staStations").rows().map(|r| name(&r, "stationID", "stationName")).collect(),
     }
-    if let Ok(rows) = db.query(r#"SELECT "stationID", "stationName" FROM "staStations""#, &[]).await {
-        n.stations = rows.iter().map(|r| (int(r, 0).unwrap_or(0) as i32, text(r, 1).unwrap_or_default())).collect();
-    }
-    n
 }
 
 impl Names {
@@ -51,14 +47,18 @@ impl Names {
 }
 
 /// Owner names (characters, corporations, alliances) for the IDs given.
-async fn owners(db: &Client, ids: &[i32]) -> HashMap<i32, String> {
-    let sql = r#"SELECT "characterID", "characterName" FROM "character_" WHERE "characterID" = ANY($1)
-                 UNION ALL SELECT "corporationID", "corporationName" FROM "corporation" WHERE "corporationID" = ANY($1)
-                 UNION ALL SELECT "allianceID", "allianceName" FROM alliances WHERE "allianceID" = ANY($1)"#;
-    match db.query(sql, &[&ids]).await {
-        Ok(rows) => rows.iter().map(|r| (int(r, 0).unwrap_or(0) as i32, text(r, 1).unwrap_or_default())).collect(),
-        Err(_) => HashMap::new(),
+fn owners(db: &Db, ids: &[i32]) -> HashMap<i32, String> {
+    let mut out = HashMap::new();
+    // Characters, then corporations, then alliances: the last found wins.
+    for (table, name) in [("character_", "characterName"), ("corporation", "corporationName"), ("alliances", "allianceName")] {
+        let table = db.table(table);
+        for id in ids {
+            if let Some(r) = table.get_id(i64::from(*id)) {
+                out.insert(*id, r.text(name).unwrap_or_default().to_string());
+            }
+        }
     }
+    out
 }
 
 pub fn market(e: &Economy, names: &Names) -> Json {
@@ -100,13 +100,13 @@ pub fn market(e: &Economy, names: &Names) -> Json {
     })
 }
 
-pub async fn relations(db: &Client, r: &Relations, hires: &Hires, bots: &[Bot], ids: &[Identity]) -> Json {
+pub fn relations(db: &Db, r: &Relations, hires: &Hires, bots: &[Bot], ids: &[Identity]) -> Json {
     let list = r.standings();
     let mut wanted: Vec<i32> = list.iter().flat_map(|(s, p, ..)| [*s, *p]).collect();
     wanted.extend(hires.by_bot.values().map(|h| h.player as i32));
     wanted.sort_unstable();
     wanted.dedup();
-    let names = owners(db, &wanted).await;
+    let names = owners(db, &wanted);
     let name = |id: i32| names.get(&id).cloned().unwrap_or_else(|| id.to_string());
     let flags = |f: u32| {
         let mut v = Vec::new();
@@ -130,11 +130,11 @@ pub async fn relations(db: &Client, r: &Relations, hires: &Hires, bots: &[Bot], 
     json!({ "standings": standings, "wingmen": wingmen, "hunting": hunting, "grudges": r.grudges.len() })
 }
 
-pub async fn followed(db: &Client, f: &Following, bots: &[Bot], ids: &[Identity], e: &Economy, atlas: &Atlas, names: &Names) -> Json {
+pub fn followed(db: &Db, f: &Following, bots: &[Bot], ids: &[Identity], e: &Economy, atlas: &Atlas, names: &Names) -> Json {
     let mut wanted: Vec<i32> = f.bots.keys().flat_map(|i| [ids[*i as usize].corp, ids[*i as usize].alliance.unwrap_or(0)]).collect();
     wanted.sort_unstable();
     wanted.dedup();
-    let owner = owners(db, &wanted).await;
+    let owner = owners(db, &wanted);
     let mut list: Vec<Json> = f
         .bots
         .iter()

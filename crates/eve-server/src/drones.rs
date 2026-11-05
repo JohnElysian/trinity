@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 
 use eve_marshal::Value;
-use tokio_postgres::Client;
 use tracing::{debug, error, info, warn};
 
 use crate::ballpark::{Command, Park, Pilot, Ship, ShipStats, Vec3};
@@ -22,6 +21,7 @@ use crate::heartbeat::{Job, Out};
 use crate::items::{self, ItemTxn, NewItem};
 use crate::npc;
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Store, StoreError, Tx};
 use crate::svc::space;
 use crate::world::World;
 
@@ -71,18 +71,25 @@ impl Settings {
         }
     }
 
-    async fn load(db: &impl tokio_postgres::GenericClient, owner: i64) -> Result<Self, tokio_postgres::Error> {
+    fn load(db: &Db, owner: i64) -> Self {
         let mut settings = Self::default();
-        for row in db.query(
-            r#"SELECT a."attributeID", COALESCE(e."valueInt"::float8, e."valueFloat", a."defaultValue"::float8, 1)
-                 FROM "dgmAttributeTypes" a LEFT JOIN entity_attributes e
-                   ON e."itemID" = $1 AND e."attributeID" = a."attributeID"
-                WHERE a."attributeID" = ANY($2)"#,
-            &[&(owner as i32), &SETTING_ATTRIBUTES.as_slice()],
-        ).await? {
-            settings.set(row.get(0), row.get::<_, f64>(1) != 0.0);
+        let attributes = db.table("entity_attributes");
+        let own: std::collections::HashMap<i32, f64> = SETTING_ATTRIBUTES
+            .iter()
+            .filter_map(|a| {
+                let r = attributes.get(&[store::Value::Int(owner), store::Value::Int((*a).into())])?;
+                Some((*a, r.float("valueInt").or_else(|| r.float("valueFloat"))?))
+            })
+            .collect();
+        // The character's own value, else the attribute's default, else on;
+        // an attribute the static data does not know is left as it is.
+        let types = crate::sde::table("dgmAttributeTypes");
+        for attribute in SETTING_ATTRIBUTES {
+            let Some(a) = types.get("attributeID", attribute as i64) else { continue };
+            let value = own.get(&attribute).copied().or_else(|| a.float("defaultValue")).unwrap_or(1.0);
+            settings.set(attribute, value != 0.0);
         }
-        Ok(settings)
+        settings
     }
 }
 
@@ -104,19 +111,23 @@ fn setting_changes(value: Option<&Value>) -> Option<Vec<(i32, bool)>> {
 pub async fn change_settings(ctx: &Ctx<'_>, value: Option<&Value>) -> Outcome {
     let Some(owner) = ctx.session.char_id else { return Outcome::custom("Select a character first.") };
     let Some(changes) = setting_changes(value) else { return Outcome::custom("Invalid drone settings.") };
-    let result = async {
-        let mut db = crate::db::connect(ctx.db_url).await?;
-        let txn = db.transaction().await?;
+    let result = ctx.store.write(|tx| {
         for (attribute, enabled) in &changes {
-            txn.execute(
-                r#"INSERT INTO entity_attributes ("itemID", "attributeID", "valueInt", "valueFloat")
-                    VALUES ($1, $2, $3, NULL) ON CONFLICT ("itemID", "attributeID")
-                    DO UPDATE SET "valueInt" = EXCLUDED."valueInt", "valueFloat" = NULL"#,
-                &[&(owner as i32), attribute, &i64::from(*enabled)],
-            ).await?;
+            let value = store::Value::Int(i64::from(*enabled));
+            tx.upsert(
+                "entity_attributes",
+                &["itemID", "attributeID"],
+                &[
+                    ("itemID", store::Value::Int(owner)),
+                    ("attributeID", store::Value::Int((*attribute).into())),
+                    ("valueInt", value.clone()),
+                    ("valueFloat", store::Value::Null),
+                ],
+                &[("valueInt", value), ("valueFloat", store::Value::Null)],
+            )?;
         }
-        txn.commit().await
-    }.await;
+        Ok::<_, StoreError>(())
+    });
     if let Err(error) = result {
         error!("saving drone settings: {}", crate::logging::chain(&error));
         return Outcome::custom("Your drone settings could not be saved.");
@@ -262,52 +273,44 @@ pub async fn launch(ctx: &Ctx<'_>, ids: Vec<i64>) -> Outcome {
     }
     let wanted: Vec<i64> = ids.into_iter().take(room).collect();
 
-    let settings = match Settings::load(ctx.db, char_id).await {
-        Ok(settings) => settings,
-        Err(error) => {
-            error!("reading drone settings: {}", crate::logging::chain(&error));
-            return Outcome::custom("Your drone settings could not be read.");
-        }
-    };
+    let settings = ctx.store.read(|db| Settings::load(db, char_id));
 
     let mut rng = combat::Rng::seeded(combat::now_ms() as u64 ^ ship_id as u64);
-    let result: Result<Option<(Vec<(i64, i64, Vec3, persistence::Identity)>, Vec<Value>)>, tokio_postgres::Error> = async {
-        let mut client = crate::db::connect(ctx.db_url).await?;
-        let mut txn = ItemTxn::begin(&mut client).await?;
-        if !txn.item(ship_id).await?.is_some_and(|s|s.owner_id==char_id && s.location_id==system) {return Ok(None)}
+    // Err(None) refuses the launch, undoing what was staged.
+    let result = ctx.store.write(|tx| -> Result<(Vec<(i64, i64, Vec3, persistence::Identity)>, Vec<Value>), Option<StoreError>> {
+        let mut txn = ItemTxn::new(tx);
+        if !txn.item(ship_id)?.is_some_and(|s|s.owner_id==char_id && s.location_id==system) {return Err(None)}
         let mut launched = Vec::new();
         for id in wanted {
-            let Some(item) = txn.item(id).await? else { continue };
+            let Some(item) = txn.item(id)? else { continue };
             if item.owner_id != char_id || item.location_id != ship_id || item.flag != FLAG_DRONE_BAY || item.category_id != CATEGORY_DRONE {
                 continue;
             }
             let drone = if item.quantity > 1 {
-                txn.set_quantity(id, item.quantity - 1).await?;
-                txn.create(NewItem { type_id: item.type_id, owner_id: char_id, location_id: system, flag: 0, quantity: 1, singleton: true })
-                    .await?
+                txn.set_quantity(id, item.quantity - 1)?;
+                txn.create(NewItem { type_id: item.type_id, owner_id: char_id, location_id: system, flag: 0, quantity: 1, singleton: true })?
             } else {
-                txn.move_to(id, system, 0).await?;
-                txn.set_singleton(id, true).await?;
+                txn.move_to(id, system, 0)?;
+                txn.set_singleton(id, true)?;
                 id
             };
             // Clear of the hull: destiny would shove a drone launched inside it.
             let pos = ship_pos + rng.in_sphere(1.0).unit() * (ship_radius + LAUNCH_CLEARANCE);
-            txn.set_position(drone, pos.tuple()).await?;
-            let identity=persistence::begin(txn.tx(),drone,char_id,system,Some(ship_id),pos,settings,control_range).await?;
+            txn.set_position(drone, pos.tuple())?;
+            let identity=persistence::begin(txn.tx(),drone,char_id,system,Some(ship_id),pos,settings,control_range)?;
             launched.push((drone, item.type_id, pos, identity));
         }
         if launched.is_empty() {
-            return Ok(None);
+            return Err(None);
         }
         if !ctx.world.lock().parks.get(&system).and_then(|p|p.ships.get(&ship_id))
-            .is_some_and(|s|s.is_pilot() && s.pilot.char_id==char_id && s.pilot.group_id!=29) {return Ok(None)}
-        Ok(Some((launched, txn.commit().await?)))
-    }
-    .await;
+            .is_some_and(|s|s.is_pilot() && s.pilot.char_id==char_id && s.pilot.group_id!=29) {return Err(None)}
+        Ok((launched, txn.events()))
+    });
     let (launched, events) = match result {
-        Ok(Some(v)) => v,
-        Ok(None) => return Outcome::custom("Those drones are not in your drone bay."),
-        Err(e) => {
+        Ok(v) => v,
+        Err(None) => return Outcome::custom("Those drones are not in your drone bay."),
+        Err(Some(e)) => {
             error!("launching drones: {}", crate::logging::chain(&e));
             return Outcome::custom("Your drones could not be launched.");
         }
@@ -315,7 +318,7 @@ pub async fn launch(ctx: &Ctx<'_>, ids: Vec<i64>) -> Outcome {
     items::notify(ctx.world, ctx.client_id, events);
 
     let types: Vec<i64> = launched.iter().map(|(_, t, _, _)| *t).collect();
-    let types = match npc::load_types(ctx.db, &types).await {
+    let types = match ctx.store.read(|db| npc::load_types(db, &types)) {
         Ok(t) => t,
         Err(e) => {
             error!("reading drone types: {}", crate::logging::chain(&e));
@@ -325,14 +328,14 @@ pub async fn launch(ctx: &Ctx<'_>, ids: Vec<i64>) -> Outcome {
     // The pilot's drone skills, through dogma.
     let drone_ids: Vec<i64> = launched.iter().map(|(id, _, _, _)| *id).collect();
     let skilled: HashMap<i64, HashMap<i32, f64>> =
-        match crate::dogma::Loadout::load_with_drones(ctx.db, ctx.dogma, char_id, Some(ship_id), &Default::default(), &drone_ids).await {
+        match ctx.store.read(|db| crate::dogma::Loadout::load_with_drones(db, ctx.dogma, char_id, Some(ship_id), &Default::default(), &drone_ids)) {
             Ok(l) => drone_ids.iter().filter_map(|id| Some((*id, l.attributes(l.find(*id)?)))).collect(),
             Err(e) => {
                 error!("applying drone skills: {}", crate::logging::chain(&e));
                 HashMap::new()
             }
         };
-    let stored=persistence::vitals(ctx.db,&drone_ids).await.unwrap_or_else(|e| {warn!("reading launched drone damage: {e}");HashMap::new()});
+    let stored=ctx.store.read(|db|persistence::vitals(db,&drone_ids));
     let now = combat::now_ms();
     let mut prepared = Vec::new();
     let mut ids = Vec::new();
@@ -370,8 +373,8 @@ pub async fn launch(ctx: &Ctx<'_>, ids: Vec<i64>) -> Outcome {
 
 /// How many drones the pilot can run: the character's maxActiveDrones, which
 /// the Drones skill raises.
-async fn drone_limits(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Result<(usize, f64), tokio_postgres::Error> {
-    let loadout = crate::dogma::Loadout::load(ctx.db, ctx.dogma, char_id, Some(ship_id), &Default::default()).await?;
+async fn drone_limits(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Result<(usize, f64), StoreError> {
+    let loadout = ctx.store.read(|db| crate::dogma::Loadout::load(db, ctx.dogma, char_id, Some(ship_id), &Default::default()))?;
     Ok(loadout.character().map_or((0, 20_000.0), |character| (
         loadout.value(character, attr::MAX_ACTIVE_DRONES).max(0.0) as usize,
         loadout.value(character, 458).max(0.0),
@@ -590,23 +593,22 @@ async fn abandon(ctx: &Ctx<'_>, ids: &[i64]) -> Value {
             }
         } else {return failures(ids.iter().map(|id|(*id,"You are not in space.")).collect())}
     }
-    let result=async {
-        let mut db=crate::db::connect(ctx.db_url).await?;
-        let mut txn=ItemTxn::begin(&mut db).await?;
+    let result=ctx.store.write(|tx| {
+        let mut txn=ItemTxn::new(tx);
         let mut abandoned=Vec::new();
         for id in &selected {
-            if txn.item(*id).await?.is_some_and(|i|i.owner_id==owner && i.location_id==system) {
+            if txn.item(*id)?.is_some_and(|i|i.owner_id==owner && i.location_id==system) {
                 let live={ctx.world.lock().parks.get(&system).and_then(|p|p.ships.get(id)).cloned()};
                 let Some(ship)=live.filter(|s|s.drone.as_ref().is_some_and(|d|d.owner==owner && d.pending_bay)) else {continue};
-                txn.set_position(*id,ship.pos.tuple()).await?;
-                if let Some(f)=&ship.fight {crate::svc::inflight::write_vitals(txn.tx(),*id,f,false).await?;}
-                txn.set_owner(*id,OWNER_SYSTEM).await?;
-                let identity=persistence::begin(txn.tx(),*id,OWNER_SYSTEM,system,None,ship.pos,Settings::default(),0.0).await?;
+                txn.set_position(*id,ship.pos.tuple())?;
+                if let Some(f)=&ship.fight {crate::svc::inflight::write_vitals(txn.tx(),*id,f,false)?;}
+                txn.set_owner(*id,OWNER_SYSTEM)?;
+                let identity=persistence::begin(txn.tx(),*id,OWNER_SYSTEM,system,None,ship.pos,Settings::default(),0.0)?;
                 abandoned.push((*id,identity));
             }
         }
-        Ok::<_,tokio_postgres::Error>((abandoned,txn.commit().await?))
-    }.await;
+        Ok::<_,StoreError>((abandoned,txn.events()))
+    });
     let (abandoned,events)=match result {Ok(v)=>v,Err(e)=>{error!("abandoning drones: {e}");(vec![],vec![])}};
     items::notify(ctx.world,ctx.client_id,events);
     let mut w=ctx.world.lock(); let mut out=Out::default();
@@ -898,23 +900,15 @@ pub async fn scoop(ctx: &Ctx<'_>, ids: Vec<i64>) -> Outcome {
     if scooped.is_empty() {
         return Outcome::custom("There is no recoverable drone close enough to scoop.");
     }
-    let mut client = match crate::db::connect(ctx.db_url).await {
-        Ok(c) => c,
-        Err(e) => {
-            release_pending(ctx.world,&scooped);
-            error!("scooping drones: {}", crate::logging::chain(&e));
-            return Outcome::custom("Your drones could not be scooped.");
-        }
-    };
     let mut success=false;
     for id in scooped {
-        success |= into_bay(&mut client,ctx.dogma,ctx.world,ctx.client_id,id,ship_id).await;
+        success |= into_bay(ctx.store,ctx.dogma,ctx.world,ctx.client_id,id,ship_id).await;
     }
     if success {Outcome::Value(Value::None)} else {Outcome::custom("The drones could not be moved into your drone bay.")}
 }
 
-pub async fn home(server: &Server, db: &mut Client, client_id: i64, drone_id: i64, ship_id: i64) {
-    into_bay(db,&server.dogma,&server.world,client_id,drone_id,ship_id).await;
+pub async fn home(server: &Server, store: &Store, client_id: i64, drone_id: i64, ship_id: i64) {
+    into_bay(store,&server.dogma,&server.world,client_id,drone_id,ship_id).await;
 }
 
 fn release_pending(world:&World, ids:&[i64]) {
@@ -931,37 +925,42 @@ fn bay_ready(world:&crate::world::WorldState,system:i64,owner:i64,drone_id:i64,s
         && park.surface_distance(drone_id,ship.id).is_some_and(|distance|distance<=SCOOP_RANGE)
 }
 
-async fn into_bay(db: &mut Client,catalog:&crate::dogma::Catalog, world: &World, client_id: i64, drone_id: i64, ship_id: i64) -> bool {
+async fn into_bay(store: &Store,catalog:&crate::dogma::Catalog, world: &World, client_id: i64, drone_id: i64, ship_id: i64) -> bool {
     let live={let w=world.lock();w.parks.iter().find_map(|(system,p)| {
         let ship=p.ships.get(&ship_id)?; let drone=p.ships.get(&drone_id)?.drone.as_ref()?;
         (ship.is_pilot() && drone.pending_bay && (drone.owner==ship.pilot.char_id || (drone.owner==OWNER_SYSTEM && drone.controller.is_none()))
             && p.surface_distance(drone_id,ship_id).is_some_and(|d|d<=SCOOP_RANGE)).then_some((*system,ship.pilot.char_id))
     })};
     let Some((system,owner))=live else {release_pending(world,&[drone_id]);return false};
-    let result = async {
-        let mut txn = ItemTxn::begin(db).await?;
-        let Some(ship)=txn.item(ship_id).await? else {return Ok(None)};
-        let Some(drone)=txn.item(drone_id).await? else {return Ok(None)};
+    // Err(None) refuses the return, undoing what was staged.
+    let result = store.write(|tx| -> Result<Vec<Value>, Option<StoreError>> {
+        let mut txn = ItemTxn::new(tx);
+        let Some(ship)=txn.item(ship_id)? else {return Err(None)};
+        let Some(drone)=txn.item(drone_id)? else {return Err(None)};
         if ship.owner_id!=owner || ship.location_id!=system || drone.category_id!=CATEGORY_DRONE || drone.location_id!=system
-            || (drone.owner_id!=owner && drone.owner_id!=OWNER_SYSTEM) {return Ok(None)}
-        let loadout=crate::dogma::Loadout::load(txn.tx(),catalog,owner,Some(ship_id),&Default::default()).await?;
+            || (drone.owner_id!=owner && drone.owner_id!=OWNER_SYSTEM) {return Err(None)}
+        let loadout=crate::dogma::Loadout::load(txn.db(),catalog,owner,Some(ship_id),&Default::default())?;
         let capacity=loadout.ship().map_or(0.0,|ship|loadout.value(ship,283));
-        let used:f64=txn.tx().query_one(r#"SELECT coalesce(sum(t.volume*e.quantity),0)::float8 FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID" WHERE e."locationID"=$1 AND e.flag=87"#,&[&(ship_id as i32)]).await?.get(0);
-        if used+drone.volume*drone.quantity as f64>capacity+1e-6 {return Ok(None)}
+        // Drones of a type the static data does not know take no room, as
+        // joining on it left them out.
+        let used:f64=txn.db().table("entity").find(&["locationID","flag"],&[store::Value::Int(ship_id),store::Value::Int(FLAG_DRONE_BAY)])
+            .filter_map(|r|{
+                let volume=crate::sde::table("invTypes").get("typeID",r.int("typeID")?)?.float("volume")?;
+                Some(volume*r.int("quantity")? as f64)
+            }).sum();
+        if used+drone.volume*drone.quantity as f64>capacity+1e-6 {return Err(None)}
         let live={world.lock().parks.get(&system).and_then(|p|p.ships.get(&drone_id)).cloned()};
-        if let Some(f)=live.as_ref().and_then(|s|s.fight.as_ref()) {crate::svc::inflight::write_vitals(txn.tx(),drone_id,f,false).await?;}
-        txn.set_owner(drone_id,owner).await?;
-        txn.move_to(drone_id, ship_id, FLAG_DRONE_BAY).await?;
-        // The ship row lock serializes persisted travel, while heartbeat
-        // motion and destruction can change the park during SQL awaits.
-        // Recheck the live reservation and destination before committing;
-        // dropping the transaction rolls staged inventory changes back.
-        if !bay_ready(&world.lock(),system,owner,drone_id,ship_id) {return Ok(None)}
-        Ok::<_,tokio_postgres::Error>(Some(txn.commit().await?))
-    }
-    .await;
+        if let Some(f)=live.as_ref().and_then(|s|s.fight.as_ref()) {crate::svc::inflight::write_vitals(txn.tx(),drone_id,f,false)?;}
+        txn.set_owner(drone_id,owner)?;
+        txn.move_to(drone_id, ship_id, FLAG_DRONE_BAY)?;
+        // Heartbeat motion and destruction can have changed the park since
+        // the live snapshot above. Recheck the live reservation and
+        // destination before committing; refusing undoes the staged changes.
+        if !bay_ready(&world.lock(),system,owner,drone_id,ship_id) {return Err(None)}
+        Ok(txn.events())
+    });
     match result {
-        Ok(Some(events)) => {
+        Ok(events) => {
             let mut w=world.lock(); let mut out=Out::default();
             if let Some(park)=w.parks.get_mut(&system) {
                 if crate::fight::detach(park,drone_id,combat::now_ms(),&mut out).is_some() {
@@ -973,27 +972,29 @@ async fn into_bay(db: &mut Client,catalog:&crate::dogma::Catalog, world: &World,
             debug!("drone {drone_id} back in {ship_id}");
             true
         }
-        result => {
-            if let Err(e)=result {error!("returning drone {drone_id} to {ship_id}: {}",crate::logging::chain(&e));}
+        Err(e) => {
+            if let Some(e)=e {error!("returning drone {drone_id} to {ship_id}: {}",crate::logging::chain(&e));}
             release_pending(world,&[drone_id]);false
         }
     }
 }
 
-async fn destroy_lost(db:&mut Client,system:i64,owner:i64,drone_id:i64,generation:Option<i64>)
-    -> Result<Option<Vec<Value>>,tokio_postgres::Error> {
-    let mut txn=ItemTxn::begin(db).await?;
-    let Some(item)=txn.item(drone_id).await? else {return Ok(None)};
-    if item.owner_id!=owner || item.location_id!=system || item.flag!=0 || item.category_id!=CATEGORY_DRONE {return Ok(None)}
-    let current=txn.tx().query_opt("SELECT generation FROM launched_drone_state WHERE drone_id=$1 AND owner_id=$2 AND system_id=$3",
-        &[&(drone_id as i32),&(owner as i32),&(system as i32)]).await?.map(|r|r.get::<_,i64>(0));
-    if current!=generation {return Ok(None)}
-    txn.destroy(drone_id).await?;
-    Ok(Some(txn.commit().await?))
+async fn destroy_lost(store:&Store,system:i64,owner:i64,drone_id:i64,generation:Option<i64>)
+    -> Result<Option<Vec<Value>>,StoreError> {
+    store.write(|tx| {
+        let mut txn=ItemTxn::new(tx);
+        let Some(item)=txn.item(drone_id)? else {return Ok(None)};
+        if item.owner_id!=owner || item.location_id!=system || item.flag!=0 || item.category_id!=CATEGORY_DRONE {return Ok(None)}
+        let current=txn.db().table("launched_drone_state").get_id(drone_id)
+            .filter(|r|r.int("owner_id")==Some(owner) && r.int("system_id")==Some(system)).and_then(|r|r.int("generation"));
+        if current!=generation {return Ok(None)}
+        txn.destroy(drone_id)?;
+        Ok(Some(txn.events()))
+    })
 }
 
-pub async fn lost(server: &Server, db: &mut Client, client_id: Option<i64>, drone_id: i64,system:i64,owner:i64,generation:Option<i64>) {
-    let result=destroy_lost(db,system,owner,drone_id,generation).await;
+pub async fn lost(server: &Server, store: &Store, client_id: Option<i64>, drone_id: i64,system:i64,owner:i64,generation:Option<i64>) {
+    let result=destroy_lost(store,system,owner,drone_id,generation).await;
     match result {
         Ok(Some(events)) => {
             if let Some(client) = client_id {
@@ -1145,18 +1146,32 @@ mod tests {
         assert_eq!(park.ships[&12].drone.as_ref().unwrap().order,Order::Engage(20));
     }
 
+    fn insert_item(database:&crate::test_support::Database,id:i64,ty:i64,owner:i64,location:i64) {
+        database.store.write(|tx|tx.insert("entity",&[("itemID",store::Value::Int(id)),("typeID",store::Value::Int(ty)),("ownerID",store::Value::Int(owner)),
+            ("locationID",store::Value::Int(location)),("flag",store::Value::Int(0)),("quantity",store::Value::Int(1)),("singleton",store::Value::Int(1))])).unwrap();
+    }
+
+    fn set_attribute(database:&crate::test_support::Database,item:i64,attribute:i64,value:i64) {
+        database.store.write(|tx|tx.upsert("entity_attributes",&["itemID","attributeID"],
+            &[("itemID",store::Value::Int(item)),("attributeID",store::Value::Int(attribute)),("valueInt",store::Value::Int(value))],
+            &[("valueInt",store::Value::Int(value))])).unwrap();
+    }
+
+    fn item_place(database:&crate::test_support::Database,id:i64)->(Option<i64>,Option<i64>,Option<i64>) {
+        database.store.read(|db|{let e=db.table("entity").get_id(id).unwrap();(e.int("ownerID"),e.int("locationID"),e.int("flag"))})
+    }
+
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
     async fn drone_delegation_abandonment_and_recovery_preserve_ownership() {
         let database=crate::test_support::Database::load().await;
         let owner=database.id().await;let recipient=database.id().await;
         let home=database.id().await;let receiver=database.id().await;let fighter=database.id().await;let ordinary=database.id().await;
         let system=30_000_001i32;
-        let fighter_type:i32=database.db.query_one(r#"SELECT "typeID" FROM "invTypes" WHERE "groupID"=549 ORDER BY "typeID" LIMIT 1"#,&[]).await.unwrap().get(0);
+        let fighter_type:i32=crate::sde::get().types_in_group(549)[0];
         for (id,ty,who,location) in [(owner,1377,owner,home),(recipient,1377,recipient,receiver),(home,626,owner,system),(receiver,626,recipient,system),(fighter,fighter_type,owner,system),(ordinary,2454,owner,system)] {
-            database.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,$2,$3,$4,0,1,1)"#,&[&id,&ty,&who,&location]).await.unwrap();
+            insert_item(&database,id.into(),ty.into(),who.into(),location.into());
         }
-        database.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,$2,5)"#,&[&recipient,&attr::MAX_ACTIVE_DRONES]).await.unwrap();
+        set_attribute(&database,recipient.into(),attr::MAX_ACTIVE_DRONES.into(),5);
         let own_session=crate::session::Session{char_id:Some(owner as i64),ship_id:Some(home as i64),solar_system_id:Some(system as i64),..Default::default()};
         let other_session=crate::session::Session{char_id:Some(recipient as i64),ship_id:Some(receiver as i64),solar_system_id:Some(system as i64),..Default::default()};
         let own=database.ctx(&own_session);let other=Ctx{client_id:2,..database.ctx(&other_session)};
@@ -1186,16 +1201,15 @@ mod tests {
         no_failures(command(&own,&[ordinary as i64],Order::ReturnHome));
         assert!(matches!(scoop(&other,vec![ordinary as i64]).await,Outcome::UserError{..}));
         no_failures(abandon(&own,&[ordinary as i64]).await);
-        assert_eq!(database.db.query_one(r#"SELECT "ownerID" FROM entity WHERE "itemID"=$1"#,&[&ordinary]).await.unwrap().get::<_,i32>(0),OWNER_SYSTEM as i32);
+        assert_eq!(item_place(&database,ordinary.into()).0,Some(OWNER_SYSTEM));
         assert_ne!(command(&own,&[ordinary as i64],Order::Engage(receiver as i64)),Value::Dict(vec![]));
         // Failure after selecting a scoop leaves the live drone recoverable.
-        database.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,283,0)"#,&[&receiver]).await.unwrap();
+        set_attribute(&database,receiver.into(),283,0);
         assert!(matches!(scoop(&other,vec![ordinary as i64]).await,Outcome::UserError{..}));
         assert!(database.world.lock().parks[&(system as i64)].ships.contains_key(&(ordinary as i64)));
-        database.db.execute(r#"UPDATE entity_attributes SET "valueInt"=100 WHERE "itemID"=$1 AND "attributeID"=283"#,&[&receiver]).await.unwrap();
+        set_attribute(&database,receiver.into(),283,100);
         assert!(matches!(scoop(&other,vec![ordinary as i64]).await,Outcome::Value(Value::None)));
-        let item=database.db.query_one(r#"SELECT "ownerID","locationID",flag FROM entity WHERE "itemID"=$1"#,&[&ordinary]).await.unwrap();
-        assert_eq!((item.get::<_,i32>(0),item.get::<_,i32>(1),item.get::<_,i32>(2)),(recipient,receiver,87));
+        assert_eq!(item_place(&database,ordinary.into()),(Some(recipient.into()),Some(receiver.into()),Some(87)));
         assert!(!database.world.lock().parks[&(system as i64)].ships.contains_key(&(ordinary as i64)));
         for receiver in [&mut owner_rx,&mut recipient_rx] {
             let mut seen=false;
@@ -1205,54 +1219,38 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
-    async fn drone_return_rechecks_ship_location_after_waiting_for_row_lock() {
+    async fn drone_return_rechecks_ship_location_after_it_moves() {
         let fixture=crate::test_support::Database::load().await;
-        let owner=fixture.id().await;let ship_id=fixture.id().await;let drone_id=fixture.id().await;
-        let system=30_000_001i32;
-        for (id,ty) in [(ship_id,626i32),(drone_id,2454)] {
-            fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,$2,$3,$4,0,1,1)"#,&[&id,&ty,&owner,&system]).await.unwrap();
+        let owner=i64::from(fixture.id().await);let ship_id=i64::from(fixture.id().await);let drone_id=i64::from(fixture.id().await);
+        let system=30_000_001i64;
+        for (id,ty) in [(ship_id,626),(drone_id,2454)] {
+            insert_item(&fixture,id,ty,owner,system);
         }
+        let move_ship=|location:i64|fixture.store.write(|tx|{let row=tx.table("entity").get_id(ship_id).unwrap().id;
+            tx.update("entity",row,&[("locationID",store::Value::Int(location))])}).unwrap();
         for leave_system in [true,false] {
-            fixture.db.execute(r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,&[&ship_id,&system]).await.unwrap();
-            let mut ship=drone(ship_id as i64,owner as i64,ship_id as i64,0.0);ship.drone=None;ship.pilot.type_id=626;
-            let mut returning=drone(drone_id as i64,owner as i64,ship_id as i64,100.0);
+            move_ship(system);
+            let mut ship=drone(ship_id,owner,ship_id,0.0);ship.drone=None;ship.pilot.type_id=626;
+            let mut returning=drone(drone_id,owner,ship_id,100.0);
             returning.drone.as_mut().unwrap().pending_bay=true;
-            let mut park=Park::new(system as i64,vec![],0);park.ships.insert(ship_id as i64,ship);park.ships.insert(drone_id as i64,returning);
-            fixture.world.lock().parks.insert(system as i64,park);
-            let mut blocker=crate::db::connect(&fixture.url).await.unwrap();
-            let blocker=blocker.transaction().await.unwrap();
-            blocker.query_one(r#"SELECT "itemID" FROM entity WHERE "itemID"=$1 FOR UPDATE"#,&[&ship_id]).await.unwrap();
-            let mut worker=crate::db::connect(&fixture.url).await.unwrap();
-            let worker_pid:i32=worker.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-            let blocked_return=into_bay(&mut worker,&fixture.dogma,&fixture.world,1,drone_id as i64,ship_id as i64);
-            let move_ship=async {
-                tokio::time::timeout(std::time::Duration::from_secs(5),async {
-                    loop {
-                        let wait:Option<String>=fixture.db.query_one("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1",&[&worker_pid]).await.unwrap().get(0);
-                        if wait.as_deref()==Some("Lock") {break}
-                        tokio::task::yield_now().await;
-                    }
-                }).await.expect("return should be blocked on ship row after its live snapshot");
-                if leave_system {
-                    blocker.execute(r#"UPDATE entity SET "locationID"=60000004 WHERE "itemID"=$1"#,&[&ship_id]).await.unwrap();
-                    fixture.world.lock().parks.get_mut(&(system as i64)).unwrap().ships.remove(&(ship_id as i64));
-                } else {
-                    fixture.world.lock().parks.get_mut(&(system as i64)).unwrap().ships.get_mut(&(ship_id as i64)).unwrap().pos=Vec3::new(1_000_000.0,0.0,0.0);
-                }
-                blocker.commit().await.unwrap();
-            };
-            let (returned,())=tokio::join!(blocked_return,move_ship);
-            assert!(!returned,"a ship that moved during the database wait cannot scoop the drone");
-            let row=fixture.db.query_one(r#"SELECT "locationID",flag FROM entity WHERE "itemID"=$1"#,&[&drone_id]).await.unwrap();
-            assert_eq!((row.get::<_,i32>(0),row.get::<_,i32>(1)),(system,0));
-            let w=fixture.world.lock();let drone=w.parks[&(system as i64)].ships[&(drone_id as i64)].drone.as_ref().unwrap();
+            let mut park=Park::new(system,vec![],0);park.ships.insert(ship_id,ship);park.ships.insert(drone_id,returning);
+            fixture.world.lock().parks.insert(system,park);
+            // The ship moves after the drone was sent home, before it arrives.
+            if leave_system {
+                move_ship(60000004);
+                fixture.world.lock().parks.get_mut(&system).unwrap().ships.remove(&ship_id);
+            } else {
+                fixture.world.lock().parks.get_mut(&system).unwrap().ships.get_mut(&ship_id).unwrap().pos=Vec3::new(1_000_000.0,0.0,0.0);
+            }
+            let returned=into_bay(&fixture.store,&fixture.dogma,&fixture.world,1,drone_id,ship_id).await;
+            assert!(!returned,"a ship that moved away cannot scoop the drone");
+            assert_eq!(fixture.store.read(|db|{let e=db.table("entity").get_id(drone_id).unwrap();(e.int("locationID"),e.int("flag"))}),(Some(system),Some(0)));
+            let w=fixture.world.lock();let drone=w.parks[&system].ships[&drone_id].drone.as_ref().unwrap();
             assert!(!drone.pending_bay,"failed pickup must remain recoverable");
         }
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
     async fn drone_settings_persist_and_update_launched_drones() {
         let database = crate::test_support::Database::load().await;
         let owner = i64::from(database.id().await);
@@ -1265,7 +1263,7 @@ mod tests {
             (Value::Int(1275), Value::Bool(false)), (Value::Int(1297), Value::Bool(true)),
         ]))).await;
         assert!(matches!(outcome, Outcome::Value(Value::None)));
-        let saved = Settings::load(&database.db, owner).await.unwrap();
+        let saved = database.store.read(|db| Settings::load(db, owner));
         assert!(!saved.aggressive);
         assert!(saved.focus_fire);
         let world = database.world.lock();

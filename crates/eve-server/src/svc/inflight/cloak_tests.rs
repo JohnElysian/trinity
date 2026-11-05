@@ -10,32 +10,38 @@ struct Fixture {
 impl Fixture {
     async fn new(covert:bool)->Self {
         let db=crate::test_support::Database::load().await;
-        let pilot=db.id().await;let ship=db.id().await;let module=db.id().await;let skill=db.id().await;
-        let system=30000142;
-        db.db.execute(r#"INSERT INTO "character_"("characterID","characterName","shipID","solarSystemID","stationID") VALUES($1,$2,$3,$4,0)"#,
-            &[&pilot,&format!("Cloak {pilot}"),&ship,&system]).await.unwrap();
+        let pilot=i64::from(db.id().await);let ship=i64::from(db.id().await);let module=i64::from(db.id().await);let skill=i64::from(db.id().await);
+        let system=30000142i64;
         let (hull_type,module_type)=if covert {(11188,11578)} else {(587,11370)};
-        db.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES
-            ($1,$2,$3,$4,0,1,1),($5,$6,$3,$1,11,1,1),($7,11579,$3,$3,7,1,1)"#,
-            &[&ship,&hull_type,&pilot,&system,&module,&module_type,&skill]).await.unwrap();
-        db.db.execute(r#"INSERT INTO entity_attributes("itemID","attributeID","valueInt") VALUES($1,2,1),($2,280,5)"#,&[&module,&skill]).await.unwrap();
-        let session=Session {char_id:Some(pilot as i64),ship_id:Some(ship as i64),solar_system_id:Some(system as i64),solar_system_id2:Some(system as i64),..Default::default()};
-        let mut hull=ship_for_space(&db.ctx(&session),pilot as i64,ship as i64).await.unwrap();
+        db.store.write(|tx| -> Result<(),StoreError> {
+            tx.insert("character_",&[("characterID",store::Value::Int(pilot)),("characterName",store::Value::Text(format!("Cloak {pilot}").into())),
+                ("shipID",store::Value::Int(ship)),("solarSystemID",store::Value::Int(system)),("stationID",store::Value::Int(0))])?;
+            for (id,type_id,location,flag) in [(ship,hull_type,system,0),(module,module_type,ship,11),(skill,11579,pilot,7)] {
+                tx.insert("entity",&[("itemID",store::Value::Int(id)),("typeID",store::Value::Int(type_id)),("ownerID",store::Value::Int(pilot)),
+                    ("locationID",store::Value::Int(location)),("flag",store::Value::Int(flag)),("quantity",store::Value::Int(1)),("singleton",store::Value::Int(1))])?;
+            }
+            for (id,attribute,value) in [(module,2,1),(skill,280,5)] {
+                tx.insert("entity_attributes",&[("itemID",store::Value::Int(id)),("attributeID",store::Value::Int(attribute)),("valueInt",store::Value::Int(value))])?;
+            }
+            Ok(())
+        }).unwrap();
+        let session=Session {char_id:Some(pilot),ship_id:Some(ship),solar_system_id:Some(system),solar_system_id2:Some(system),..Default::default()};
+        let mut hull=ship_for_space(&db.ctx(&session),pilot,ship).await.unwrap();
         hull.stats.warp_capacitor_need=0.0;
-        let observer=ship as i64+1000000000;
+        let observer=ship+1000000000;
         let mut other=hull.clone();other.id=observer;other.client_id=2;other.pilot.char_id=observer;other.pos=Vec3::new(20000.0,0.0,0.0);
         // Leave one elapsed simulation tick for the warp-entry step below.
         // Advancing a park created at wall-clock now by one would checkpoint
         // a future trajectory, correctly rejected by reconnect validation.
-        let mut park=Park::new(system as i64,vec![],crate::destiny::tick_now()-1);park.ships.insert(ship as i64,hull);park.ships.insert(observer,other);
-        let (owner_rx,observer_rx)={let mut world=db.world.lock();world.parks.insert(system as i64,park);
+        let mut park=Park::new(system,vec![],crate::destiny::tick_now()-1);park.ships.insert(ship,hull);park.ships.insert(observer,other);
+        let (owner_rx,observer_rx)={let mut world=db.world.lock();world.parks.insert(system,park);
             let rx1=world.connect(1);let rx2=world.connect(2);
-            for (client,char_id) in [(1,pilot as i64),(2,observer)] {
-                world.set_presence(client,Some(Presence {char_id,corp_id:1,solar_system_id:system as i64,docked:false,station_id:None,role:0}));world.sees(client,system as i64);
+            for (client,char_id) in [(1,pilot),(2,observer)] {
+                world.set_presence(client,Some(Presence {char_id,corp_id:1,solar_system_id:system,docked:false,station_id:None,role:0}));world.sees(client,system);
             }
             (rx1,rx2)
         };
-        Self {db,session,system:system as i64,ship:ship as i64,module:module as i64,observer,owner_rx,observer_rx}
+        Self {db,session,system,ship,module,observer,owner_rx,observer_rx}
     }
     fn call(&self,method:&str,covert:bool)->Call {
         Call {service:"dogmaIM".into(),method:method.into(),args:vec![Value::Int(self.module),Value::bytes(if covert {"cloakingWarpSafe"}else{"cloaking"}),Value::None,Value::Int(0)],kwargs:vec![]}
@@ -52,7 +58,6 @@ fn drain(rx:&mut tokio::sync::mpsc::UnboundedReceiver<Push>)->Vec<crate::world::
 fn user_error_is(outcome:Outcome,key:&str)->bool {matches!(outcome,Outcome::UserError {msg,..} if msg==key)}
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn continuous_cloak_native_visibility_immediate_stop_and_original_delays() {
     let mut f=Fixture::new(false).await;
     let ctx=f.db.ctx(&f.session);
@@ -95,9 +100,8 @@ async fn continuous_cloak_native_visibility_immediate_stop_and_original_delays()
     assert!(user_error_is(add_target(&ctx,f.observer),"DeniedTargetAfterCloak"));
     let stopped=f.db.world.lock().parks[&f.system].ships[&f.ship].clone();
     assert_eq!(stopped.stats.max_velocity,speed);
-    let mut connection=crate::db::connect(&f.db.url).await.unwrap();
     let tick=f.db.world.lock().parks[&f.system].tick;
-    assert!(crate::space_state::save_detached(&mut connection,f.system,&stopped,tick).await.unwrap());
+    assert!(crate::space_state::save_detached(&f.db.store,f.system,&stopped,tick).await.unwrap());
     let mut restored=ship_for_space(&ctx,f.session.char_id.unwrap(),f.ship).await.unwrap();
     assert!(crate::space_state::restore(&ctx,f.system,&mut restored).await.unwrap());
     assert_eq!(restored.fight.as_ref().unwrap().cloak_history,stopped.fight.as_ref().unwrap().cloak_history);
@@ -113,7 +117,6 @@ async fn continuous_cloak_native_visibility_immediate_stop_and_original_delays()
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn covert_cloak_stays_continuous_in_warp_and_reconnect_validates_fitted_item() {
     let f=Fixture::new(true).await;let ctx=f.db.ctx(&f.session);
     f.db.world.lock().parks.get_mut(&f.system).unwrap().command(f.ship,Command::Warp {target:Vec3::new(5e12,0.0,0.0),range:0.0});
@@ -129,15 +132,17 @@ async fn covert_cloak_stays_continuous_in_warp_and_reconnect_validates_fitted_it
     }
     let snapshot=f.db.world.lock().parks[&f.system].ships[&f.ship].clone();let tick=f.db.world.lock().parks[&f.system].tick;
     assert!(tick<=crate::destiny::tick_now(),"the saved warp is an elapsed, not future, simulation state");
-    let mut connection=crate::db::connect(&f.db.url).await.unwrap();
-    assert!(crate::space_state::save_detached(&mut connection,f.system,&snapshot,tick).await.unwrap());
+    assert!(crate::space_state::save_detached(&f.db.store,f.system,&snapshot,tick).await.unwrap());
     let mut restored=ship_for_space(&ctx,f.session.char_id.unwrap(),f.ship).await.unwrap();
     assert!(crate::space_state::restore(&ctx,f.system,&mut restored).await.unwrap());
     assert!(restored.cloaked);assert!(restored.in_warp());assert_eq!(restored.fight.as_ref().unwrap().module(f.module).unwrap().started_ms,f.active().unwrap().started_ms);
     assert_eq!(restored.stats.max_velocity,snapshot.stats.max_velocity);
     assert!(matches!(deactivate(&ctx,&f.call("Deactivate",true)).await,Outcome::Value(_)));
     f.forget_delays();assert!(matches!(activate(&ctx,&f.call("Activate",true)).await,Outcome::Value(_)),"a warp-safe cloak may activate during the actual warp");
-    f.db.db.execute(r#"UPDATE entity_attributes SET "valueInt"=0 WHERE "itemID"=$1 AND "attributeID"=2"#,&[&(f.module as i32)]).await.unwrap();
+    f.db.store.write(|tx| {
+        let Some(row)=tx.table("entity_attributes").get(&[store::Value::Int(f.module),store::Value::Int(2)]).map(|r|r.id) else {return Ok(())};
+        tx.update("entity_attributes",row,&[("valueInt",store::Value::Int(0))])
+    }).unwrap();
     let mut offline=ship_for_space(&ctx,f.session.char_id.unwrap(),f.ship).await.unwrap();
     assert!(crate::space_state::restore(&ctx,f.system,&mut offline).await.unwrap());
     assert!(!offline.cloaked);assert!(offline.fight.as_ref().unwrap().modules.is_empty());

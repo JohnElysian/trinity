@@ -8,17 +8,16 @@
 //! only in the simulation. It is not a static owner: the client learns its
 //! name when it needs it, as for any player (config.StaticOwners goes whole
 //! to every client at login, and has a 1 MB ceiling). They are made in batches, each in one
-//! transaction of a few set-based inserts.
+//! write.
 
 use std::collections::{HashMap, HashSet};
 
-use tokio_postgres::Client;
 use tracing::info;
 
 use super::behaviour::{Activity, Atlas, Bot, Role, System};
 use super::presence::Identity;
 use crate::combat::Rng;
-use crate::svc::rows::{float, int, text};
+use crate::store::{Db, Row, Store, StoreError, Tx, Value};
 
 /// The share of bots in each role.
 pub const ROLES: [(Role, f64); 6] = [
@@ -39,17 +38,15 @@ const HIGH_SEC: f32 = 0.45;
 
 // ---- the map -------------------------------------------------------------------------------
 
-pub async fn atlas(db: &Client) -> Result<Atlas, String> {
-    let fail = |what: &str, e: tokio_postgres::Error| format!("{what}: {}", crate::logging::chain(&e));
-    let graph = crate::gates::graph(db).await.ok_or("the star gates could not be read")?;
+pub fn atlas(db: &Db) -> Result<Atlas, String> {
+    let graph = crate::gates::graph(db).ok_or("the star gates could not be read")?;
     let mut systems: HashMap<i32, System> = HashMap::new();
-    let sql = r#"SELECT "solarSystemID", "security", "regionID" FROM "mapSolarSystems""#;
-    for r in db.query(sql, &[]).await.map_err(|e| fail("reading the systems", e))? {
-        let id = int(&r, 0).unwrap_or(0) as i32;
+    for r in db.table("mapSolarSystems").rows() {
+        let id = r.int("solarSystemID").unwrap_or(0) as i32;
         let neighbours = graph.get(&(id as i64)).map(|n| n.iter().map(|s| *s as i32).collect()).unwrap_or_default();
         let system = System {
-            security: float(&r, 1).unwrap_or(0.0) as f32,
-            region: int(&r, 2).unwrap_or(0) as i32,
+            security: r.float("security").unwrap_or(0.0) as f32,
+            region: r.int("regionID").unwrap_or(0) as i32,
             stations: Vec::new(),
             belts: 0,
             neighbours,
@@ -57,18 +54,22 @@ pub async fn atlas(db: &Client) -> Result<Atlas, String> {
         systems.insert(id, system);
     }
     let mut station_system = HashMap::new();
-    let sql = r#"SELECT "stationID", "solarSystemID" FROM "staStations" ORDER BY "stationID""#;
-    for r in db.query(sql, &[]).await.map_err(|e| fail("reading the stations", e))? {
-        let (station, system) = (int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0) as i32);
+    let mut stations: Vec<(i32, i32)> =
+        db.table("staStations").rows().map(|r| (r.int("stationID").unwrap_or(0) as i32, r.int("solarSystemID").unwrap_or(0) as i32)).collect();
+    stations.sort_unstable_by_key(|(station, _)| *station);
+    for (station, system) in stations {
         if let Some(s) = systems.get_mut(&system) {
             s.stations.push(station);
             station_system.insert(station, system);
         }
     }
-    let sql = r#"SELECT "solarSystemID", count(*) FROM "mapDenormalize" WHERE "groupID" = $1 GROUP BY 1"#;
-    for r in db.query(sql, &[&GROUP_BELT]).await.map_err(|e| fail("reading the belts", e))? {
-        if let Some(s) = systems.get_mut(&(int(&r, 0).unwrap_or(0) as i32)) {
-            s.belts = int(&r, 1).unwrap_or(0).min(u16::MAX as i64) as u16;
+    let mut belts: HashMap<i32, i64> = HashMap::new();
+    for r in db.table("mapDenormalize").rows().filter(|r| r.int("groupID") == Some(i64::from(GROUP_BELT))) {
+        *belts.entry(r.int("solarSystemID").unwrap_or(0) as i32).or_default() += 1;
+    }
+    for (system, n) in belts {
+        if let Some(s) = systems.get_mut(&system) {
+            s.belts = n.min(u16::MAX as i64) as u16;
         }
     }
     let belts_near = systems
@@ -99,12 +100,14 @@ struct Sources {
     hulls: HashMap<(i32, i64), Vec<i32>>,
 }
 
-async fn sources(db: &Client) -> Result<Sources, tokio_postgres::Error> {
+fn sources(db: &Db) -> Sources {
+    let chr_bloodlines = crate::sde::table("chrBloodlines");
+    let characters = db.table("character_");
     let mut names: HashMap<i64, (Vec<String>, Vec<String>)> = HashMap::new();
-    let sql = r#"SELECT b."raceID", c."characterName" FROM "character_" c JOIN "chrBloodlines" b ON b."bloodlineID" = c."bloodlineID"
-                  WHERE c."accountID" IS NULL AND c."characterName" LIKE '% %'"#;
-    for r in db.query(sql, &[]).await? {
-        let (race, name) = (int(&r, 0).unwrap_or(0), text(&r, 1).unwrap_or_default());
+    for r in characters.rows().filter(|c| c.int("accountID").is_none() && c.text("characterName").is_some_and(|n| n.contains(' '))) {
+        // An NPC whose bloodline is not in chrBloodlines lends no names.
+        let Some(b) = r.int("bloodlineID").and_then(|b| chr_bloodlines.get("bloodlineID", b)) else { continue };
+        let (race, name) = (b.int("raceID").unwrap_or(0), r.text("characterName").unwrap_or_default());
         let (Some(first), Some(last)) = (name.split(' ').next(), name.rsplit(' ').next()) else { continue };
         let entry = names.entry(race).or_default();
         entry.0.push(first.to_string());
@@ -116,30 +119,29 @@ async fn sources(db: &Client) -> Result<Sources, tokio_postgres::Error> {
         lasts.sort();
         lasts.dedup();
     }
-    let taken = db
-        .query(r#"SELECT lower("characterName") FROM "character_""#, &[])
-        .await?
-        .iter()
-        .filter_map(|r| text(r, 0))
-        .collect();
+    let taken = characters.rows().filter_map(|r| r.text("characterName").map(str::to_lowercase)).collect();
     let mut faces: HashMap<(i64, i16), Vec<i32>> = HashMap::new();
-    let sql = r#"SELECT "bloodlineID", "gender", "characterID" FROM "character_" WHERE "accountID" IS NULL AND "bloodlineID" BETWEEN 1 AND 8"#;
-    for r in db.query(sql, &[]).await? {
-        faces.entry((int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0) as i16)).or_default().push(int(&r, 2).unwrap_or(0) as i32);
+    for r in characters.rows().filter(|c| c.int("accountID").is_none() && c.int("bloodlineID").is_some_and(|b| (1..=8).contains(&b))) {
+        faces.entry((r.int("bloodlineID").unwrap_or(0), r.int("gender").unwrap_or(0) as i16)).or_default().push(r.int("characterID").unwrap_or(0) as i32);
     }
-    let bloodlines = db
-        .query(r#"SELECT "bloodlineID", "raceID" FROM "chrBloodlines" WHERE "bloodlineID" BETWEEN 1 AND 8 ORDER BY 1"#, &[])
-        .await?
-        .iter()
-        .map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0)))
+    let mut bloodlines: Vec<(i64, i64)> = chr_bloodlines
+        .rows()
+        .filter_map(|r| Some((r.int("bloodlineID").filter(|b| (1..=8).contains(b))?, r.int("raceID").unwrap_or(0))))
         .collect();
+    bloodlines.sort_by_key(|(b, _)| *b);
+    // Marketable hulls of a race in the bots' ship groups, by type.
     let mut hulls: HashMap<(i32, i64), Vec<i32>> = HashMap::new();
-    let sql = r#"SELECT "groupID", "raceID", "typeID" FROM "invTypes"
-                  WHERE "groupID" = ANY($1) AND "marketGroupID" IS NOT NULL AND "raceID" IS NOT NULL ORDER BY "typeID""#;
-    for r in db.query(sql, &[&vec![25i32, 26, 27, 28, 31, 419, 463]]).await? {
-        hulls.entry((int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0))).or_default().push(int(&r, 2).unwrap_or(0) as i32);
+    let mut types: Vec<_> = [25i64, 26, 27, 28, 31, 419, 463]
+        .into_iter()
+        .flat_map(|g| crate::sde::table("invTypes").find("groupID", g))
+        .filter(|t| t.int("marketGroupID").is_some() && t.int("raceID").is_some())
+        .collect();
+    types.sort_by_key(|t| t.int("typeID"));
+    for t in types {
+        let (Some(group), Some(race), Some(id)) = (t.int("groupID"), t.int("raceID"), t.int("typeID")) else { continue };
+        hulls.entry((group as i32, race)).or_default().push(id as i32);
     }
-    Ok(Sources { names, taken, faces, bloodlines, hulls })
+    Sources { names, taken, faces, bloodlines, hulls }
 }
 
 /// How likely a role is to live at a station, by where it is.
@@ -214,26 +216,23 @@ fn name(race: i64, s: &mut Sources, rng: &mut Rng) -> Option<String> {
 }
 
 /// Makes bots until there are `target`; returns how many there are.
-pub async fn ensure(db: &mut Client, atlas: &Atlas, target: usize) -> Result<usize, String> {
-    let fail = |what: &str, e: tokio_postgres::Error| format!("{what}: {}", crate::logging::chain(&e));
-    let have: i64 = db.query_one(r#"SELECT count(*) FROM "bots""#, &[]).await.map_err(|e| fail("counting bots", e))?.get(0);
-    let have = have as usize;
+pub async fn ensure(store: &Store, atlas: &Atlas, target: usize) -> Result<usize, String> {
+    let fail = |what: &str, e: StoreError| format!("{what}: {}", crate::logging::chain(&e));
+    let have = store.read(|db| db.table("bots").len());
     if have >= target {
         return Ok(have);
     }
-    let account: i32 = db
-        .query_one(
-            r#"WITH found AS (SELECT "accountID" FROM "account" WHERE "accountName" = $1),
-                    made AS (INSERT INTO "account" ("accountID", "accountName", "password", "role", "banned")
-                             SELECT nextval('"account_accountID_seq"'), $1, '', 0, 1
-                              WHERE NOT EXISTS (SELECT 1 FROM found) RETURNING "accountID")
-               SELECT "accountID" FROM found UNION ALL SELECT "accountID" FROM made"#,
-            &[&BOT_ACCOUNT],
-        )
-        .await
-        .map_err(|e| fail("the bot account", e))?
-        .get(0);
-    let mut src = sources(db).await.map_err(|e| fail("reading names, faces and hulls", e))?;
+    let account = store
+        .write(|tx| -> Result<i64, StoreError> {
+            let name = Value::Text(BOT_ACCOUNT.into());
+            if let Some(found) = tx.table("account").find_one(&["accountName"], std::slice::from_ref(&name)) {
+                return Ok(found.int("accountID").unwrap_or(0));
+            }
+            let row = tx.insert("account", &[("accountName", name), ("password", Value::Text("".into())), ("role", Value::Int(0)), ("banned", Value::Int(1))])?;
+            Ok(tx.table("account").row(row).and_then(|r| r.int("accountID")).unwrap_or(0))
+        })
+        .map_err(|e| fail("the bot account", e))?;
+    let mut src = store.read(sources);
     let stations: Vec<i32> = atlas.station_system.keys().copied().collect();
     let homes: Vec<(Role, Pick)> = ROLES.iter().map(|(role, _)| (*role, Pick::new(stations.iter().map(|s| (*s, home_weight(*role, atlas, *s)))))).collect();
     let roles = Pick::new(ROLES.iter().map(|(r, w)| (*r as i32, *w)));
@@ -256,7 +255,7 @@ pub async fn ensure(db: &mut Client, atlas: &Atlas, target: usize) -> Result<usi
             let share = rng.range(0.1, 0.5) as f32;
             batch.push(NewBot { name, bloodline: bloodline as i32, gender, face, home, ship, balance, security, role, share });
         }
-        insert(db, account, &batch).await.map_err(|e| fail("making bots", e))?;
+        store.write(|tx| insert(tx, account, &batch)).map_err(|e| fail("making bots", e))?;
         made += batch.len();
         info!("bots: made {} of {} ({:.0}/s)", have + made, target, made as f64 / started.elapsed().as_secs_f64().max(0.001));
     }
@@ -277,124 +276,180 @@ struct NewBot {
 }
 
 /// The appearance columns a bot copies from its face.
-const LOOKS: &str = r#""accessoryID","beardID","costumeID","decoID","eyebrowsID","eyesID","hairID","lipstickID","makeupID","skinID",
-    "backgroundID","lightID","headRotation1","headRotation2","headRotation3","eyeRotation1","eyeRotation2","eyeRotation3",
-    "camPos1","camPos2","camPos3","morph1e","morph1n","morph1s","morph1w","morph2e","morph2n","morph2s","morph2w",
-    "morph3e","morph3n","morph3s","morph3w","morph4e","morph4n","morph4s","morph4w""#;
+const LOOKS: [&str; 37] = [
+    "accessoryID", "beardID", "costumeID", "decoID", "eyebrowsID", "eyesID", "hairID", "lipstickID", "makeupID", "skinID",
+    "backgroundID", "lightID", "headRotation1", "headRotation2", "headRotation3", "eyeRotation1", "eyeRotation2", "eyeRotation3",
+    "camPos1", "camPos2", "camPos3", "morph1e", "morph1n", "morph1s", "morph1w", "morph2e", "morph2n", "morph2s", "morph2w",
+    "morph3e", "morph3n", "morph3s", "morph3w", "morph4e", "morph4n", "morph4s", "morph4w",
+];
 
-async fn insert(db: &mut Client, account: i32, batch: &[NewBot]) -> Result<(), tokio_postgres::Error> {
-    let tx = db.transaction().await?;
-    let ids: Vec<i32> = tx
-        .query("SELECT nextval('dyn_id_seq')::int FROM generate_series(1, $1)", &[&(2 * batch.len() as i32)])
-        .await?
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
+/// A batch of bots, in the caller's transaction: their characters (each
+/// with the face it copies, its bloodline's school corporation and race,
+/// at home), bodies, ships, names, roles and employment, and the bots' rows.
+fn insert(tx: &mut Tx<'_>, account: i64, batch: &[NewBot]) -> Result<(), StoreError> {
+    let mut ids = Vec::with_capacity(2 * batch.len());
+    for _ in 0..2 * batch.len() {
+        ids.push(tx.nextval("dyn_id_seq")?);
+    }
     let (chars, ships) = ids.split_at(batch.len());
-    let col = |f: fn(&NewBot) -> i32| batch.iter().map(f).collect::<Vec<i32>>();
-    let names: Vec<&str> = batch.iter().map(|b| b.name.as_str()).collect();
-    let (bloodline, face, home, ship_type) = (col(|b| b.bloodline), col(|b| b.face), col(|b| b.home), col(|b| b.ship));
-    let gender: Vec<i16> = batch.iter().map(|b| b.gender).collect();
-    let balance: Vec<f64> = batch.iter().map(|b| b.balance).collect();
-    let security: Vec<f64> = batch.iter().map(|b| b.security).collect();
-    let role: Vec<i16> = batch.iter().map(|b| b.role as i16).collect();
-    let share: Vec<f32> = batch.iter().map(|b| b.share).collect();
     let now = crate::bulkdata::filetime_now();
-    let new = r#"unnest($1::int[], $2::text[], $3::int[], $4::smallint[], $5::int[], $6::int[], $7::int[], $8::int[], $9::float8[], $10::float8[])
-                   AS u(id, name, bloodline, gender, face, home, ship, ship_type, balance, sec)"#;
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 10] =
-        [&chars, &names, &bloodline, &gender, &face, &home, &ships, &ship_type, &balance, &security];
-    let character = format!(
-        r#"INSERT INTO "character_" ("characterID","characterName","accountID","balance","securityRating","corporationID",
-                "corporationDateTime","startDateTime","createDateTime","typeID","raceID","bloodlineID","gender",{LOOKS},
-                "stationID","solarSystemID","constellationID","regionID","shipID")
-           SELECT u.id, u.name, {account}, u.balance, u.sec, b."corporationID", {now}, {now}, {now}, f."typeID", b."raceID",
-                  u.bloodline, u.gender, {face_looks}, s."stationID", s."solarSystemID", s."constellationID", s."regionID", u.ship
-             FROM {new}
-             JOIN "character_" f ON f."characterID" = u.face
-             JOIN "chrBloodlines" b ON b."bloodlineID" = u.bloodline
-             JOIN "staStations" s ON s."stationID" = u.home"#,
-        face_looks = LOOKS.split(',').map(|c| format!("f.{}", c.trim())).collect::<Vec<_>>().join(",")
-    );
-    tx.execute(character.as_str(), &params).await?;
-    let rest = format!(
-        r#"WITH u AS (SELECT * FROM {new}),
-                bodies AS (INSERT INTO entity ("itemID","itemName","typeID","ownerID","locationID","flag","contraband","singleton","quantity")
-                           SELECT u.id, u.name, c."typeID", u.id, u.home, 0, 0, 1, 1 FROM u JOIN "character_" c ON c."characterID" = u.id),
-                hulls AS (INSERT INTO entity ("itemID","itemName","typeID","ownerID","locationID","flag","contraband","singleton","quantity")
-                          SELECT u.ship, '', u.ship_type, u.id, u.home, 4, 0, 1, 1 FROM u),
-                names AS (INSERT INTO "eveNames" ("itemID","itemName","categoryID","groupID","typeID")
-                          SELECT u.id, u.name, 1, 1, c."typeID" FROM u JOIN "character_" c ON c."characterID" = u.id),
-                roles AS (INSERT INTO "chrCorporationRoles" ("characterID","corprole","rolesAtAll","rolesAtBase","rolesAtHQ","rolesAtOther")
-                          SELECT u.id, 0, 0, 0, 0, 0 FROM u),
-                jobs AS (INSERT INTO "chrEmployment" ("characterID","corporationID","startDate","deleted")
-                         SELECT u.id, c."corporationID", {now}, 0 FROM u JOIN "character_" c ON c."characterID" = u.id)
-           UPDATE "corporation" co SET "memberCount" = co."memberCount" + n.members
-             FROM (SELECT b."corporationID", count(*)::int AS members FROM u JOIN "chrBloodlines" b ON b."bloodlineID" = u.bloodline GROUP BY 1) n
-            WHERE co."corporationID" = n."corporationID""#
-    );
-    tx.execute(rest.as_str(), &params).await?;
-    tx.execute(
-        r#"INSERT INTO "bots" ("characterID","role","homeStationID","share") SELECT * FROM unnest($1::int[], $2::smallint[], $3::int[], $4::real[])"#,
-        &[&chars, &role, &home, &share],
-    )
-    .await?;
-    tx.commit().await
+    // chrBloodlines: each bloodline's school corporation and race.
+    let bloodlines: HashMap<i64, (Value, Value)> = crate::sde::table("chrBloodlines")
+        .rows()
+        .filter_map(|r| {
+            let to = |c: &str| r.int(c).map_or(Value::Null, Value::Int);
+            Some((r.int("bloodlineID")?, (to("corporationID"), to("raceID"))))
+        })
+        .collect();
+    let mut joined: HashMap<i64, i64> = HashMap::new();
+    for ((b, &id), &ship) in batch.iter().zip(chars).zip(ships) {
+        let bloodline = bloodlines.get(&i64::from(b.bloodline));
+        let face = tx.table("character_").get_id(i64::from(b.face)).map(|f| (f.value("typeID").clone(), LOOKS.map(|c| f.value(c).clone())));
+        let home = tx.table("staStations").get_id(i64::from(b.home)).map(|s| ["stationID", "solarSystemID", "constellationID", "regionID"].map(|c| s.value(c).clone()));
+        let name = Value::Text(b.name.as_str().into());
+        if let (Some((corp, race)), Some((type_id, looks)), Some(home)) = (bloodline, face, home) {
+            let mut row: Vec<(&str, Value)> = vec![
+                ("characterID", Value::Int(id)),
+                ("characterName", name.clone()),
+                ("accountID", Value::Int(account)),
+                ("balance", Value::Float(b.balance)),
+                ("securityRating", Value::Float(b.security)),
+                ("corporationID", corp.clone()),
+                ("corporationDateTime", Value::Int(now)),
+                ("startDateTime", Value::Int(now)),
+                ("createDateTime", Value::Int(now)),
+                ("typeID", type_id.clone()),
+                ("raceID", race.clone()),
+                ("bloodlineID", Value::Int(i64::from(b.bloodline))),
+                ("gender", Value::Int(i64::from(b.gender))),
+                ("shipID", Value::Int(ship)),
+            ];
+            row.extend(LOOKS.iter().copied().zip(looks));
+            row.extend(["stationID", "solarSystemID", "constellationID", "regionID"].into_iter().zip(home));
+            tx.insert("character_", &row)?;
+            tx.insert(
+                "entity",
+                &[
+                    ("itemID", Value::Int(id)),
+                    ("itemName", name.clone()),
+                    ("typeID", type_id.clone()),
+                    ("ownerID", Value::Int(id)),
+                    ("locationID", Value::Int(i64::from(b.home))),
+                    ("flag", Value::Int(0)),
+                    ("contraband", Value::Int(0)),
+                    ("singleton", Value::Int(1)),
+                    ("quantity", Value::Int(1)),
+                ],
+            )?;
+            tx.insert(
+                "eveNames",
+                &[("itemID", Value::Int(id)), ("itemName", name.clone()), ("categoryID", Value::Int(1)), ("groupID", Value::Int(1)), ("typeID", type_id)],
+            )?;
+            tx.insert(
+                "chrEmployment",
+                &[("characterID", Value::Int(id)), ("corporationID", corp.clone()), ("startDate", Value::Int(now)), ("deleted", Value::Int(0))],
+            )?;
+        }
+        // The ship and the roles come whether or not the character could
+        // be made, as the set-based inserts made them.
+        tx.insert(
+            "entity",
+            &[
+                ("itemID", Value::Int(ship)),
+                ("itemName", Value::Text("".into())),
+                ("typeID", Value::Int(i64::from(b.ship))),
+                ("ownerID", Value::Int(id)),
+                ("locationID", Value::Int(i64::from(b.home))),
+                ("flag", Value::Int(4)),
+                ("contraband", Value::Int(0)),
+                ("singleton", Value::Int(1)),
+                ("quantity", Value::Int(1)),
+            ],
+        )?;
+        tx.insert(
+            "chrCorporationRoles",
+            &[
+                ("characterID", Value::Int(id)),
+                ("corprole", Value::Int(0)),
+                ("rolesAtAll", Value::Int(0)),
+                ("rolesAtBase", Value::Int(0)),
+                ("rolesAtHQ", Value::Int(0)),
+                ("rolesAtOther", Value::Int(0)),
+            ],
+        )?;
+        if let Some(corp) = bloodline.and_then(|(corp, _)| corp.int()) {
+            *joined.entry(corp).or_default() += 1;
+        }
+    }
+    for (corp, n) in joined {
+        let Some(co) = tx.table("corporation").get_id(corp) else { continue };
+        let (row, members) = (co.id, co.int("memberCount").unwrap_or(0));
+        tx.update("corporation", row, &[("memberCount", Value::Int(members + n))])?;
+    }
+    for (b, &id) in batch.iter().zip(chars) {
+        tx.insert(
+            "bots",
+            &[
+                ("characterID", Value::Int(id)),
+                ("role", Value::Int(b.role as i64)),
+                ("homeStationID", Value::Int(i64::from(b.home))),
+                ("share", Value::Float(f64::from(b.share))),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 // ---- reading them back ---------------------------------------------------------------------
 
 /// Up to `limit` bots, each docked where it was (or at home, if it was in
 /// space when the server stopped), offline; with who each is.
-pub async fn load(db: &Client, atlas: &Atlas, limit: usize) -> Result<(Vec<Bot>, Vec<Identity>), tokio_postgres::Error> {
-    let sql = r#"SELECT b."characterID", b."role", b."homeStationID", b."share", c."stationID", c."balance",
-                        c."characterName", c."corporationID", c."securityRating", c."shipID", COALESCE(e."typeID", 0),
-                        b."turf", co."allianceID", b."tier"
-                   FROM "bots" b JOIN "character_" c ON c."characterID" = b."characterID"
-                   LEFT JOIN entity e ON e."itemID" = c."shipID"
-                   LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                  ORDER BY b."characterID" LIMIT $1"#;
-    let rows = db.query(sql, &[&(limit as i64)]).await?;
+pub fn load(db: &Db, atlas: &Atlas, limit: usize) -> (Vec<Bot>, Vec<Identity>) {
+    let (characters, entity, corps) = (db.table("character_"), db.table("entity"), db.table("corporation"));
+    let mut rows: Vec<(Row, Row)> = db.table("bots").rows().filter_map(|b| Some((b, characters.get_id(b.int("characterID")?)?))).collect();
+    rows.sort_by_key(|(b, _)| b.int("characterID"));
+    rows.truncate(limit);
     let ids = rows
         .iter()
-        .map(|r| Identity {
-            name: text(r, 6).unwrap_or_default(),
-            corp: int(r, 7).unwrap_or(0) as i32,
-            security: float(r, 8).unwrap_or(0.0) as f32,
-            ship: int(r, 9).unwrap_or(0),
-            hull: int(r, 10).unwrap_or(0),
-            alliance: int(r, 12).map(|a| a as i32).filter(|a| *a != 0),
+        .map(|(_, c)| Identity {
+            name: c.text("characterName").unwrap_or_default().to_string(),
+            corp: c.int("corporationID").unwrap_or(0) as i32,
+            security: c.float("securityRating").unwrap_or(0.0) as f32,
+            ship: c.int("shipID").unwrap_or(0),
+            hull: c.int("shipID").and_then(|s| entity.get_id(s)).and_then(|e| e.int("typeID")).unwrap_or(0),
+            alliance: c.int("corporationID").and_then(|co| corps.get_id(co)).and_then(|co| co.int("allianceID")).map(|a| a as i32).filter(|a| *a != 0),
         })
         .collect();
     let bots = rows
         .iter()
-        .map(|r| {
-            let home = int(r, 2).unwrap_or(0) as i32;
-            let station = int(r, 4).map(|s| s as i32).filter(|s| atlas.station_system.contains_key(s)).unwrap_or(home);
+        .map(|(b, c)| {
+            let home = b.int("homeStationID").unwrap_or(0) as i32;
+            let station = c.int("stationID").map(|s| s as i32).filter(|s| atlas.station_system.contains_key(s)).unwrap_or(home);
+            let hull = c.int("shipID").and_then(|s| entity.get_id(s)).and_then(|e| e.int("typeID")).unwrap_or(0);
             Bot {
-                id: int(r, 0).unwrap_or(0) as i32,
-                role: Role::from_i16(int(r, 1).unwrap_or(1) as i16),
+                id: b.int("characterID").unwrap_or(0) as i32,
+                role: Role::from_i16(b.int("role").unwrap_or(1) as i16),
                 home,
                 system: atlas.station_system.get(&station).copied().unwrap_or(0),
                 station,
                 online: false,
-                share: float(r, 3).unwrap_or(0.3) as f32,
+                share: b.float("share").unwrap_or(0.3) as f32,
                 session_end: 0,
                 activity: Activity::Docked,
                 route: Vec::new(),
                 dock_at: 0,
                 hold: Vec::new(),
-                isk: float(r, 5).unwrap_or(0.0),
-                isk_saved: float(r, 5).unwrap_or(0.0),
+                isk: c.float("balance").unwrap_or(0.0),
+                isk_saved: c.float("balance").unwrap_or(0.0),
                 earned: 0.0,
                 pod: None,
-                turf: int(r, 11).unwrap_or(0) as i32,
-                hull: int(r, 10).unwrap_or(0) as i32,
-                tier: int(r, 13).unwrap_or(0) as u8,
+                turf: b.int("turf").unwrap_or(0) as i32,
+                hull: hull as i32,
+                tier: b.int("tier").unwrap_or(0) as u8,
                 hull_lost: false,
-                prime: super::behaviour::prime_for(int(r, 0).unwrap_or(0) as i32),
+                prime: super::behaviour::prime_for(b.int("characterID").unwrap_or(0) as i32),
             }
         })
         .collect();
-    Ok((bots, ids))
+    (bots, ids)
 }

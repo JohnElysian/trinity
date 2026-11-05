@@ -6,7 +6,9 @@
 
 use eve_marshal::Value;
 
+use crate::sde;
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::Db;
 
 const TYPE_CORPORATION: i32 = 2;
 const TYPE_FACTION: i32 = 30;
@@ -22,55 +24,75 @@ pub async fn lookup_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "LookupOwners" => owners(ctx, &search, exact, false).await,
         "LookupPCOwners" | "LookupNoneNPCAccountOwners" => owners(ctx, &search, exact, true).await,
         "LookupCharacters" => {
-            let sql = r#"SELECT "characterName", "characterID", "typeID" FROM "character_"
-                          WHERE "accountID" IS NOT NULL AND {match}"#;
-            find(ctx, &["characterName", "characterID", "typeID"], sql, "characterName", &search, exact).await
+            let header = ["characterName", "characterID", "typeID"];
+            find(ctx, &header, &search, exact, |db, hit| {
+                db.table("character_")
+                    .rows()
+                    .filter(|r| !r.value("accountID").is_null() && hit(r.text("characterName")))
+                    .map(|r| r.line(&header))
+                    .collect()
+            })
+            .await
         }
         "LookupCorporations" => corporations(ctx, &search, exact, false).await,
         "LookupAlliances" | "LookupAllianceShortNames" => {
-            let sql = r#"SELECT "allianceName", "allianceID", 16159 AS "typeID", "shortName"
-                           FROM alliances WHERE deleted = 0 AND {match}"#;
             let column = if call.method == "LookupAlliances" { "allianceName" } else { "shortName" };
-            find(ctx, &["allianceName", "allianceID", "typeID", "shortName"], sql, column, &search, exact).await
+            find(ctx, &["allianceName", "allianceID", "typeID", "shortName"], &search, exact, |db, hit| {
+                db.table("alliances")
+                    .rows()
+                    .filter(|r| r.int("deleted") == Some(0) && hit(r.text(column)))
+                    .map(|r| vec![r.cell("allianceName"), r.cell("allianceID"), Value::Int(TYPE_ALLIANCE as i64), r.cell("shortName")])
+                    .collect()
+            })
+            .await
         }
         "LookupPlayerCorporations" => corporations(ctx, &search, exact, true).await,
         "LookupCorporationTickers" => {
-            let sql = r#"SELECT "corporationName", "corporationID", 2 AS "typeID", "tickerName"
-                           FROM "corporation" WHERE {match}"#;
-            find(ctx, &["corporationName", "corporationID", "typeID", "tickerName"], sql, "tickerName", &search, exact).await
+            find(ctx, &["corporationName", "corporationID", "typeID", "tickerName"], &search, exact, |db, hit| {
+                db.table("corporation")
+                    .rows()
+                    .filter(|r| hit(r.text("tickerName")))
+                    .map(|r| vec![r.cell("corporationName"), r.cell("corporationID"), Value::Int(TYPE_CORPORATION as i64), r.cell("tickerName")])
+                    .collect()
+            })
+            .await
         }
         "LookupCorporationsOrAlliances" => {
-            let sql = format!(
-                r#"SELECT * FROM (
-                       SELECT "corporationName" AS "ownerName", "corporationID" AS "ownerID",
-                              {TYPE_CORPORATION} AS "typeID" FROM "corporation"
-                       UNION ALL
-                       SELECT "allianceName", "allianceID", {TYPE_ALLIANCE} FROM "alliances") o
-                    WHERE {{match}}"#
-            );
-            find(ctx, &["ownerName", "ownerID", "typeID"], &sql, "ownerName", &search, exact).await
+            find(ctx, &["ownerName", "ownerID", "typeID"], &search, exact, |db, hit| {
+                let corporations = db.table("corporation").rows().map(|r| (r, "corporationName", "corporationID", TYPE_CORPORATION));
+                let alliances = db.table("alliances").rows().map(|r| (r, "allianceName", "allianceID", TYPE_ALLIANCE));
+                corporations
+                    .chain(alliances)
+                    .filter(|(r, name, ..)| hit(r.text(name)))
+                    .map(|(r, name, id, type_id)| vec![r.cell(name), r.cell(id), Value::Int(type_id as i64)])
+                    .collect()
+            })
+            .await
         }
         "LookupStations" => {
-            let sql = r#"SELECT "stationName", "stationID", "stationTypeID" AS "typeID"
-                           FROM "staStations" WHERE {match}"#;
-            find(ctx, &["stationName", "stationID", "typeID"], sql, "stationName", &search, exact).await
+            find(ctx, &["stationName", "stationID", "typeID"], &search, exact, |db, hit| {
+                db.table("staStations")
+                    .rows()
+                    .filter(|r| hit(r.text("stationName")))
+                    .map(|r| r.line(&["stationName", "stationID", "stationTypeID"]))
+                    .collect()
+            })
+            .await
         }
-        "LookupFactions" => {
-            let sql = format!(
-                r#"SELECT "factionName", "factionID", {TYPE_FACTION} AS "typeID"
-                     FROM "chrFactions" WHERE {{match}}"#
-            );
-            find(ctx, &["factionName", "factionID", "typeID"], &sql, "factionName", &search, exact).await
-        }
+        "LookupFactions" => factions(&search, exact),
         "LookupLocationsByGroup" => {
             // (groupID, searchStr): the arguments are the other way round here.
             let group = call.arg_i64(0).and_then(|g| i32::try_from(g).ok()).unwrap_or(0);
             let search = call.arg_text(1).unwrap_or_default();
-            let sql = format!(
-                r#"SELECT "itemName", "itemID", "typeID" FROM "mapDenormalize"
-                    WHERE "groupID" = {group} AND {{match}}"#
-            );
-            find(ctx, &["itemName", "itemID", "typeID"], &sql, "itemName", &search, false).await
+            let header = ["itemName", "itemID", "typeID"];
+            find(ctx, &header, &search, false, |db, hit| {
+                db.table("mapDenormalize")
+                    .rows()
+                    .filter(|r| r.int("groupID") == Some(i64::from(group)) && hit(r.text("itemName")))
+                    .map(|r| r.line(&header))
+                    .collect()
+            })
+            .await
         }
         _ => return None,
     };
@@ -78,55 +100,92 @@ pub async fn lookup_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 }
 
 async fn owners(ctx: &Ctx<'_>, search: &str, exact: bool, players_only: bool) -> Value {
-    let filter = if players_only { format!(r#""ownerID" >= {FIRST_PLAYER_ID} AND "#) } else { String::new() };
-    let sql = format!(
-        r#"SELECT "ownerName", "ownerID", "typeID" FROM "eveStaticOwners" WHERE {filter}{{match}}"#
-    );
-    find(ctx, &["ownerName", "ownerID", "typeID"], &sql, "ownerName", search, exact).await
+    let header = ["ownerName", "ownerID", "typeID"];
+    find(ctx, &header, search, exact, |db, hit| {
+        db.table("eveStaticOwners")
+            .rows()
+            .filter(|r| (!players_only || r.int("ownerID").is_some_and(|id| id >= FIRST_PLAYER_ID as i64)) && hit(r.text("ownerName")))
+            .map(|r| r.line(&header))
+            .collect()
+    })
+    .await
 }
 
 async fn corporations(ctx: &Ctx<'_>, search: &str, exact: bool, players_only: bool) -> Value {
-    let filter = if players_only { format!(r#""corporationID" >= {FIRST_PLAYER_ID} AND "#) } else { String::new() };
-    let sql = format!(
-        r#"SELECT "corporationName", "corporationID", {TYPE_CORPORATION} AS "typeID"
-             FROM "corporation" WHERE {filter}{{match}}"#
-    );
-    find(ctx, &["corporationName", "corporationID", "typeID"], &sql, "corporationName", search, exact).await
+    find(ctx, &["corporationName", "corporationID", "typeID"], search, exact, |db, hit| {
+        db.table("corporation")
+            .rows()
+            .filter(|r| (!players_only || r.int("corporationID").is_some_and(|id| id >= FIRST_PLAYER_ID as i64)) && hit(r.text("corporationName")))
+            .map(|r| vec![r.cell("corporationName"), r.cell("corporationID"), Value::Int(TYPE_CORPORATION as i64)])
+            .collect()
+    })
+    .await
 }
 
-/// Runs `sql` with `{match}` replaced by a case-insensitive test of `column`
-/// against `search`: equality when `exact`, otherwise "contains".
+/// The factions, which are static data, matched as `find` matches.
+fn factions(search: &str, exact: bool) -> Value {
+    const HEADER: &[&str] = &["factionName", "factionID", "typeID"];
+    if search.is_empty() {
+        return crate::svc::rows::rowset(HEADER, Vec::new());
+    }
+    let mut found: Vec<sde::Row> =
+        sde::table("chrFactions").rows().filter(|r| r.text("factionName").is_some_and(|name| matches(name, search, exact))).collect();
+    found.sort_by_key(|r| r.text("factionName"));
+    found.truncate(MAX_RESULTS as usize);
+    let lines = found
+        .iter()
+        .map(|r| {
+            let mut line = r.line(&["factionName", "factionID"]);
+            line.push(Value::Int(TYPE_FACTION as i64));
+            Value::List(line)
+        })
+        .collect();
+    crate::svc::rows::rowset(HEADER, lines)
+}
+
+/// Whether `text` matches `search` case-insensitively: equality when
+/// `exact`, otherwise "contains". Letters fold as the database's lower() and
+/// ILIKE folded them (ASCII only: its locale was C), and the search is
+/// literal text, wildcards and all.
+fn matches(text: &str, search: &str, exact: bool) -> bool {
+    let text = text.to_ascii_lowercase();
+    let search = search.to_ascii_lowercase();
+    if exact { text == search } else { text.contains(&search) }
+}
+
+/// The lines `rows` gives for the rows whose searched column (a NULL never
+/// matches) passes `hit`: the first [`MAX_RESULTS`] in the order of their
+/// first column, the name.
 async fn find(
     ctx: &Ctx<'_>,
     header: &[&str],
-    sql: &str,
-    column: &str,
     search: &str,
     exact: bool,
+    rows: impl FnOnce(&Db, &dyn Fn(Option<&str>) -> bool) -> Vec<Vec<Value>>,
 ) -> Value {
     if search.is_empty() {
         return crate::svc::rows::rowset(header, Vec::new());
     }
-    let test = if exact {
-        format!(r#"lower("{column}") = lower($1)"#)
-    } else {
-        format!(r#""{column}" ILIKE '%' || $1 || '%' ESCAPE '\'"#)
-    };
-    let sql = format!("{} ORDER BY 1 LIMIT {MAX_RESULTS}", sql.replace("{match}", &test));
-    let pattern = if exact { search.to_string() } else { escape_like(search) };
-    ctx.rowset(header, &sql, &[&pattern]).await
-}
-
-fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    let hit = |text: Option<&str>| text.is_some_and(|t| matches(t, search, exact));
+    let lines = ctx.store.read(|db| {
+        let mut found: Vec<(Option<String>, Vec<Value>)> = rows(db, &hit).into_iter().map(|line| (line[0].as_string(), line)).collect();
+        // ORDER BY sorts NULLs last.
+        found.sort_by(|(a, _), (b, _)| (a.is_none(), a).cmp(&(b.is_none(), b)));
+        found.into_iter().take(MAX_RESULTS as usize).map(|(_, line)| Value::List(line)).collect()
+    });
+    crate::svc::rows::rowset(header, lines)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::escape_like;
+    use super::matches;
 
     #[test]
     fn like_wildcards_in_the_search_are_literal() {
-        assert_eq!(escape_like("50%_off\\"), "50\\%\\_off\\\\");
+        assert!(matches("Save 50%_off\\ today", "50%_OFF\\", false));
+        assert!(!matches("Save 50 percent off", "50%_off", false));
+        assert!(!matches("Save 50xxoff", "50%_off", false));
+        assert!(matches("Amarr Empire", "amarr empire", true));
+        assert!(!matches("Amarr Empire", "amarr", true));
     }
 }

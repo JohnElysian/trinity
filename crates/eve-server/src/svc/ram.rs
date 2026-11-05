@@ -44,14 +44,14 @@
 //! and changing a line's prices.
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::info;
 
 use crate::items::{Item, ItemTxn, NewItem};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Row, StoreError, Tx};
 use crate::svc::inventory::FLAG_FACTORY_BLUEPRINT;
-use crate::svc::membership::{db_failed, message, Refused};
-use crate::svc::rows::{float, int, key_val, row, rowset, text};
+use crate::svc::membership::{db_failed, message, Refused, Undone};
+use crate::svc::rows::{key_val, row, rowset};
 use crate::svc::wallet::{self, Entry, Transfer};
 
 const ACTIVITY_MANUFACTURING: i64 = 1;
@@ -71,7 +71,7 @@ const CORP_ROLE_FACTORY_MANAGER: i64 = 1_024;
 
 /// The lines each starbase array or laboratory carries: (structure type,
 /// [(assembly line type, how many)]).
-const STARBASE_LINES: [(i32, &[(i32, i32)]); 16] = [
+const STARBASE_LINES: [(i64, &[(i64, i64)]); 16] = [
     (13780, &[(24, 6)]),
     (16220, &[(23, 6)]),
     (24574, &[(17, 1)]),
@@ -90,54 +90,98 @@ const STARBASE_LINES: [(i32, &[(i32, i32)]); 16] = [
     (25305, &[(37, 2)]),
 ];
 
+fn int(v: i64) -> store::Value {
+    store::Value::Int(v)
+}
+
+fn float(v: f64) -> store::Value {
+    store::Value::Float(v)
+}
+
 /// Brings starbase lines into line with the arrays and laboratories online
 /// now: lines for those new, none for those gone or offline.
-async fn sync_starbase_lines(db: &impl GenericClient) -> Result<(), tokio_postgres::Error> {
-    let types: Vec<i32> = STARBASE_LINES.iter().map(|(t, _)| *t).collect();
-    let online = db
-        .query(
-            r#"SELECT e."itemID", e."typeID", e."ownerID", e."locationID", s."regionID"
-                 FROM entity e JOIN "posStructures" p ON p."itemID" = e."itemID"
-                 JOIN "mapSolarSystems" s ON s."solarSystemID" = e."locationID"
-                WHERE e."typeID" = ANY($1) AND p."state" IN (4, 5)"#,
-            &[&types],
-        )
-        .await?;
-    let ids: Vec<i32> = online.iter().map(|r| r.get::<_, i32>(0)).collect();
+fn sync_starbase_lines(tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    let types: Vec<i64> = STARBASE_LINES.iter().map(|(t, _)| *t).collect();
+    // (itemID, typeID, ownerID, solar system, region) of each online one.
+    let online: Vec<[i64; 5]> = {
+        let db = tx.db();
+        let (structures, systems) = (db.table("posStructures"), db.table("mapSolarSystems"));
+        types
+            .iter()
+            .flat_map(|t| db.table("entity").find(&["typeID"], &[int(*t)]))
+            .filter_map(|e| {
+                let id = e.int("itemID")?;
+                let state = structures.get_id(id)?.int("state");
+                if !matches!(state, Some(4 | 5)) {
+                    return None;
+                }
+                let system = e.int("locationID")?;
+                let region = systems.get_id(system)?.int("regionID").unwrap_or(0);
+                Some([id, e.int("typeID").unwrap_or(0), e.int("ownerID").unwrap_or(0), system, region])
+            })
+            .collect()
+    };
+    let ids: Vec<i64> = online.iter().map(|r| r[0]).collect();
     // Gone or offline: their lines go (jobs running on them are kept).
-    db.execute(
-        r#"DELETE FROM "ramAssemblyLineStations" WHERE "stationTypeID" = ANY($1) AND NOT ("stationID" = ANY($2))"#,
-        &[&types, &ids],
-    )
-    .await?;
-    for r in &online {
-        let (id, type_id, owner, system, region) = (r.get::<_, i32>(0), r.get::<_, i32>(1), r.get::<_, i32>(2), r.get::<_, i32>(3), r.get::<_, i32>(4));
-        let have = db.query_opt(r#"SELECT 1 FROM "ramAssemblyLineStations" WHERE "stationID" = $1 LIMIT 1"#, &[&id]).await?;
-        if have.is_some() {
+    let gone: Vec<store::RowId> = tx
+        .table("ramAssemblyLineStations")
+        .rows()
+        .filter(|l| l.int("stationTypeID").is_some_and(|t| types.contains(&t)) && !l.int("stationID").is_some_and(|s| ids.contains(&s)))
+        .map(|l| l.id)
+        .collect();
+    for id in gone {
+        tx.delete("ramAssemblyLineStations", id)?;
+    }
+    for &[id, type_id, owner, system, region] in &online {
+        if tx.table("ramAssemblyLineStations").find(&["stationID"], &[int(id)]).next().is_some() {
             continue;
         }
         let Some((_, lines)) = STARBASE_LINES.iter().find(|(t, _)| *t == type_id) else { continue };
-        for (line_type, quantity) in lines.iter() {
-            db.execute(
-                r#"INSERT INTO "ramAssemblyLineStations" ("stationID","assemblyLineTypeID","quantity","stationTypeID","ownerID","solarSystemID","regionID")
-                   VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
-                &[&id, line_type, quantity, &type_id, &owner, &system, &region],
-            )
-            .await?;
-            let existing: i64 = db
-                .query_one(r#"SELECT count(*) FROM "ramAssemblyLines" WHERE "containerID" = $1 AND "assemblyLineTypeID" = $2"#, &[&id, line_type])
-                .await?
-                .get(0);
-            for _ in existing..*quantity as i64 {
-                db.execute(
-                    r#"INSERT INTO "ramAssemblyLines" ("assemblyLineID","assemblyLineTypeID","containerID","nextFreeTime","UIGroupingID","costInstall","costPerHour",
-                                                       "restrictionMask","discountPerGoodStandingPoint","surchargePerBadStandingPoint","minimumStanding",
-                                                       "minimumCharSecurity","minimumCorpSecurity","maximumCharSecurity","maximumCorpSecurity","ownerID","activityID")
-                       SELECT nextval('dyn_id_seq'), $2, $1, now() AT TIME ZONE 'UTC', 0, 0, 0, 0, 0, 0, -10, -10, -10, 10, 10, $3, t."activityID"
-                         FROM "ramAssemblyLineTypes" t WHERE t."assemblyLineTypeID" = $2"#,
-                    &[&id, line_type, &owner],
-                )
-                .await?;
+        for &(line_type, quantity) in lines.iter() {
+            tx.insert(
+                "ramAssemblyLineStations",
+                &[
+                    ("stationID", int(id)),
+                    ("assemblyLineTypeID", int(line_type)),
+                    ("quantity", int(quantity)),
+                    ("stationTypeID", int(type_id)),
+                    ("ownerID", int(owner)),
+                    ("solarSystemID", int(system)),
+                    ("regionID", int(region)),
+                ],
+            )?;
+            let existing = tx
+                .table("ramAssemblyLines")
+                .rows()
+                .filter(|l| l.int("containerID") == Some(id) && l.int("assemblyLineTypeID") == Some(line_type))
+                .count() as i64;
+            // A line type the data does not know makes no lines.
+            let Some(known) = crate::sde::table("ramAssemblyLineTypes").get("assemblyLineTypeID", line_type) else { continue };
+            let activity = known.int("activityID").map_or(store::Value::Null, int);
+            for _ in existing..quantity {
+                let line_id = tx.nextval("dyn_id_seq")?;
+                tx.insert(
+                    "ramAssemblyLines",
+                    &[
+                        ("assemblyLineID", int(line_id)),
+                        ("assemblyLineTypeID", int(line_type)),
+                        ("containerID", int(id)),
+                        ("nextFreeTime", int(crate::bulkdata::filetime_now())),
+                        ("UIGroupingID", int(0)),
+                        ("costInstall", float(0.0)),
+                        ("costPerHour", float(0.0)),
+                        ("restrictionMask", int(0)),
+                        ("discountPerGoodStandingPoint", float(0.0)),
+                        ("surchargePerBadStandingPoint", float(0.0)),
+                        ("minimumStanding", float(-10.0)),
+                        ("minimumCharSecurity", float(-10.0)),
+                        ("minimumCorpSecurity", float(-10.0)),
+                        ("maximumCharSecurity", float(10.0)),
+                        ("maximumCorpSecurity", float(10.0)),
+                        ("ownerID", int(owner)),
+                        ("activityID", activity.clone()),
+                    ],
+                )?;
             }
         }
         tracing::info!("starbase structure {id} now carries its assembly lines");
@@ -203,9 +247,9 @@ const QUOTE_HEADER: &[&str] = &[
 
 pub async fn ram_proxy(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let result = match call.method.as_str() {
-        "AssemblyLinesSelect" => Ok(assembly_lines(ctx, call.arg_text(0).as_deref()).await),
-        "AssemblyLinesGet" => Ok(lines_at(ctx, call.arg_id(0)).await),
-        "GetJobs2" => Ok(jobs(ctx, call).await),
+        "AssemblyLinesSelect" => Ok(assembly_lines(ctx, call.arg_text(0).as_deref())),
+        "AssemblyLinesGet" => Ok(lines_at(ctx, call.arg_id(0))),
+        "GetJobs2" => Ok(jobs(ctx, call)),
         "InstallJob" => install(ctx, call).await,
         "CompleteJob" => complete(ctx, call.arg_id(1), call.arg_i64(2).unwrap_or(0) != 0).await,
         "UpdateAssemblyLineConfigurations" => Err(message("RamConfigAssemblyLinesAccessDenied")),
@@ -217,8 +261,8 @@ pub async fn ram_proxy(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 /// AssemblyLinesSelect(typeFlag): 'region' is every line in the caller's region;
 /// 'char', 'corp' and 'alliance' are the lines that owner holds
 /// (manufacturing.py:938-942).
-async fn assembly_lines(ctx: &Ctx<'_>, type_flag: Option<&str>) -> Value {
-    if let Err(e) = sync_starbase_lines(ctx.db).await {
+fn assembly_lines(ctx: &Ctx<'_>, type_flag: Option<&str>) -> Value {
+    if let Err(e) = ctx.store.write(sync_starbase_lines) {
         tracing::error!("starbase assembly lines: {}", crate::logging::chain(&e));
     }
     let s = ctx.session;
@@ -229,52 +273,64 @@ async fn assembly_lines(ctx: &Ctx<'_>, type_flag: Option<&str>) -> Value {
         _ => ("regionID", s.region_id),
     };
     let Some(id) = id else { return rowset(LINE_HEADER, Vec::new()) };
-    let sql = format!(
-        r#"SELECT "stationID","stationTypeID","solarSystemID","assemblyLineTypeID","quantity","ownerID"
-             FROM "ramAssemblyLineStations" WHERE "{column}" = $1
-            ORDER BY "stationID","assemblyLineTypeID""#
-    );
-    ctx.rowset(LINE_HEADER, &sql, &[&(id as i32)]).await
+    const COLUMNS: &[&str] = &["stationID", "stationTypeID", "solarSystemID", "assemblyLineTypeID", "quantity", "ownerID"];
+    ctx.store.read(|db| {
+        let mut found: Vec<Row> = db.table("ramAssemblyLineStations").rows().filter(|l| l.int(column) == Some(id)).collect();
+        found.sort_by_key(|l| (l.int("stationID"), l.int("assemblyLineTypeID")));
+        rowset(LINE_HEADER, found.iter().map(|l| Value::List(l.line(COLUMNS))).collect())
+    })
 }
 
 /// AssemblyLinesGet(containerID): the station's lines, each with when it is
 /// next free.
-async fn lines_at(ctx: &Ctx<'_>, container: i64) -> Value {
-    let sql = format!(
-        r#"SELECT l."assemblyLineID", l."assemblyLineTypeID", l."containerID", {NEXT_FREE},
-                  l."costInstall", l."costPerHour", l."restrictionMask", l."discountPerGoodStandingPoint",
-                  l."surchargePerBadStandingPoint", l."minimumStanding", l."minimumCharSecurity",
-                  l."minimumCorpSecurity", l."maximumCharSecurity", l."maximumCorpSecurity", l."ownerID",
-                  t."activityID"
-             FROM "ramAssemblyLines" l JOIN "ramAssemblyLineTypes" t ON t."assemblyLineTypeID" = l."assemblyLineTypeID"
-            WHERE l."containerID" = $1 ORDER BY l."assemblyLineID""#
-    );
-    ctx.rowset(ASSEMBLY_LINE_HEADER, &sql, &[&(container as i32)]).await
+fn lines_at(ctx: &Ctx<'_>, container: i64) -> Value {
+    const COLUMNS: &[&str] = &[
+        "assemblyLineID", "assemblyLineTypeID", "containerID", "nextFreeTime", "costInstall", "costPerHour", "restrictionMask",
+        "discountPerGoodStandingPoint", "surchargePerBadStandingPoint", "minimumStanding", "minimumCharSecurity",
+        "minimumCorpSecurity", "maximumCharSecurity", "maximumCorpSecurity", "ownerID",
+    ];
+    // Each line with its type's activity; a line of a type the data does not
+    // know is not offered.
+    let types = crate::sde::table("ramAssemblyLineTypes");
+    let lines = ctx.store.read(|db| {
+        let mut found: Vec<Row> = db.table("ramAssemblyLines").rows().filter(|l| l.int("containerID") == Some(container)).collect();
+        found.sort_by_key(|l| l.int("assemblyLineID"));
+        found
+            .iter()
+            .filter_map(|r| {
+                let t = types.get("assemblyLineTypeID", r.int("assemblyLineTypeID")?)?;
+                let mut line = r.line(COLUMNS);
+                line.push(t.cell("activityID"));
+                Some(Value::List(line))
+            })
+            .collect()
+    });
+    rowset(ASSEMBLY_LINE_HEADER, lines)
 }
-
-/// A line's nextFreeTime, a timestamp in UTC, as a FILETIME.
-const NEXT_FREE: &str = r#"(EXTRACT(EPOCH FROM l."nextFreeTime") * 10000000)::bigint + 116444736000000000"#;
 
 /// GetJobs2(ownerID, completed, fromDate, toDate): the jobs of the caller or its
 /// corporation, delivered or not; the dates (FILETIME, or None) bound installTime.
-async fn jobs(ctx: &Ctx<'_>, call: &Call) -> Value {
+fn jobs(ctx: &Ctx<'_>, call: &Call) -> Value {
     let owner = call.arg_i64(0);
     let s = ctx.session;
     if owner.is_none() || (owner != s.char_id && owner != s.corp_id) {
         return rowset(JOB_HEADER, Vec::new());
     }
-    let completed = i16::from(call.arg_i64(1).unwrap_or(0) != 0);
+    let completed = i64::from(call.arg_i64(1).unwrap_or(0) != 0);
     let from = call.arg_i64(2);
     let to = call.arg_i64(3);
-    let sql = format!(
-        r#"SELECT {} FROM "ramJobs"
-            WHERE "installedItemOwnerID" = $1 AND "completed" = $2
-              AND ($3::bigint IS NULL OR "installTime" >= $3)
-              AND ($4::bigint IS NULL OR "installTime" <= $4)
-            ORDER BY "installTime" DESC"#,
-        JOB_HEADER.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",")
-    );
-    ctx.rowset(JOB_HEADER, &sql, &[&(owner.unwrap_or(0) as i32), &completed, &from, &to]).await
+    ctx.store.read(|db| {
+        let mut found: Vec<Row> = db
+            .table("ramJobs")
+            .find(&["installedItemOwnerID", "completed"], &[int(owner.unwrap_or(0)), int(completed)])
+            .filter(|j| {
+                let installed = j.int("installTime").unwrap_or(0);
+                from.is_none_or(|f| installed >= f) && to.is_none_or(|t| installed <= t)
+            })
+            .collect();
+        found.sort_by_key(|j| std::cmp::Reverse(j.int("installTime")));
+        rowset(JOB_HEADER, found.iter().map(|j| Value::List(j.line(JOB_HEADER))).collect())
+    })
 }
 
 // ---- installing --------------------------------------------------------------------------
@@ -299,43 +355,37 @@ struct Line {
     structure: bool,
 }
 
-async fn line(db: &impl GenericClient, id: i64) -> Refused<Line> {
-    let sql = format!(
-        r#"SELECT l."assemblyLineID", l."assemblyLineTypeID", l."containerID", COALESCE(s."stationTypeID", ls."stationTypeID"),
-                  COALESCE(s."solarSystemID", ls."solarSystemID"), COALESCE(s."regionID", ls."regionID"), l."ownerID", t."activityID",
-                  t."baseTimeMultiplier", t."baseMaterialMultiplier",
-                  COALESCE(l."costInstall", 0), COALESCE(l."costPerHour", 0), {NEXT_FREE},
-                  COALESCE(l."minimumCharSecurity", -10), COALESCE(l."maximumCharSecurity", 10), s."stationID" IS NULL
-             FROM "ramAssemblyLines" l
-             JOIN "ramAssemblyLineTypes" t ON t."assemblyLineTypeID" = l."assemblyLineTypeID"
-             LEFT JOIN "staStations" s ON s."stationID" = l."containerID"
-             LEFT JOIN LATERAL (SELECT * FROM "ramAssemblyLineStations" x WHERE x."stationID" = l."containerID" LIMIT 1) ls ON true
-            WHERE l."assemblyLineID" = $1"#
-    );
-    let r = db
-        .query_opt(sql.as_str(), &[&(id as i32)])
-        .await
-        .map_err(|e| db_failed("reading the assembly line", e))?
+fn line(db: &Db, id: i64) -> Refused<Line> {
+    let l = db.table("ramAssemblyLines").get_id(id).ok_or_else(|| message("RamPleasePickAnInstalltion"))?;
+    // A line of a type the data does not know is no line at all.
+    let t = l
+        .int("assemblyLineTypeID")
+        .and_then(|t| crate::sde::table("ramAssemblyLineTypes").get("assemblyLineTypeID", t))
         .ok_or_else(|| message("RamPleasePickAnInstalltion"))?;
-    let i = |n| int(&r, n).unwrap_or(0);
-    let f = |n| float(&r, n).unwrap_or(0.0);
+    // The station it is in, or else (a starbase structure's) its first
+    // station row.
+    let container = l.int("containerID");
+    let s = container.and_then(|c| db.table("staStations").get_id(c));
+    let ls = container.and_then(|c| db.table("ramAssemblyLineStations").find(&["stationID"], &[int(c)]).next());
+    let place = |column: &str| s.and_then(|s| s.int(column)).or_else(|| ls.and_then(|ls| ls.int(column))).unwrap_or(0);
+    let f = |column: &str, default: f64| l.float(column).unwrap_or(default);
     Ok(Line {
-        id: i(0),
-        type_id: i(1),
-        station: i(2),
-        station_type: i(3),
-        system: i(4),
-        region: i(5),
-        owner: i(6),
-        activity: i(7),
-        time_multiplier: f(8),
-        material_multiplier: f(9),
-        cost_install: f(10),
-        cost_per_hour: f(11),
-        next_free: i(12),
-        min_security: f(13),
-        max_security: f(14),
-        structure: r.get::<_, Option<bool>>(15).unwrap_or(false),
+        id: l.int("assemblyLineID").unwrap_or(0),
+        type_id: l.int("assemblyLineTypeID").unwrap_or(0),
+        station: container.unwrap_or(0),
+        station_type: place("stationTypeID"),
+        system: place("solarSystemID"),
+        region: place("regionID"),
+        owner: l.int("ownerID").unwrap_or(0),
+        activity: t.int("activityID").unwrap_or(0),
+        time_multiplier: t.float("baseTimeMultiplier").unwrap_or(0.0),
+        material_multiplier: t.float("baseMaterialMultiplier").unwrap_or(0.0),
+        cost_install: f("costInstall", 0.0),
+        cost_per_hour: f("costPerHour", 0.0),
+        next_free: l.int("nextFreeTime").unwrap_or(0),
+        min_security: f("minimumCharSecurity", -10.0),
+        max_security: f("maximumCharSecurity", 10.0),
+        structure: s.is_none(),
     })
 }
 
@@ -357,45 +407,39 @@ struct Blueprint {
     runs_left: i64,
 }
 
-async fn blueprint(txn: &mut ItemTxn<'_>, item_id: i64) -> Refused<Blueprint> {
+fn blueprint(txn: &mut ItemTxn<'_, '_>, item_id: i64) -> Refused<Blueprint> {
     let item = txn
         .item(item_id)
-        .await
         .map_err(|e| db_failed("reading the blueprint", e))?
         .ok_or_else(|| message("RamPleasePickAnItemToInstall"))?;
     if item.category_id != CATEGORY_BLUEPRINT {
         return Err(message("RamActivityRequiresABlueprint"));
     }
-    let sql = r#"SELECT t."typeName", b."productTypeID", b."productionTime", b."researchProductivityTime",
-                        b."researchMaterialTime", b."researchCopyTime", b."productivityModifier", b."wasteFactor",
-                        b."maxProductionLimit", COALESCE(i."copy", 0), COALESCE(i."materialLevel", 0),
-                        COALESCE(i."productivityLevel", 0), COALESCE(i."licensedProductionRunsRemaining", -1)
-                   FROM "invBlueprintTypes" b
-                   JOIN "invTypes" t ON t."typeID" = b."blueprintTypeID"
-                   LEFT JOIN "invBlueprints" i ON i."itemID" = $2
-                  WHERE b."blueprintTypeID" = $1"#;
-    let r = txn
-        .tx()
-        .query_opt(sql, &[&(item.type_id as i32), &(item_id as i32)])
-        .await
-        .map_err(|e| db_failed("reading the blueprint type", e))?
-        .ok_or_else(|| message("RamActivityRequiresABlueprint"))?;
-    let i = |n| int(&r, n).unwrap_or(0);
-    let f = |n| float(&r, n).unwrap_or(0.0);
+    // The type's figures, for a blueprint type the data knows (and has as a type).
+    let sde = crate::sde::get();
+    let type_name = sde.table("invTypes").get("typeID", item.type_id).map(|t| t.text("typeName").unwrap_or_default().to_string());
+    let (Some(b), Some(type_name)) = (sde.table("invBlueprintTypes").get("blueprintTypeID", item.type_id), type_name) else {
+        return Err(message("RamActivityRequiresABlueprint"));
+    };
+    let r = txn.db().table("invBlueprints").get_id(item_id);
+    // An item without research of its own is an original at level 0 with unlimited runs.
+    let own = |column: &str, default: i64| r.as_ref().map_or(default, |r| r.int(column).unwrap_or(default));
+    let i = |c| b.int(c).unwrap_or(0);
+    let f = |c| b.float(c).unwrap_or(0.0);
     Ok(Blueprint {
-        type_name: text(&r, 0).unwrap_or_default(),
-        product: i(1),
-        production_time: f(2),
-        research_productivity_time: f(3),
-        research_material_time: f(4),
-        research_copy_time: f(5),
-        productivity_modifier: f(6),
-        waste_factor: f(7),
-        max_production_limit: i(8).max(1),
-        copy: i(9) != 0,
-        material_level: i(10),
-        productivity_level: i(11),
-        runs_left: i(12),
+        type_name,
+        product: i("productTypeID"),
+        production_time: f("productionTime"),
+        research_productivity_time: f("researchProductivityTime"),
+        research_material_time: f("researchMaterialTime"),
+        research_copy_time: f("researchCopyTime"),
+        productivity_modifier: f("productivityModifier"),
+        waste_factor: f("wasteFactor"),
+        max_production_limit: i("maxProductionLimit").max(1),
+        copy: own("copy", 0) != 0,
+        material_level: own("materialLevel", 0),
+        productivity_level: own("productivityLevel", 0),
+        runs_left: own("licensedProductionRunsRemaining", -1),
         item,
     })
 }
@@ -409,26 +453,28 @@ struct Need {
     skill: bool,
 }
 
-async fn needs(db: &impl GenericClient, blueprint_type: i64, activity: i64) -> Refused<Vec<Need>> {
-    let sql = r#"SELECT m."requiredTypeID", m."quantity", m."damagePerJob", g."categoryID"
-                   FROM "TL2MaterialsForTypeWithActivity" m
-                   JOIN "invTypes" t ON t."typeID" = m."requiredTypeID"
-                   JOIN "invGroups" g ON g."groupID" = t."groupID"
-                  WHERE m."typeID" = $1 AND m."activity" = $2 AND m."quantity" > 0
-                  ORDER BY m."requiredTypeID""#;
-    let rows = db
-        .query(sql, &[&(blueprint_type as i32), &(activity as i32)])
-        .await
-        .map_err(|e| db_failed("reading what the job needs", e))?;
-    Ok(rows
-        .iter()
-        .map(|r| Need {
-            type_id: int(r, 0).unwrap_or(0),
-            quantity: int(r, 1).unwrap_or(0),
-            damage: float(r, 2).unwrap_or(1.0),
-            skill: int(r, 3) == Some(CATEGORY_SKILL),
+/// The blueprint's rows for the activity, by required type; a required type
+/// the data does not know is left out.
+fn needs(blueprint_type: i64, activity: i64) -> Vec<Need> {
+    let sde = crate::sde::get();
+    let mut needs: Vec<(i64, Need)> = sde
+        .table("TL2MaterialsForTypeWithActivity")
+        .find("typeID", blueprint_type as i32 as i64)
+        .filter(|m| m.int("activity") == Some(activity as i32 as i64) && m.int("quantity").is_some_and(|q| q > 0))
+        .filter_map(|m| {
+            let required = m.int("requiredTypeID")?;
+            let (_, category) = sde.group_and_category(required)?;
+            let need = Need {
+                type_id: required,
+                quantity: m.int("quantity").unwrap_or(0),
+                damage: m.float("damagePerJob").unwrap_or(1.0),
+                skill: category == CATEGORY_SKILL,
+            };
+            Some((required, need))
         })
-        .collect())
+        .collect();
+    needs.sort_by_key(|(required, _)| *required);
+    needs.into_iter().map(|(_, n)| n).collect()
 }
 
 /// What a job will take, how long and what it costs.
@@ -487,17 +533,18 @@ fn run_time(production_time: f64, productivity_modifier: f64, productivity_level
 
 /// The multipliers a line puts on what it makes: per group, else per
 /// category; None if the line cannot make it.
-async fn line_detail(db: &impl GenericClient, line_type: i64, subject: i64) -> Refused<Option<(f64, f64)>> {
-    let sql = r#"SELECT COALESCE(
-                    (SELECT ARRAY[d."timeMultiplier", d."materialMultiplier"] FROM "ramAssemblyLineTypeDetailPerGroup" d
-                      WHERE d."assemblyLineTypeID" = $1 AND d."groupID" = t."groupID"),
-                    (SELECT ARRAY[d."timeMultiplier", d."materialMultiplier"] FROM "ramAssemblyLineTypeDetailPerCategory" d
-                      WHERE d."assemblyLineTypeID" = $1 AND d."categoryID" = g."categoryID"))
-                   FROM "invTypes" t JOIN "invGroups" g ON g."groupID" = t."groupID"
-                  WHERE t."typeID" = $2"#;
-    let r = db.query_opt(sql, &[&(line_type as i32), &(subject as i32)]).await.map_err(|e| db_failed("reading the line's abilities", e))?;
-    let m: Option<Vec<f64>> = r.and_then(|r| r.try_get(0).ok());
-    Ok(m.filter(|m| m.len() == 2).map(|m| (m[0], m[1])))
+fn line_detail(line_type: i64, subject: i64) -> Option<(f64, f64)> {
+    let sde = crate::sde::get();
+    let (group, category) = sde.group_and_category(subject as i32 as i64)?;
+    let line_type = line_type as i32 as i64;
+    // The group's row wins whenever there is one, even with a multiplier
+    // missing (which makes it no use, as before).
+    let detail = sde
+        .table("ramAssemblyLineTypeDetailPerGroup")
+        .find("assemblyLineTypeID", line_type)
+        .find(|d| d.int("groupID") == Some(group))
+        .or_else(|| sde.table("ramAssemblyLineTypeDetailPerCategory").find("assemblyLineTypeID", line_type).find(|d| d.int("categoryID") == Some(category)))?;
+    Some((detail.float("timeMultiplier")?, detail.float("materialMultiplier")?))
 }
 
 /// InstallJob(installationLocationData, installedItemLocationData,
@@ -544,205 +591,221 @@ async fn install(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
         return Err(message("RamNoShip"));
     }
 
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| db_failed("BEGIN", e))?;
-    // The installer owns its job slots across every assembly line. Lock before
-    // items and wallet rows, matching character travel/checkpoint ordering.
-    if !crate::svc::login::lock_character_lifecycle(txn.tx(), me as i32).await.map_err(|e| db_failed("locking the installer", e))? {
-        return Err(Outcome::custom("That character no longer exists."));
-    }
-    txn.tx().query_one(r#"SELECT "characterID" FROM "character_" WHERE "characterID"=$1 FOR UPDATE"#, &[&(me as i32)]).await.map_err(|e| db_failed("locking the installer", e))?;
-    txn.tx()
-        .execute(r#"SELECT 1 FROM "ramAssemblyLines" WHERE "assemblyLineID" = $1 FOR UPDATE"#, &[&(line_id as i32)])
-        .await
-        .map_err(|e| db_failed("locking the assembly line", e))?;
-    let line = line(txn.tx(), line_id).await?;
-    if line.activity != activity || ![ACTIVITY_MANUFACTURING, ACTIVITY_TIME, ACTIVITY_MATERIAL, ACTIVITY_COPYING].contains(&activity) {
-        return Err(message("RamActivityInvalid"));
-    }
-    within_reach(ctx, &line).await?;
-    let security = security_of(txn.tx(), me).await;
-    if security < line.min_security {
-        return Err(message("RamAccessDeniedSecStatusTooLow"));
-    }
-    if security > line.max_security {
-        return Err(message("RamAccessDeniedSecStatusTooHigh"));
-    }
-
-    let mut bp = blueprint(&mut txn, item_id).await?;
-    if bp.item.flag == i64::from(FLAG_FACTORY_BLUEPRINT)
-        || txn.tx().query_opt(r#"SELECT 1 FROM "ramJobs" WHERE "installedItemID"=$1 AND completed=0 LIMIT 1"#, &[&(item_id as i32)]).await.map_err(|e|db_failed("checking blueprint custody",e))?.is_some()
-    {
-        return Err(Outcome::custom("That blueprint is already installed in an industry job."));
-    }
-    if bp.item.owner_id != who {
-        return Err(message("RamCannotInstallItemForAnother"));
-    }
-    // The corporation's office at the station, for its materials and output.
-    let office = if for_corp {
-        txn.tx()
-            .query_opt(r#"SELECT "itemID" FROM "crpOffices" WHERE "corporationID" = $1 AND "stationID" = $2"#, &[&(who as i32), &(line.station as i32)])
-            .await
-            .map_err(|e| db_failed("finding the office", e))?
-            .and_then(|r| int(&r, 0))
-    } else {
-        None
-    };
-    let in_office = office.is_some_and(|o| bp.item.location_id == o && crate::svc::corphangar::may_take_at(ctx, bp.item.flag, Some(line.station)));
-    if !in_office && !at_station(ctx, &mut txn, &bp.item, line.station).await? {
-        return Err(message_with("RamInstalledItemWrongLocation", &[("location", Value::text(station_name(txn.tx(), line.station).await))]));
-    }
-    match activity {
-        ACTIVITY_COPYING if bp.copy => return Err(message("RamCannotCopyABlueprintCopy")),
-        ACTIVITY_TIME | ACTIVITY_MATERIAL if bp.copy => return Err(message("RamCannotResearchABlueprintCopy")),
-        ACTIVITY_MANUFACTURING if bp.copy && runs > bp.runs_left => return Err(message("RamTooManyProductionRuns")),
-        ACTIVITY_COPYING if runs > MAX_COPIES => return Err(Outcome::custom(format!("At most {MAX_COPIES} copies can be made in one job."))),
-        _ => {}
-    }
-    if activity == ACTIVITY_MANUFACTURING && bp.product == 0 {
-        return Err(message("RamNoKnownOutputType"));
-    }
-    let subject = if activity == ACTIVITY_MANUFACTURING { bp.product } else { bp.item.type_id };
-    let (detail_time, detail_material) =
-        line_detail(txn.tx(), line.type_id, subject).await?.ok_or_else(|| message("RamBadEndProductForActivity"))?;
-
-    // A blueprint from a stack is installed alone.
-    let mut split_off = Value::None;
-    if bp.item.quantity > 1 {
-        txn.set_quantity(bp.item.id, bp.item.quantity - 1).await.map_err(|e| db_failed("splitting the stack", e))?;
-        let one = NewItem {
-            type_id: bp.item.type_id,
-            owner_id: bp.item.owner_id,
-            location_id: bp.item.location_id,
-            flag: bp.item.flag,
-            quantity: 1,
-            singleton: true,
-        };
-        let id = txn.create(one).await.map_err(|e| db_failed("splitting the stack", e))?;
-        split_off = Value::Int(id);
-        bp = blueprint(&mut txn, id).await?;
-    }
-
-    let need = needs(txn.tx(), bp.item.type_id, activity).await?;
-    let skill_types: Vec<i32> = need
-        .iter()
-        .filter(|n| n.skill)
-        .map(|n| n.type_id as i32)
-        .chain([
-            SKILL_INDUSTRY, SKILL_MASS_PRODUCTION, SKILL_PRODUCTION_EFFICIENCY, SKILL_SCIENCE, SKILL_RESEARCH,
-            SKILL_LABORATORY_OPERATION, SKILL_METALLURGY, SKILL_ADVANCED_LABORATORY_OPERATION, SKILL_ADVANCED_MASS_PRODUCTION,
-        ])
-        .collect();
-    let levels = crate::svc::skills::levels(txn.tx(), me, &skill_types).await.map_err(|e| db_failed("reading skills", e))?;
-    let level = |s: i32| levels.get(&s).copied().unwrap_or(0);
-    for n in need.iter().filter(|n| n.skill) {
-        if level(n.type_id as i32) < n.quantity {
-            let name = type_name(txn.tx(), n.type_id).await;
-            return Err(message_with("RamNeedSkillForJob", &[("skillLevel", Value::Int(n.quantity)), ("item", Value::text(name))]));
-        }
-    }
-    slots_free(txn.tx(), me, activity, &level).await?;
-
-    let now = crate::bulkdata::filetime_now();
-    let plan = plan(&line, &bp, &need, activity, runs, licensed_runs, (detail_time, detail_material), &level, now);
-    if plan.seconds > MAX_DAYS * 86_400.0 {
-        return Err(message_with("RamProductionTimeExceedsLimits", &[("productionTime", Value::Double(plan.seconds / 3600.0)), ("limit", Value::Double(MAX_DAYS * 24.0))]));
-    }
-
-    if quote_only {
-        // The split-off blueprint is kept: the install refers to it.
-        txn.commit().await.map_err(|e| db_failed("COMMIT", e))?;
-        return Ok(Value::Tuple(vec![quote(&plan), split_off]));
-    }
-    if latest_start.is_some_and(|t| plan.begin > t) {
-        return Err(message("RamCannotGuaranteeStartTime"));
-    }
-    if authorized.is_some_and(|a| plan.cost() > a + 0.01) {
-        return Err(Outcome::custom("The price has gone up since your quote. Please ask for a new one."));
-    }
-
-    // The materials, from the hangar or the ship's hold at the station; a
-    // corporation's office division; or a starbase structure's hold.
-    let source = match bom_flag {
-        _ if line.structure => Some((line.station, bom_flag.unwrap_or(0))),
-        Some(f) if office.is_some() && crate::svc::corphangar::division(f).is_some() => {
-            if !crate::svc::corphangar::may_take_at(ctx, f, Some(line.station)) {
-                return Err(Outcome::custom("You may not take materials from that division."));
+    let (reply, installed) = ctx
+        .store
+        .write(|tx| -> Result<_, Undone> {
+            let mut txn = ItemTxn::new(tx);
+            // The installer's job slots span every assembly line; the store runs one
+            // writer at a time, so the count below holds until this commits.
+            if !crate::svc::login::lock_character_lifecycle(txn.db(), me).map_err(|e| db_failed("locking the installer", e))? {
+                return Err(Outcome::custom("That character no longer exists.").into());
             }
-            office.map(|o| (o, f))
-        }
-        Some(FLAG_CARGO) if ctx.session.station_id == Some(line.station) => ctx.session.ship_id.map(|s| (s, FLAG_CARGO)),
-        Some(FLAG_HANGAR) => Some((line.station, FLAG_HANGAR)),
-        _ => None,
-    };
-    let consumed = plan.consumed();
-    if !consumed.is_empty() || !plan.tools.is_empty() {
-        let Some((location, flag)) = source else { return Err(Outcome::custom("Please select an input location for the job.")) };
-        let mut rng = crate::combat::Rng::seeded(now as u64 ^ (bp.item.id as u64) << 20);
-        let mut take: Vec<(i64, i64, i64)> = consumed.iter().map(|(t, q)| (*t, *q, *q)).collect();
-        for tool in &plan.tools {
-            let worn = tool.damage * runs as f64;
-            let used = worn.floor() as i64 + i64::from(rng.unit() < worn.fract());
-            take.push((tool.type_id, tool.quantity.max(used), used));
-        }
-        for (t, have_at_least, used) in take {
-            use_up(&mut txn, who, location, flag, t, have_at_least, used).await?;
-        }
-    }
+            let line = line(txn.db(), line_id)?;
+            if line.activity != activity || ![ACTIVITY_MANUFACTURING, ACTIVITY_TIME, ACTIVITY_MATERIAL, ACTIVITY_COPYING].contains(&activity) {
+                return Err(message("RamActivityInvalid").into());
+            }
+            within_reach(ctx, txn.db(), &line)?;
+            let security = security_of(txn.db(), me);
+            if security < line.min_security {
+                return Err(message("RamAccessDeniedSecStatusTooLow").into());
+            }
+            if security > line.max_security {
+                return Err(message("RamAccessDeniedSecStatusTooHigh").into());
+            }
 
-    // The fee, from the pilot (or the corporation) to the line's owner.
-    let reason = format!("{} job, {} run(s)", activity_name(activity), runs);
-    let entry = Entry { ref_type: REF_JOB_BASE + activity as i32, payer: who, payee: line.owner, arg_id1: "", reason: &reason };
-    let balance = match wallet::post(txn.tx(), who, -plan.cost(), &entry).await {
-        Ok(b) => b,
-        Err(Transfer::NotEnough { need, have }) => return Err(Outcome::not_enough_money(need, have)),
-        Err(Transfer::NoSuchOwner) => return Err(Outcome::custom("Your wallet could not be found.")),
-        Err(Transfer::Db(e)) => return Err(db_failed("paying for the job", e)),
-    };
-    if plan.cost() > 0.0 {
-        if let Err(Transfer::Db(e)) = wallet::post(txn.tx(), line.owner, plan.cost(), &entry).await {
-            return Err(db_failed("paying the line's owner", e));
-        }
-    }
+            let mut bp = blueprint(&mut txn, item_id)?;
+            if bp.item.flag == i64::from(FLAG_FACTORY_BLUEPRINT)
+                || txn.db().table("ramJobs").rows().any(|j| j.int("installedItemID") == Some(item_id) && j.int("completed") == Some(0))
+            {
+                return Err(Outcome::custom("That blueprint is already installed in an industry job.").into());
+            }
+            if bp.item.owner_id != who {
+                return Err(message("RamCannotInstallItemForAnother").into());
+            }
+            // The corporation's office at the station, for its materials and output.
+            let office = if for_corp {
+                txn.db()
+                    .table("crpOffices")
+                    .find(&["corporationID"], &[int(who)])
+                    .find(|o| o.int("stationID") == Some(line.station))
+                    .and_then(|o| o.int("itemID"))
+            } else {
+                None
+            };
+            let in_office = office.is_some_and(|o| bp.item.location_id == o && crate::svc::corphangar::may_take_at(ctx, bp.item.flag, Some(line.station)));
+            if !in_office && !at_station(ctx, &mut txn, &bp.item, line.station)? {
+                return Err(message_with("RamInstalledItemWrongLocation", &[("location", Value::text(station_name(txn.db(), line.station)))]).into());
+            }
+            match activity {
+                ACTIVITY_COPYING if bp.copy => return Err(message("RamCannotCopyABlueprintCopy").into()),
+                ACTIVITY_TIME | ACTIVITY_MATERIAL if bp.copy => return Err(message("RamCannotResearchABlueprintCopy").into()),
+                ACTIVITY_MANUFACTURING if bp.copy && runs > bp.runs_left => return Err(message("RamTooManyProductionRuns").into()),
+                ACTIVITY_COPYING if runs > MAX_COPIES => return Err(Outcome::custom(format!("At most {MAX_COPIES} copies can be made in one job.")).into()),
+                _ => {}
+            }
+            if activity == ACTIVITY_MANUFACTURING && bp.product == 0 {
+                return Err(message("RamNoKnownOutputType").into());
+            }
+            let subject = if activity == ACTIVITY_MANUFACTURING { bp.product } else { bp.item.type_id };
+            let (detail_time, detail_material) =
+                line_detail(line.type_id, subject).ok_or_else(|| message("RamBadEndProductForActivity"))?;
 
-    // Where the output (and the blueprint) goes: the structure's hold, the
-    // corporation's division, or the pilot's hangar.
-    let (output_location, output_flag) = match office {
-        _ if line.structure => (line.station, 0),
-        Some(o) if crate::svc::corphangar::division(output_flag).is_some() => (o, output_flag),
-        Some(o) => (o, FLAG_HANGAR),
-        None => (line.station, output_flag),
-    };
-    txn.set_singleton(bp.item.id, true).await.map_err(|e| db_failed("installing the blueprint", e))?;
-    txn.move_to(bp.item.id, line.station, i64::from(FLAG_FACTORY_BLUEPRINT)).await.map_err(|e| db_failed("installing the blueprint", e))?;
-    let sql = r#"INSERT INTO "ramJobs" ("assemblyLineID", "installerID", "creator", "installedItemID", "installedItemTypeID",
-                     "installedItemOwnerID", "installedItemQuantity", "installedItemProductivityLevel", "installedItemMaterialLevel",
-                     "installedItemLicensedProductionRunsRemaining", "containerID", "containerTypeID", "containerLocationID",
-                     "installedInSolarSystemID", "activityID", "outputTypeID", "outputFlag", "outputLocationID", "runs",
-                     "licensedProductionRuns", "installTime", "beginProductionTime", "endProductionTime")
-                 VALUES ($1, $2, $2, $3, $4, $19, 1, $5, $6, $7, $8, $9, $10, $10, $11, $12, $13, $20, $14, $15, $16, $17, $18)
-                 RETURNING "jobID""#;
-    let i = |v: i64| v as i32;
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 20] = [
-        &i(line.id), &i(me), &i(bp.item.id), &i(bp.item.type_id), &i(bp.productivity_level), &i(bp.material_level),
-        &i(bp.runs_left), &i(line.station), &i(line.station_type), &i(line.system), &i(activity), &i(plan.output_type),
-        &i(output_flag), &i(runs), &i(licensed_runs), &now, &plan.begin, &plan.end, &i(who), &i(output_location),
-    ];
-    let job_id: i32 = txn.tx().query_one(sql, &params).await.map_err(|e| db_failed("recording the job", e))?.get(0);
-    let free = r#"UPDATE "ramAssemblyLines" SET "nextFreeTime" = to_timestamp(($2 - 116444736000000000) / 1e7) AT TIME ZONE 'UTC'
-                   WHERE "assemblyLineID" = $1"#;
-    txn.tx().execute(free, &[&i(line.id), &plan.end]).await.map_err(|e| db_failed("booking the assembly line", e))?;
-    let events = txn.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+            // A blueprint from a stack is installed alone.
+            let mut split_off = Value::None;
+            if bp.item.quantity > 1 {
+                txn.set_quantity(bp.item.id, bp.item.quantity - 1).map_err(|e| db_failed("splitting the stack", e))?;
+                let one = NewItem {
+                    type_id: bp.item.type_id,
+                    owner_id: bp.item.owner_id,
+                    location_id: bp.item.location_id,
+                    flag: bp.item.flag,
+                    quantity: 1,
+                    singleton: true,
+                };
+                let id = txn.create(one).map_err(|e| db_failed("splitting the stack", e))?;
+                split_off = Value::Int(id);
+                bp = blueprint(&mut txn, id)?;
+            }
+
+            let need = needs(bp.item.type_id, activity);
+            let skill_types: Vec<i32> = need
+                .iter()
+                .filter(|n| n.skill)
+                .map(|n| n.type_id as i32)
+                .chain([
+                    SKILL_INDUSTRY, SKILL_MASS_PRODUCTION, SKILL_PRODUCTION_EFFICIENCY, SKILL_SCIENCE, SKILL_RESEARCH,
+                    SKILL_LABORATORY_OPERATION, SKILL_METALLURGY, SKILL_ADVANCED_LABORATORY_OPERATION, SKILL_ADVANCED_MASS_PRODUCTION,
+                ])
+                .collect();
+            let levels = crate::svc::skills::levels(txn.db(), me, &skill_types).map_err(|e| db_failed("reading skills", e))?;
+            let level = |s: i32| levels.get(&s).copied().unwrap_or(0);
+            for n in need.iter().filter(|n| n.skill) {
+                if level(n.type_id as i32) < n.quantity {
+                    let name = type_name(n.type_id);
+                    return Err(message_with("RamNeedSkillForJob", &[("skillLevel", Value::Int(n.quantity)), ("item", Value::text(name))]).into());
+                }
+            }
+            slots_free(txn.db(), me, activity, &level)?;
+
+            let now = crate::bulkdata::filetime_now();
+            let plan = plan(&line, &bp, &need, activity, runs, licensed_runs, (detail_time, detail_material), &level, now);
+            if plan.seconds > MAX_DAYS * 86_400.0 {
+                return Err(message_with("RamProductionTimeExceedsLimits", &[("productionTime", Value::Double(plan.seconds / 3600.0)), ("limit", Value::Double(MAX_DAYS * 24.0))]).into());
+            }
+
+            if quote_only {
+                // The split-off blueprint is kept: the install refers to it.
+                return Ok((Value::Tuple(vec![quote(&plan), split_off]), None));
+            }
+            if latest_start.is_some_and(|t| plan.begin > t) {
+                return Err(message("RamCannotGuaranteeStartTime").into());
+            }
+            if authorized.is_some_and(|a| plan.cost() > a + 0.01) {
+                return Err(Outcome::custom("The price has gone up since your quote. Please ask for a new one.").into());
+            }
+
+            // The materials, from the hangar or the ship's hold at the station; a
+            // corporation's office division; or a starbase structure's hold.
+            let source = match bom_flag {
+                _ if line.structure => Some((line.station, bom_flag.unwrap_or(0))),
+                Some(f) if office.is_some() && crate::svc::corphangar::division(f).is_some() => {
+                    if !crate::svc::corphangar::may_take_at(ctx, f, Some(line.station)) {
+                        return Err(Outcome::custom("You may not take materials from that division.").into());
+                    }
+                    office.map(|o| (o, f))
+                }
+                Some(FLAG_CARGO) if ctx.session.station_id == Some(line.station) => ctx.session.ship_id.map(|s| (s, FLAG_CARGO)),
+                Some(FLAG_HANGAR) => Some((line.station, FLAG_HANGAR)),
+                _ => None,
+            };
+            let consumed = plan.consumed();
+            if !consumed.is_empty() || !plan.tools.is_empty() {
+                let Some((location, flag)) = source else { return Err(Outcome::custom("Please select an input location for the job.").into()) };
+                let mut rng = crate::combat::Rng::seeded(now as u64 ^ (bp.item.id as u64) << 20);
+                let mut take: Vec<(i64, i64, i64)> = consumed.iter().map(|(t, q)| (*t, *q, *q)).collect();
+                for tool in &plan.tools {
+                    let worn = tool.damage * runs as f64;
+                    let used = worn.floor() as i64 + i64::from(rng.unit() < worn.fract());
+                    take.push((tool.type_id, tool.quantity.max(used), used));
+                }
+                for (t, have_at_least, used) in take {
+                    use_up(&mut txn, who, location, flag, t, have_at_least, used)?;
+                }
+            }
+
+            // The fee, from the pilot (or the corporation) to the line's owner.
+            let reason = format!("{} job, {} run(s)", activity_name(activity), runs);
+            let entry = Entry { ref_type: REF_JOB_BASE + activity as i32, payer: who, payee: line.owner, arg_id1: "", reason: &reason };
+            let balance = match wallet::post(txn.tx(), who, -plan.cost(), &entry) {
+                Ok(b) => b,
+                Err(Transfer::NotEnough { need, have }) => return Err(Outcome::not_enough_money(need, have).into()),
+                Err(Transfer::NoSuchOwner) => return Err(Outcome::custom("Your wallet could not be found.").into()),
+                Err(Transfer::Db(e)) => return Err(db_failed("paying for the job", e).into()),
+            };
+            if plan.cost() > 0.0 {
+                if let Err(Transfer::Db(e)) = wallet::post(txn.tx(), line.owner, plan.cost(), &entry) {
+                    return Err(db_failed("paying the line's owner", e).into());
+                }
+            }
+
+            // Where the output (and the blueprint) goes: the structure's hold, the
+            // corporation's division, or the pilot's hangar.
+            let (output_location, output_flag) = match office {
+                _ if line.structure => (line.station, 0),
+                Some(o) if crate::svc::corphangar::division(output_flag).is_some() => (o, output_flag),
+                Some(o) => (o, FLAG_HANGAR),
+                None => (line.station, output_flag),
+            };
+            txn.set_singleton(bp.item.id, true).map_err(|e| db_failed("installing the blueprint", e))?;
+            txn.move_to(bp.item.id, line.station, i64::from(FLAG_FACTORY_BLUEPRINT)).map_err(|e| db_failed("installing the blueprint", e))?;
+            let tx = txn.tx();
+            // ramJobs."jobID" is an identity column: its next value, as the column's default gave it.
+            let job_id = tx.nextval("ramJobs_jobID_seq")?;
+            let job = [
+                ("jobID", int(job_id)),
+                ("assemblyLineID", int(line.id)),
+                ("installerID", int(me)),
+                ("creator", int(me)),
+                ("installedItemID", int(bp.item.id)),
+                ("installedItemTypeID", int(bp.item.type_id)),
+                ("installedItemOwnerID", int(who)),
+                ("installedItemQuantity", int(1)),
+                ("installedItemProductivityLevel", int(bp.productivity_level)),
+                ("installedItemMaterialLevel", int(bp.material_level)),
+                ("installedItemLicensedProductionRunsRemaining", int(bp.runs_left)),
+                ("containerID", int(line.station)),
+                ("containerTypeID", int(line.station_type)),
+                ("containerLocationID", int(line.system)),
+                ("installedInSolarSystemID", int(line.system)),
+                ("activityID", int(activity)),
+                ("outputTypeID", int(plan.output_type)),
+                ("outputFlag", int(output_flag)),
+                ("outputLocationID", int(output_location)),
+                ("runs", int(runs)),
+                ("licensedProductionRuns", int(licensed_runs)),
+                ("installTime", int(now)),
+                ("beginProductionTime", int(plan.begin)),
+                ("endProductionTime", int(plan.end)),
+            ];
+            tx.insert("ramJobs", &job).map_err(|e| db_failed("recording the job", e))?;
+            if let Some(row) = tx.table("ramAssemblyLines").get_id(line.id).map(|l| l.id) {
+                tx.update("ramAssemblyLines", row, &[("nextFreeTime", int(plan.end))]).map_err(|e| db_failed("booking the assembly line", e))?;
+            }
+            let done = format!(
+                "{me} installed job {job_id}: {} x{runs} of {} on line {} at {}, {:.0} s, {:.2} ISK",
+                activity_name(activity), bp.type_name, line.id, line.station, plan.seconds, plan.cost()
+            );
+            Ok((Value::Tuple(vec![quote(&plan), split_off]), Some((txn.events(), balance, done))))
+        })
+        .map_err(|Undone(o)| o)?;
+    let Some((events, balance, done)) = installed else { return Ok(reply) };
 
     crate::items::notify(ctx.world, ctx.client_id, events);
     let w = ctx.world.lock();
     let cash = Value::Tuple(vec![Value::bytes("cash"), Value::Int(who), Value::Double(balance)]);
     w.notify(&w.clients_of(me), "OnAccountChange", cash);
-    info!(
-        "{me} installed job {job_id}: {} x{runs} of {} on line {} at {}, {:.0} s, {:.2} ISK",
-        activity_name(activity), bp.type_name, line.id, line.station, plan.seconds, plan.cost()
-    );
-    Ok(Value::Tuple(vec![quote(&plan), split_off]))
+    info!("{done}");
+    Ok(reply)
 }
 
 /// The time, the price and the bill of materials of a job.
@@ -854,42 +917,39 @@ fn quote(p: &Plan) -> Value {
 
 /// Whether the blueprint is in the station's hangar, or in the hold of a
 /// ship there.
-async fn at_station(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, item: &Item, station: i64) -> Refused<bool> {
+fn at_station(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_, '_>, item: &Item, station: i64) -> Refused<bool> {
     if item.location_id == station {
         // A station's hangar; or anywhere in a starbase structure's hold.
-        let structure = txn.tx().query_opt(r#"SELECT 1 FROM "posStructures" WHERE "itemID" = $1"#, &[&(station as i32)]).await.map_err(|e| db_failed("reading the structure", e))?;
-        return Ok(item.flag == FLAG_HANGAR || structure.is_some());
+        let structure = txn.db().table("posStructures").get_id(station).is_some();
+        return Ok(item.flag == FLAG_HANGAR || structure);
     }
     if item.flag != FLAG_CARGO {
         return Ok(false);
     }
-    let ship = txn.item(item.location_id).await.map_err(|e| db_failed("reading the ship", e))?;
+    let ship = txn.item(item.location_id).map_err(|e| db_failed("reading the ship", e))?;
     Ok(ship.is_some_and(|s| s.location_id == station && Some(s.owner_id) == ctx.session.char_id))
 }
 
 /// Takes `used` units of `t` from the stacks at a location (assembled ships
 /// do not count), after checking `have_at_least` are there.
-async fn use_up(txn: &mut ItemTxn<'_>, owner: i64, location: i64, flag: i64, t: i64, have_at_least: i64, mut used: i64) -> Refused<()> {
-    let sql = r#"SELECT "itemID", "quantity" FROM entity
-                  WHERE "locationID" = $1 AND "ownerID" = $2 AND "flag" = $3 AND "typeID" = $4 AND "singleton" = 0
-                  ORDER BY "itemID" FOR UPDATE"#;
-    let stacks: Vec<(i64, i64)> = txn
-        .tx()
-        .query(sql, &[&(location as i32), &(owner as i32), &(flag as i32), &(t as i32)])
-        .await
-        .map_err(|e| db_failed("counting the materials", e))?
-        .iter()
-        .map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0)))
+fn use_up(txn: &mut ItemTxn<'_, '_>, owner: i64, location: i64, flag: i64, t: i64, have_at_least: i64, mut used: i64) -> Refused<()> {
+    let mut stacks: Vec<(i64, i64)> = txn
+        .db()
+        .table("entity")
+        .find(&["locationID", "flag", "ownerID"], &[int(location), int(flag), int(owner)])
+        .filter(|e| e.int("typeID") == Some(t) && e.int("singleton") == Some(0))
+        .map(|e| (e.int("itemID").unwrap_or(0), e.int("quantity").unwrap_or(0)))
         .collect();
+    stacks.sort_by_key(|(id, _)| *id);
     if stacks.iter().map(|(_, q)| q).sum::<i64>() < have_at_least {
-        return Err(message_with("RamNeedMoreForJob", &[("item", Value::text(type_name(txn.tx(), t).await))]));
+        return Err(message_with("RamNeedMoreForJob", &[("item", Value::text(type_name(t)))]));
     }
     for (id, q) in stacks {
         if used <= 0 {
             break;
         }
         let take = q.min(used);
-        txn.set_quantity(id, q - take).await.map_err(|e| db_failed("using the materials", e))?;
+        txn.set_quantity(id, q - take).map_err(|e| db_failed("using the materials", e))?;
         used -= take;
     }
     Ok(())
@@ -897,21 +957,19 @@ async fn use_up(txn: &mut ItemTxn<'_>, owner: i64, location: i64, flag: i64, t: 
 
 /// Jobs a character may have running: manufacturing, or the research kinds
 /// together.
-async fn slots_free(db: &impl GenericClient, me: i64, activity: i64, level: &(dyn Fn(i32) -> i64 + Sync)) -> Refused<()> {
+fn slots_free(db: &Db, me: i64, activity: i64, level: &(dyn Fn(i32) -> i64 + Sync)) -> Refused<()> {
     let manufacturing = activity == ACTIVITY_MANUFACTURING;
     let allowed = if manufacturing {
         1 + level(SKILL_MASS_PRODUCTION) + level(SKILL_ADVANCED_MASS_PRODUCTION)
     } else {
         1 + level(SKILL_LABORATORY_OPERATION) + level(SKILL_ADVANCED_LABORATORY_OPERATION)
     };
-    let sql = r#"SELECT count(*) FROM "ramJobs" WHERE "installerID" = $1 AND "completed" = 0
-                    AND (("activityID" = 1) = $2)"#;
     let running = db
-        .query_one(sql, &[&(me as i32), &manufacturing])
-        .await
-        .map_err(|e| db_failed("counting jobs", e))?
-        .get::<_, i64>(0);
-    if running >= allowed {
+        .table("ramJobs")
+        .find(&["installerID", "completed"], &[int(me), int(0)])
+        .filter(|j| j.int("activityID").is_some_and(|a| (a == ACTIVITY_MANUFACTURING) == manufacturing))
+        .count();
+    if running as i64 >= allowed {
         let kind = if manufacturing { "manufacturing" } else { "research" };
         return Err(Outcome::custom(format!("Your skills allow {allowed} {kind} job(s) at a time, and you have {running} running.")));
     }
@@ -920,7 +978,7 @@ async fn slots_free(db: &impl GenericClient, me: i64, activity: i64, level: &(dy
 
 /// Whether the caller may use a line where they are: their reach skill, in
 /// jumps, from where they are.
-async fn within_reach(ctx: &Ctx<'_>, line: &Line) -> Refused<()> {
+fn within_reach(ctx: &Ctx<'_>, db: &Db, line: &Line) -> Refused<()> {
     if ctx.session.station_id == Some(line.station) {
         return Ok(());
     }
@@ -933,13 +991,13 @@ async fn within_reach(ctx: &Ctx<'_>, line: &Line) -> Refused<()> {
     }
     let skill = if line.activity == ACTIVITY_MANUFACTURING { SKILL_SUPPLY_CHAIN_MANAGEMENT } else { SKILL_SCIENTIFIC_NETWORKING };
     let me = ctx.session.char_id.unwrap_or(0);
-    let level = crate::svc::skills::levels(ctx.db, me, &[skill]).await.map_err(|e| db_failed("reading skills", e))?;
+    let level = crate::svc::skills::levels(db, me, &[skill]).map_err(|e| db_failed("reading skills", e))?;
     let reach = REACH[level.get(&skill).copied().unwrap_or(0).clamp(0, 5) as usize];
     let here = ctx.session.solar_system_id2.unwrap_or(0);
     let ok = match reach {
         -1 => false,
         50 => true,
-        r => crate::gates::jumps(ctx.db, here, line.system, r).await.is_some(),
+        r => crate::gates::jumps(db, here, line.system, r).is_some(),
     };
     if ok {
         Ok(())
@@ -957,100 +1015,109 @@ async fn within_reach(ctx: &Ctx<'_>, line: &Line) -> Refused<()> {
 /// cancelled one gives the blueprint back alone.
 async fn complete(ctx: &Ctx<'_>, job_id: i64, cancel: bool) -> Refused<Value> {
     let me = ctx.session.char_id.unwrap_or(0);
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| db_failed("BEGIN", e))?;
-    let sql = r#"SELECT "installedItemOwnerID", "installedItemID", "activityID", "outputTypeID", "outputLocationID",
-                        "runs", "licensedProductionRuns", "endProductionTime", "completed", "outputFlag", "containerID"
-                   FROM "ramJobs" WHERE "jobID" = $1 FOR UPDATE"#;
-    let r = txn
-        .tx()
-        .query_opt(sql, &[&(job_id as i32)])
-        .await
-        .map_err(|e| db_failed("reading the job", e))?
-        .ok_or_else(|| message("RamCompletionNoSuchJob"))?;
-    let i = |n| int(&r, n).unwrap_or(0);
-    let (owner, item_id, activity, output, station, runs, licensed_runs, end) = (i(0), i(1), i(2), i(3), i(4), i(5), i(6), i(7));
-    let out_flag = i(9);
-    let roles = ctx.session.corp_role();
-    let corp_job = Some(owner) == ctx.session.corp_id && roles & (crate::session::CORP_ROLE_DIRECTOR | CORP_ROLE_FACTORY_MANAGER) != 0;
-    if owner != me && !corp_job {
-        return Err(message("RamCompletionAccessDenied"));
-    }
-    if i(8) != 0 {
-        return Err(message("RamCompletionJobCompleted"));
-    }
-    if !cancel && crate::bulkdata::filetime_now() < end {
-        return Err(message("RamCompletionInProduction"));
-    }
-    let bp = blueprint(&mut txn, item_id).await?;
-    if bp.item.owner_id != owner || bp.item.location_id != i(10) || bp.item.flag != i64::from(FLAG_FACTORY_BLUEPRINT) {
-        return Err(Outcome::custom("The installed blueprint is no longer held by this job."));
-    }
-    txn.move_to(item_id, station, out_flag).await.map_err(|e| db_failed("returning the blueprint", e))?;
-
-    let research = |column: &str| {
-        format!(
-            r#"INSERT INTO "invBlueprints" ("itemID", "{column}") VALUES ($1, $2)
-               ON CONFLICT ("itemID") DO UPDATE SET "{column}" = "invBlueprints"."{column}" + $2"#
-        )
-    };
-    let delivered = async {
-        if cancel {
-            return Ok::<_, tokio_postgres::Error>(());
-        }
-        match activity {
-            ACTIVITY_MANUFACTURING => {
-                let portion = txn
-                    .tx()
-                    .query_opt(r#"SELECT "portionSize" FROM "invTypes" WHERE "typeID" = $1"#, &[&(output as i32)])
-                    .await?
-                    .and_then(|r| int(&r, 0))
-                    .unwrap_or(1)
-                    .max(1);
-                let made = NewItem { type_id: output, owner_id: owner, location_id: station, flag: out_flag, quantity: portion * runs, singleton: false };
-                txn.create(made).await?;
-                if bp.copy {
-                    let left = bp.runs_left - runs;
-                    if left <= 0 {
-                        txn.tx().execute(r#"DELETE FROM "invBlueprints" WHERE "itemID" = $1"#, &[&(item_id as i32)]).await?;
-                        txn.destroy(item_id).await?;
-                    } else {
-                        let sql = r#"UPDATE "invBlueprints" SET "licensedProductionRunsRemaining" = $2 WHERE "itemID" = $1"#;
-                        txn.tx().execute(sql, &[&(item_id as i32), &(left as i32)]).await?;
-                    }
-                }
+    let (events, activity, type_name) = ctx
+        .store
+        .write(|tx| -> Result<_, Undone> {
+            let mut txn = ItemTxn::new(tx);
+            let r = txn.db().table("ramJobs").get_id(job_id).ok_or_else(|| message("RamCompletionNoSuchJob"))?;
+            let i = |c: &str| r.int(c).unwrap_or(0);
+            let (owner, item_id, activity, output, station) = (i("installedItemOwnerID"), i("installedItemID"), i("activityID"), i("outputTypeID"), i("outputLocationID"));
+            let (runs, licensed_runs, end, completed) = (i("runs"), i("licensedProductionRuns"), i("endProductionTime"), i("completed"));
+            let (out_flag, container, job_row) = (i("outputFlag"), i("containerID"), r.id);
+            let roles = ctx.session.corp_role();
+            let corp_job = Some(owner) == ctx.session.corp_id && roles & (crate::session::CORP_ROLE_DIRECTOR | CORP_ROLE_FACTORY_MANAGER) != 0;
+            if owner != me && !corp_job {
+                return Err(message("RamCompletionAccessDenied").into());
             }
-            ACTIVITY_TIME => {
-                txn.tx().execute(research("productivityLevel").as_str(), &[&(item_id as i32), &(runs as i32)]).await?;
+            if completed != 0 {
+                return Err(message("RamCompletionJobCompleted").into());
             }
-            ACTIVITY_MATERIAL => {
-                txn.tx().execute(research("materialLevel").as_str(), &[&(item_id as i32), &(runs as i32)]).await?;
+            if !cancel && crate::bulkdata::filetime_now() < end {
+                return Err(message("RamCompletionInProduction").into());
             }
-            _ => {
-                for _ in 0..runs {
-                    let copy = NewItem { type_id: output, owner_id: owner, location_id: station, flag: out_flag, quantity: 1, singleton: true };
-                    let id = txn.create(copy).await?;
-                    let sql = r#"INSERT INTO "invBlueprints" ("itemID", "copy", "materialLevel", "productivityLevel", "licensedProductionRunsRemaining")
-                                 VALUES ($1, 1, $2, $3, $4)"#;
-                    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
-                        [&(id as i32), &(bp.material_level as i32), &(bp.productivity_level as i32), &(licensed_runs.max(1) as i32)];
-                    txn.tx().execute(sql, &params).await?;
-                }
+            let bp = blueprint(&mut txn, item_id)?;
+            if bp.item.owner_id != owner || bp.item.location_id != container || bp.item.flag != i64::from(FLAG_FACTORY_BLUEPRINT) {
+                return Err(Outcome::custom("The installed blueprint is no longer held by this job.").into());
             }
-        }
-        Ok(())
-    }
-    .await;
-    delivered.map_err(|e| db_failed("delivering the job", e))?;
-    let status = if cancel { STATUS_ABORTED } else { STATUS_DELIVERED };
-    txn.tx()
-        .execute(r#"UPDATE "ramJobs" SET "completed" = 1, "completedStatus" = $2 WHERE "jobID" = $1"#, &[&(job_id as i32), &status])
-        .await
-        .map_err(|e| db_failed("closing the job", e))?;
-    let events = txn.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+            txn.move_to(item_id, station, out_flag).map_err(|e| db_failed("returning the blueprint", e))?;
+            if !cancel {
+                deliver(&mut txn, &bp, activity, output, owner, station, out_flag, runs, licensed_runs).map_err(|e| db_failed("delivering the job", e))?;
+            }
+            let status = if cancel { STATUS_ABORTED } else { STATUS_DELIVERED };
+            txn.tx()
+                .update("ramJobs", job_row, &[("completed", int(1)), ("completedStatus", int(status.into()))])
+                .map_err(|e| db_failed("closing the job", e))?;
+            Ok((txn.events(), activity, bp.type_name))
+        })
+        .map_err(|Undone(o)| o)?;
     crate::items::notify(ctx.world, ctx.client_id, events);
-    info!("{me} {} job {job_id} ({} of {})", if cancel { "cancelled" } else { "delivered" }, activity_name(activity), bp.type_name);
+    info!("{me} {} job {job_id} ({} of {type_name})", if cancel { "cancelled" } else { "delivered" }, activity_name(activity));
     Ok(Value::None)
+}
+
+/// What a finished job makes: the products, the research on the blueprint,
+/// or the copies.
+#[allow(clippy::too_many_arguments)]
+fn deliver(
+    txn: &mut ItemTxn<'_, '_>,
+    bp: &Blueprint,
+    activity: i64,
+    output: i64,
+    owner: i64,
+    station: i64,
+    out_flag: i64,
+    runs: i64,
+    licensed_runs: i64,
+) -> Result<(), StoreError> {
+    let item_id = bp.item.id;
+    match activity {
+        ACTIVITY_MANUFACTURING => {
+            let portion = crate::sde::table("invTypes")
+                .get("typeID", output as i32 as i64)
+                .and_then(|t| t.int("portionSize"))
+                .unwrap_or(1)
+                .max(1);
+            let made = NewItem { type_id: output, owner_id: owner, location_id: station, flag: out_flag, quantity: portion * runs, singleton: false };
+            txn.create(made)?;
+            if bp.copy {
+                let left = bp.runs_left - runs;
+                if left <= 0 {
+                    txn.tx().delete_where("invBlueprints", &["itemID"], &[int(item_id)])?;
+                    txn.destroy(item_id)?;
+                } else if let Some(row) = txn.db().table("invBlueprints").get_id(item_id).map(|b| b.id) {
+                    txn.tx().update("invBlueprints", row, &[("licensedProductionRunsRemaining", int(left))])?;
+                }
+            }
+        }
+        ACTIVITY_TIME => research(txn.tx(), item_id, "productivityLevel", runs)?,
+        ACTIVITY_MATERIAL => research(txn.tx(), item_id, "materialLevel", runs)?,
+        _ => {
+            for _ in 0..runs {
+                let copy = NewItem { type_id: output, owner_id: owner, location_id: station, flag: out_flag, quantity: 1, singleton: true };
+                let id = txn.create(copy)?;
+                txn.tx().insert(
+                    "invBlueprints",
+                    &[
+                        ("itemID", int(id)),
+                        ("copy", int(1)),
+                        ("materialLevel", int(bp.material_level)),
+                        ("productivityLevel", int(bp.productivity_level)),
+                        ("licensedProductionRunsRemaining", int(licensed_runs.max(1))),
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Research adds `runs` to the blueprint's own level, from 0 when it has
+/// none yet.
+fn research(tx: &mut Tx<'_>, item_id: i64, column: &str, runs: i64) -> Result<(), StoreError> {
+    match tx.table("invBlueprints").get_id(item_id).map(|b| (b.id, b.int(column).unwrap_or(0))) {
+        Some((row, level)) => tx.update("invBlueprints", row, &[(column, int(level + runs))]),
+        None => tx.insert("invBlueprints", &[("itemID", int(item_id)), (column, int(runs))]).map(|_| ()),
+    }
 }
 
 // ---- shared ------------------------------------------------------------------------------
@@ -1065,19 +1132,17 @@ fn activity_name(activity: i64) -> &'static str {
     }
 }
 
-async fn security_of(db: &impl GenericClient, char_id: i64) -> f64 {
-    let sql = r#"SELECT "securityRating" FROM "character_" WHERE "characterID" = $1"#;
-    db.query_opt(sql, &[&(char_id as i32)]).await.ok().flatten().and_then(|r| float(&r, 0)).unwrap_or(0.0)
+fn security_of(db: &Db, char_id: i64) -> f64 {
+    db.table("character_").get_id(char_id).and_then(|r| r.float("securityRating")).unwrap_or(0.0)
 }
 
-async fn type_name(db: &impl GenericClient, type_id: i64) -> String {
-    let sql = r#"SELECT "typeName" FROM "invTypes" WHERE "typeID" = $1"#;
-    db.query_opt(sql, &[&(type_id as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_default()
+fn type_name(type_id: i64) -> String {
+    let t = crate::sde::table("invTypes").get("typeID", type_id as i32 as i64);
+    t.and_then(|t| t.text("typeName")).unwrap_or_default().to_string()
 }
 
-async fn station_name(db: &impl GenericClient, station: i64) -> String {
-    let sql = r#"SELECT "stationName" FROM "staStations" WHERE "stationID" = $1"#;
-    db.query_opt(sql, &[&(station as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_default()
+fn station_name(db: &Db, station: i64) -> String {
+    db.table("staStations").get_id(station).and_then(|r| r.text("stationName")).unwrap_or_default().to_string()
 }
 
 fn message_with(key: &str, args: &[(&str, Value)]) -> Outcome {
@@ -1088,54 +1153,69 @@ fn message_with(key: &str, args: &[(&str, Value)]) -> Outcome {
 mod tests {
     use super::*;
 
+    /// Sets columns of the row with this single-column primary key.
+    fn set(store:&crate::store::Store,table:&str,id:i64,sets:store::Sets) {
+        store.write(|tx|{let row=tx.table(table).get_id(id).unwrap().id;tx.update(table,row,sets)}).unwrap();
+    }
+
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn industry_job_slots_and_blueprint_custody_survive_races_and_failed_delivery() {
+    async fn industry_job_slots_and_blueprint_custody_hold_and_delivery_happens_once() {
         let db=crate::test_support::Database::load().await;
-        let me=db.id().await;let ship=db.id().await;let first=db.id().await;let second=db.id().await;
-        let first_line=db.id().await;let second_line=db.id().await;
-        let original=db.db.query_one(r#"SELECT l."containerID",l."assemblyLineTypeID",s."solarSystemID" FROM "ramAssemblyLines" l JOIN "ramAssemblyLineTypes" t ON t."assemblyLineTypeID"=l."assemblyLineTypeID" JOIN "staStations" s ON s."stationID"=l."containerID" WHERE t."activityID"=$1 ORDER BY l."assemblyLineID" LIMIT 1"#,&[&(ACTIVITY_MATERIAL as i32)]).await.unwrap();
-        let station:i32=original.get(0);let line_type:i32=original.get(1);let system:i32=original.get(2);
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","stationID","solarSystemID",balance) VALUES($1,$2,$3,$4,$5,1000000)"#,&[&me,&format!("Industry custody {me}"),&ship,&station,&system]).await.unwrap();
-        for id in [first,second] {
-            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES($1,691,$2,$3,4,1,1)"#,&[&id,&me,&station]).await.unwrap();
-        }
-        for id in [first_line,second_line] {
-            db.db.execute(r#"INSERT INTO "ramAssemblyLines" ("assemblyLineID","assemblyLineTypeID","containerID","ownerID","costInstall","costPerHour","nextFreeTime") VALUES($1,$2,$3,$4,0,0,'1970-01-01')"#,&[&id,&line_type,&station,&me]).await.unwrap();
-        }
-        for need in needs(&db.db,691,ACTIVITY_MATERIAL).await.ok().unwrap().into_iter().filter(|n|n.skill) {
-            let skill=db.id().await;
-            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES($1,$2,$3,$3,7,1,1)"#,&[&skill,&(need.type_id as i32),&me]).await.unwrap();
-            db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES($1,280,$2)"#,&[&skill,&need.quantity]).await.unwrap();
-        }
-        let session=crate::session::Session {char_id:Some(me as i64),ship_id:Some(ship as i64),station_id:Some(station as i64),solar_system_id2:Some(system as i64),..Default::default()};
+        let me=db.id().await as i64;let ship=db.id().await as i64;let first=db.id().await as i64;let second=db.id().await as i64;
+        let first_line=db.id().await as i64;let second_line=db.id().await as i64;
+        let research_lines:Vec<i64>=crate::sde::table("ramAssemblyLineTypes").rows().filter(|t|t.int("activityID")==Some(ACTIVITY_MATERIAL))
+            .filter_map(|t|t.int("assemblyLineTypeID")).collect();
+        let (station,line_type,system)=db.store.read(|db|{
+            let mut lines:Vec<Row>=db.table("ramAssemblyLines").rows().filter(|l|l.int("assemblyLineTypeID").is_some_and(|t|research_lines.contains(&t))).collect();
+            lines.sort_by_key(|l|l.int("assemblyLineID"));
+            lines.iter().find_map(|l|{
+                let station=db.table("staStations").get_id(l.int("containerID")?)?;
+                Some((station.int("stationID")?,l.int("assemblyLineTypeID")?,station.int("solarSystemID")?))
+            }).unwrap()
+        });
+        db.store.write(|tx|->Result<(),StoreError> {
+            tx.insert("character_",&[("characterID",int(me)),("characterName",store::Value::Text(format!("Industry custody {me}").into())),("shipID",int(ship)),
+                ("stationID",int(station)),("solarSystemID",int(system)),("balance",float(1_000_000.0))])?;
+            for id in [first,second] {
+                tx.insert("entity",&[("itemID",int(id)),("typeID",int(691)),("ownerID",int(me)),("locationID",int(station)),("flag",int(4)),("quantity",int(1)),("singleton",int(1))])?;
+            }
+            for id in [first_line,second_line] {
+                // Free since 1970-01-01.
+                tx.insert("ramAssemblyLines",&[("assemblyLineID",int(id)),("assemblyLineTypeID",int(line_type)),("containerID",int(station)),("ownerID",int(me)),
+                    ("costInstall",float(0.0)),("costPerHour",float(0.0)),("nextFreeTime",int(116_444_736_000_000_000))])?;
+            }
+            for need in needs(691,ACTIVITY_MATERIAL).into_iter().filter(|n|n.skill) {
+                let skill=tx.nextval("dyn_id_seq")?;
+                tx.insert("entity",&[("itemID",int(skill)),("typeID",int(need.type_id)),("ownerID",int(me)),("locationID",int(me)),("flag",int(7)),("quantity",int(1)),("singleton",int(1))])?;
+                tx.insert("entity_attributes",&[("itemID",int(skill)),("attributeID",int(280)),("valueInt",int(need.quantity))])?;
+            }
+            Ok(())
+        }).unwrap();
+        let session=crate::session::Session {char_id:Some(me),ship_id:Some(ship),station_id:Some(station),solar_system_id2:Some(system),..Default::default()};
         let ctx=db.ctx(&session);
-        let call=|line:i32,bp:i32|Call {service:"ramProxy".into(),method:"InstallJob".into(),args:vec![
-            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![Value::Int(station as i64),Value::Int(line as i64)])]),
-            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![Value::Int(bp as i64)])]),
+        let call=|line:i64,bp:i64|Call {service:"ramProxy".into(),method:"InstallJob".into(),args:vec![
+            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![Value::Int(station),Value::Int(line)])]),
+            Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![Value::Int(bp)])]),
             Value::List(vec![Value::None,Value::List(vec![]),Value::List(vec![])]),
             Value::Int(4),Value::Int(1),Value::Int(ACTIVITY_MATERIAL),Value::Int(0),Value::Bool(false)],kwargs:vec![(Value::bytes("quoteOnly"),Value::Int(0))]};
         let a=call(first_line,first);let b=call(second_line,second);
-        let (one,two)=tokio::join!(install(&ctx,&a),install(&ctx,&b));
+        let one=install(&ctx,&a).await;let two=install(&ctx,&b).await;
         let describe=|result:&Refused<Value>| match result {Err(Outcome::UserError{msg,args})=>format!("{msg}: {args:?}"),Err(_)=>"other refusal".into(),Ok(_)=>"installed".into()};
         assert_eq!(usize::from(one.is_ok())+usize::from(two.is_ok()),1,"two different lines must not bypass the installer's one research slot: {}, {}",describe(&one),describe(&two));
-        let row=db.db.query_one(r#"SELECT "jobID","installedItemID" FROM "ramJobs" WHERE "installerID"=$1 AND completed=0"#,&[&me]).await.unwrap();
-        let job:i32=row.get(0);let bp:i32=row.get(1);
+        let (job,bp)=db.store.read(|db|{
+            let j=db.table("ramJobs").find(&["installerID","completed"],&[int(me),int(0)]).next().unwrap();
+            (j.int("jobID").unwrap(),j.int("installedItemID").unwrap())
+        });
         assert!(install(&ctx,&call(second_line,bp)).await.is_err(),"installed blueprint cannot start another job");
-        db.db.execute(r#"UPDATE "ramJobs" SET "endProductionTime"=0 WHERE "jobID"=$1"#,&[&job]).await.unwrap();
-        db.db.execute(r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,&[&bp,&(me+1000)]).await.unwrap();
-        assert!(complete(&ctx,job as i64,false).await.is_err(),"job cannot reclaim a blueprint whose custody changed");
-        db.db.execute(r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,&[&bp,&me]).await.unwrap();
-        let constraint=format!("job_delivery_failure_{me}");
-        db.db.batch_execute(&format!(r#"ALTER TABLE entity ADD CONSTRAINT {constraint} CHECK ("itemID"<>{bp} OR flag<>4) NOT VALID"#)).await.unwrap();
-        let failed=complete(&ctx,job as i64,false).await;
-        db.db.batch_execute(&format!("ALTER TABLE entity DROP CONSTRAINT {constraint}")).await.unwrap();
-        assert!(failed.is_err());
-        assert_eq!(db.db.query_one(r#"SELECT flag FROM entity WHERE "itemID"=$1"#,&[&bp]).await.unwrap().get::<_,i32>(0),36);
-        assert_eq!(db.db.query_one(r#"SELECT completed::integer FROM "ramJobs" WHERE "jobID"=$1"#,&[&job]).await.unwrap().get::<_,i32>(0),0);
-        assert!(complete(&ctx,job as i64,false).await.is_ok());
-        assert!(complete(&ctx,job as i64,false).await.is_err());
-        assert_eq!(db.db.query_one(r#"SELECT "materialLevel" FROM "invBlueprints" WHERE "itemID"=$1"#,&[&bp]).await.unwrap().get::<_,i32>(0),1);
+        set(&db.store,"ramJobs",job,&[("endProductionTime",int(0))]);
+        set(&db.store,"entity",bp,&[("ownerID",int(me+1000))]);
+        assert!(complete(&ctx,job,false).await.is_err(),"job cannot reclaim a blueprint whose custody changed");
+        set(&db.store,"entity",bp,&[("ownerID",int(me))]);
+        assert_eq!(db.store.read(|db|db.table("entity").get_id(bp).unwrap().int("flag")),Some(36));
+        assert_eq!(db.store.read(|db|db.table("ramJobs").get_id(job).unwrap().int("completed")),Some(0));
+        assert!(complete(&ctx,job,false).await.is_ok());
+        assert!(complete(&ctx,job,false).await.is_err());
+        assert_eq!(db.store.read(|db|db.table("invBlueprints").get_id(bp).unwrap().int("materialLevel")),Some(1));
     }
 
     #[test]

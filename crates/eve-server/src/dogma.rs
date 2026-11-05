@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::RwLock;
 
-use tokio_postgres::GenericClient;
+use crate::store::{self, Db, StoreError};
 
 pub mod attr {
     pub const IS_ONLINE: i32 = 2;
@@ -123,7 +123,7 @@ impl Piece {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Modifier {
     type_id: i64,
     category: i16,
@@ -171,22 +171,22 @@ struct AttributeType {
     stackable: bool,
 }
 
-/// What dogma needs from the database, loaded once and shared.
+/// What dogma keeps between loadouts: attribute defaults from the static
+/// data, and the fleet bonuses currently in force.
 pub struct Catalog {
     attributes: HashMap<i32, AttributeType>,
     fleet_bonuses: RwLock<HashMap<i64, BTreeMap<i32, f64>>>,
 }
 
 impl Catalog {
-    pub async fn load(db: &impl GenericClient) -> Result<Self, tokio_postgres::Error> {
-        let rows = db
-            .query(r#"SELECT "attributeID", coalesce("defaultValue", 0)::float8, coalesce("stackable", 1)::int FROM "dgmAttributeTypes""#, &[])
-            .await?;
-        let attributes = rows
-            .iter()
-            .map(|r| (r.get::<_, i32>(0), AttributeType { default: r.get(1), stackable: r.get::<_, i32>(2) != 0 }))
+    pub fn new() -> Self {
+        let attributes = crate::sde::get()
+            .attribute_types()
+            .map(|(id, a)| {
+                (id, AttributeType { default: a.default_value.unwrap_or(0.0), stackable: a.stackable.unwrap_or(true) })
+            })
             .collect();
-        Ok(Catalog { attributes, fleet_bonuses: RwLock::new(HashMap::new()) })
+        Catalog { attributes, fleet_bonuses: RwLock::new(HashMap::new()) }
     }
 
     pub fn fleet_bonuses(&self, char_id: i64) -> BTreeMap<i32, f64> {
@@ -216,6 +216,66 @@ impl Catalog {
     }
 }
 
+/// Original effects 234/235/494 supply the Warp Drive Operation level
+/// multiplier and ship warp-capacitor percentage. The imported modifier
+/// table maps them for skill3455/implant13241, but omits rig26066 despite
+/// its identical original effect494. A type with one of these effects and no
+/// modifiers of its own for it borrows that effect's modifiers from the types
+/// that have them (each distinct one once); no persistent rows are added.
+const BORROWED_EFFECTS: [i32; 3] = [234, 235, 494];
+
+/// A type's modifiers: its own from dgmTypeModifiers, then any it borrows.
+fn type_modifiers(sde: &crate::sde::Sde, type_id: i64) -> Vec<Modifier> {
+    let mut out: Vec<Modifier> = sde.type_modifiers(type_id).filter_map(|m| modifier(type_id, m.effect_category, m)).collect();
+    let mut borrowed: Vec<Modifier> = Vec::new();
+    for effect_id in sde.type_effects(type_id).iter().filter(|e| BORROWED_EFFECTS.contains(e)) {
+        let Some(effect) = sde.effect(*effect_id) else { continue };
+        if sde.type_modifiers(type_id).any(|m| m.effect_name == effect.name) {
+            continue;
+        }
+        for m in sde.effect_modifiers(&effect.name).filter_map(|m| modifier(type_id, effect.category, m)) {
+            if !borrowed.contains(&m) {
+                borrowed.push(m);
+            }
+        }
+    }
+    out.extend(borrowed);
+    out
+}
+
+/// A modifier row as dogma applies it, for `type_id`; None for a func or
+/// domain the engine does not model.
+fn modifier(type_id: i64, category: i16, m: &crate::sde::TypeModifier) -> Option<Modifier> {
+    let func = match &*m.func {
+        "ItemModifier" => Func::Item,
+        "LocationGroupModifier" => Func::LocationGroup,
+        "LocationRequiredSkillModifier" => Func::LocationRequiredSkill,
+        "OwnerRequiredSkillModifier" => Func::OwnerRequiredSkill,
+        "LocationModifier" => Func::Location,
+        _ => return None,
+    };
+    let domain = match &*m.domain {
+        "shipID" => Domain::Ship,
+        "charID" => Domain::Char,
+        "itemID" => Domain::Itself,
+        "otherID" => Domain::Other,
+        "targetID" | "target" => Domain::Target,
+        _ => return None,
+    };
+    Some(Modifier {
+        type_id,
+        category,
+        func,
+        domain,
+        modified: m.modified_attribute_id,
+        modifying: m.modifying_attribute_id,
+        operation: m.operation,
+        group_id: m.group_id.map(i64::from),
+        skill_type_id: m.skill_type_id.map(i64::from),
+        off_while_active: m.off_while_active,
+    })
+}
+
 pub struct Loadout<'c> {
     catalog: &'c Catalog,
     pub pieces: Vec<Piece>,
@@ -229,62 +289,63 @@ impl<'c> Loadout<'c> {
     /// The character, its skills and implants, and (if given) its ship with
     /// whatever is fitted. A module is online when its isOnline attribute says
     /// so; `active` lists modules whose active effects are running.
-    pub async fn load(
-        db: &impl GenericClient,
+    pub fn load(
+        db: &Db,
         catalog: &'c Catalog,
         char_id: i64,
         ship_id: Option<i64>,
         active: &HashSet<i64>,
-    ) -> Result<Loadout<'c>, tokio_postgres::Error> {
-        Self::load_with_drones(db, catalog, char_id, ship_id, active, &[]).await
+    ) -> Result<Loadout<'c>, StoreError> {
+        Self::load_with_drones(db, catalog, char_id, ship_id, active, &[])
     }
 
     /// As [`Loadout::load`], with some of the character's drones as well.
-    pub async fn load_with_drones(
-        db: &impl GenericClient,
+    pub fn load_with_drones(
+        db: &Db,
         catalog: &'c Catalog,
         char_id: i64,
         ship_id: Option<i64>,
         active: &HashSet<i64>,
         drones: &[i64],
-    ) -> Result<Loadout<'c>, tokio_postgres::Error> {
-        let drone_ids: Vec<i32> = drones.iter().map(|d| *d as i32).collect();
-        let rows = db
-            .query(
-                r#"SELECT e."itemID", e."typeID", t."groupID", g."categoryID", e."flag", e."locationID"
-                     FROM entity e
-                     JOIN "invTypes" t ON t."typeID" = e."typeID"
-                     JOIN "invGroups" g ON g."groupID" = t."groupID"
-                    WHERE (e."itemID" = $1 OR e."itemID" = $2
-                       OR (e."locationID" = $1 AND e."flag" IN ($3, $4, $5, $6))
-                       OR (e."locationID" = $2 AND (e."flag" BETWEEN $7 AND $8 OR e."flag" BETWEEN $9 AND $10))
-                       OR e."itemID" = ANY($11))
-                      AND (e.flag <> 88 OR EXISTS (SELECT 1 FROM character_boosters b
-                           WHERE b.item=e."itemID" AND b.character=$1 AND b.type_id=e."typeID"
-                             AND e."ownerID"=$1 AND e."locationID"=$1 AND e.quantity=1 AND e.singleton=1
-                             AND b.expires>$12))
-                    ORDER BY e."itemID""#,
-                &[
-                    &(char_id as i32),
-                    &(ship_id.unwrap_or(0) as i32),
-                    &FLAG_SKILL,
-                    &FLAG_SKILL_IN_TRAINING,
-                    &FLAG_BOOSTER,
-                    &FLAG_IMPLANT,
-                    &(FLAG_SLOT_FIRST as i32),
-                    &(FLAG_SLOT_LAST as i32),
-                    &(FLAG_RIG_FIRST as i32),
-                    &(FLAG_RIG_LAST as i32),
-                    &drone_ids,
-                    &crate::bulkdata::filetime_now(),
-                ],
-            )
-            .await?;
+    ) -> Result<Loadout<'c>, StoreError> {
+        let sde = crate::sde::get();
+        let entity = db.table("entity");
+        let ship = ship_id.unwrap_or(0);
+        // The character and ship themselves, the character's skills,
+        // boosters and implants, what is fitted to the ship, and the drones,
+        // by itemID.
+        let mut candidates: Vec<store::Row> = Vec::new();
+        candidates.extend(entity.get_id(char_id));
+        candidates.extend(entity.get_id(ship));
+        let on_character = [FLAG_SKILL, FLAG_SKILL_IN_TRAINING, FLAG_BOOSTER, FLAG_IMPLANT].map(i64::from);
+        candidates.extend(entity.find(&["locationID"], &[store::Value::Int(char_id)]).filter(|e| e.int("flag").is_some_and(|f| on_character.contains(&f))));
+        let fitted = |f: i64| (FLAG_SLOT_FIRST..=FLAG_SLOT_LAST).contains(&f) || (FLAG_RIG_FIRST..=FLAG_RIG_LAST).contains(&f);
+        candidates.extend(entity.find(&["locationID"], &[store::Value::Int(ship)]).filter(|e| e.int("flag").is_some_and(fitted)));
+        candidates.extend(drones.iter().filter_map(|d| entity.get_id(*d)));
+        let found: BTreeMap<i64, store::Row> = candidates.into_iter().filter_map(|r| Some((r.int("itemID")?, r))).collect();
+        // A booster counts only while the character has it running.
+        let now = crate::bulkdata::filetime_now();
+        let boosters = db.table("character_boosters");
+        let running = |e: &store::Row| {
+            boosters.get_id(e.int("itemID").unwrap_or(0)).is_some_and(|b| {
+                b.int("character") == Some(char_id)
+                    && b.int("type_id") == e.int("typeID")
+                    && e.int("ownerID") == Some(char_id)
+                    && e.int("locationID") == Some(char_id)
+                    && e.int("quantity") == Some(1)
+                    && e.int("singleton") == Some(1)
+                    && b.int("expires").is_some_and(|t| t > now)
+            })
+        };
+        let rows: Vec<store::Row> = found.into_values().filter(|e| e.int("flag") != Some(i64::from(FLAG_BOOSTER)) || running(e)).collect();
         let mut pieces = Vec::with_capacity(rows.len());
         for r in &rows {
-            let item_id = r.get::<_, i32>(0) as i64;
-            let category_id = r.get::<_, i32>(3) as i64;
-            let flag = r.get::<_, i32>(4) as i64;
+            let item_id = r.int("itemID").unwrap_or(0);
+            let type_id = r.int("typeID").unwrap_or(0);
+            // An item of a type the static data does not know (or whose
+            // group it does not know) is left out, as joining on it did.
+            let Some((group_id, category_id)) = sde.group_and_category(type_id) else { continue };
+            let flag = r.int("flag").unwrap_or(0);
             let role = if item_id == char_id {
                 Role::Character
             } else if Some(item_id) == ship_id {
@@ -293,7 +354,7 @@ impl<'c> Loadout<'c> {
                 Role::Skill
             } else if drones.contains(&item_id) {
                 Role::Drone
-            } else if r.get::<_, i32>(5) as i64 == char_id {
+            } else if r.int("locationID") == Some(char_id) {
                 Role::Implant
             } else if category_id == category::CHARGE {
                 Role::Charge { module: usize::MAX }
@@ -302,8 +363,8 @@ impl<'c> Loadout<'c> {
             };
             pieces.push(Piece {
                 item_id,
-                type_id: r.get::<_, i32>(1) as i64,
-                group_id: r.get::<_, i32>(2) as i64,
+                type_id,
+                group_id,
                 category_id,
                 flag,
                 role,
@@ -322,49 +383,21 @@ impl<'c> Loadout<'c> {
             }
         }
 
-        let type_ids: Vec<i32> = pieces.iter().map(|p| p.type_id as i32).collect();
-        let item_ids: Vec<i32> = pieces.iter().map(|p| p.item_id as i32).collect();
-        let index: HashMap<i64, usize> = pieces.iter().enumerate().map(|(i, p)| (p.item_id, i)).collect();
-
-        let type_attrs = db
-            .query(
-                r#"SELECT "typeID", "attributeID", coalesce("valueFloat", "valueInt"::float8)
-                     FROM "dgmTypeAttributes" WHERE "typeID" = ANY($1)"#,
-                &[&type_ids],
-            )
-            .await?;
-        let mut by_type: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
-        for r in &type_attrs {
-            if let Some(v) = r.get::<_, Option<f64>>(2) {
-                by_type.entry(r.get::<_, i32>(0) as i64).or_default().push((r.get(1), v));
+        for p in pieces.iter_mut() {
+            p.base.extend(sde.type_attributes(p.type_id).iter().copied());
+        }
+        // Each item's own stored values override its type's.
+        let attributes = db.table("entity_attributes");
+        for p in pieces.iter_mut() {
+            for r in attributes.find(&["itemID"], &[store::Value::Int(p.item_id)]) {
+                let value = r.float("valueFloat").or_else(|| r.float("valueInt"));
+                let (Some(attribute), Some(v)) = (r.int("attributeID"), value) else { continue };
+                p.base.insert(attribute as i32, v);
             }
         }
-        for p in pieces.iter_mut() {
-            p.base.extend(by_type.get(&p.type_id).into_iter().flatten().copied());
-        }
-        let own = db
-            .query(
-                r#"SELECT "itemID", "attributeID", coalesce("valueFloat", "valueInt"::float8)
-                     FROM entity_attributes WHERE "itemID" = ANY($1)"#,
-                &[&item_ids],
-            )
-            .await?;
-        for r in &own {
-            let (Some(&i), Some(v)) = (index.get(&(r.get::<_, i32>(0) as i64)), r.get::<_, Option<f64>>(2)) else {
-                continue;
-            };
-            pieces[i].base.insert(r.get(1), v);
-        }
 
-        let effects = db
-            .query(r#"SELECT "typeID", "effectID" FROM "dgmTypeEffects" WHERE "typeID" = ANY($1)"#, &[&type_ids])
-            .await?;
-        let mut effects_by_type: HashMap<i64, HashSet<i32>> = HashMap::new();
-        for r in &effects {
-            effects_by_type.entry(r.get::<_, i32>(0) as i64).or_default().insert(r.get(1));
-        }
         for p in pieces.iter_mut() {
-            p.effects = effects_by_type.get(&p.type_id).cloned().unwrap_or_default();
+            p.effects = sde.type_effects(p.type_id).iter().copied().collect();
             p.state = match p.role {
                 Role::Module if active.contains(&p.item_id) => State::Active,
                 Role::Module if p.base.get(&attr::IS_ONLINE).copied().unwrap_or(0.0) != 0.0 => State::Online,
@@ -373,62 +406,10 @@ impl<'c> Loadout<'c> {
             };
         }
 
-        let rows = db
-            .query(
-                r#"SELECT "typeID","effectCategory",func,domain,"modifiedAttributeID","modifyingAttributeID",
-                          operation,"groupID","skillTypeID","offWhileActive"
-                     FROM "dgmTypeModifiers" WHERE "typeID" = ANY($1)
-                   UNION ALL
-                   SELECT DISTINCT te."typeID", e."effectCategory"::smallint, m.func, m.domain,
-                          m."modifiedAttributeID", m."modifyingAttributeID", m.operation,
-                          m."groupID", m."skillTypeID", m."offWhileActive"
-                     FROM "dgmTypeEffects" te
-                     JOIN "dgmEffects" e ON e."effectID" = te."effectID"
-                     JOIN "dgmTypeModifiers" m ON m."effectName" = e."effectName"
-                    WHERE te."typeID" = ANY($1) AND e."effectID" IN (234,235,494)
-                      AND NOT EXISTS (SELECT 1 FROM "dgmTypeModifiers" own
-                          WHERE own."typeID" = te."typeID" AND own."effectName" = e."effectName")"#,
-                &[&type_ids],
-            )
-            .await?;
-        // Original effects 234/235/494 supply the Warp Drive Operation level
-        // multiplier and ship warp-capacitor percentage. The imported modifier
-        // table maps them for skill3455/implant13241, but omits rig26066 despite
-        // its identical original effect494. Reuse only these effect templates
-        // when absent; existing mappings win, and no persistent rows are added.
-        let modifiers = rows
-            .iter()
-            .filter_map(|r| {
-                let func = match r.get::<_, &str>(2) {
-                    "ItemModifier" => Func::Item,
-                    "LocationGroupModifier" => Func::LocationGroup,
-                    "LocationRequiredSkillModifier" => Func::LocationRequiredSkill,
-                    "OwnerRequiredSkillModifier" => Func::OwnerRequiredSkill,
-                    "LocationModifier" => Func::Location,
-                    _ => return None,
-                };
-                let domain = match r.get::<_, &str>(3) {
-                    "shipID" => Domain::Ship,
-                    "charID" => Domain::Char,
-                    "itemID" => Domain::Itself,
-                    "otherID" => Domain::Other,
-                    "targetID" | "target" => Domain::Target,
-                    _ => return None,
-                };
-                Some(Modifier {
-                    type_id: r.get::<_, i32>(0) as i64,
-                    category: r.get(1),
-                    func,
-                    domain,
-                    modified: r.get(4),
-                    modifying: r.get(5),
-                    operation: r.get(6),
-                    group_id: r.get::<_, Option<i32>>(7).map(i64::from),
-                    skill_type_id: r.get::<_, Option<i32>>(8).map(i64::from),
-                    off_while_active: r.get(9),
-                })
-            })
-            .collect();
+        let mut type_ids: Vec<i64> = pieces.iter().map(|p| p.type_id).collect();
+        type_ids.sort_unstable();
+        type_ids.dedup();
+        let modifiers = type_ids.into_iter().flat_map(|t| type_modifiers(sde, t)).collect();
 
         let mut loadout = Loadout {
             catalog,
@@ -734,46 +715,51 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with original imported static data"]
     async fn original_warp_cost_skill_implant_and_rig_effects_reach_ship() {
+        use crate::store::Value as V;
         let database=crate::test_support::Database::load().await;
-        let owner=database.id().await;
-        let ship=database.id().await;
-        let skill=database.id().await;
-        let implant=database.id().await;
-        let rig=database.id().await;
-        let ids=vec![owner,ship,skill,implant,rig];
+        let owner=database.id().await as i64;
+        let ship=database.id().await as i64;
+        let skill=database.id().await as i64;
+        let implant=database.id().await as i64;
+        let rig=database.id().await as i64;
+        let insert=|id:i64,kind:i64,location:i64,flag:i64| {
+            database.store.write(|tx| tx.insert("entity",&[("itemID",V::Int(id)),("typeID",V::Int(kind)),("ownerID",V::Int(owner)),("locationID",V::Int(location)),
+                ("flag",V::Int(flag)),("quantity",V::Int(1)),("singleton",V::Int(1))])).unwrap();
+        };
+        let load=|| database.store.read(|db| Loadout::load(db,&database.dogma,owner,Some(ship),&HashSet::new())).unwrap();
         for (id,kind,location,flag) in [(owner,1373,ship,57),(ship,587,60014689,4),(skill,3455,owner,7)] {
-            database.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES($1,$2,$3,$4,$5,1,1)"#,&[&id,&kind,&owner,&location,&flag]).await.unwrap();
+            insert(id,kind,location,flag);
         }
-        database.db.execute(r#"INSERT INTO entity_attributes("itemID","attributeID","valueInt") VALUES($1,280,0)"#,&[&skill]).await.unwrap();
         let mut base=0.0;
         for level in [0,1,5] {
-            database.db.execute(r#"UPDATE entity_attributes SET "valueInt"=$2 WHERE "itemID"=$1 AND "attributeID"=280"#,&[&skill,&i64::from(level)]).await.unwrap();
-            let loadout=Loadout::load(&database.db,&database.dogma,owner as i64,Some(ship as i64),&HashSet::new()).await.unwrap();
+            database.store.write(|tx| tx.upsert("entity_attributes",&["itemID","attributeID"],
+                &[("itemID",V::Int(skill)),("attributeID",V::Int(280)),("valueInt",V::Int(level))],&[("valueInt",V::Int(level))])).unwrap();
+            let loadout=load();
             let actual=loadout.value(loadout.ship().unwrap(),153);
             if level==0 { base=actual; assert!(base>0.0,"original Rifter warp cost"); }
-            let expected=base*(1.0-f64::from(level)*0.1);
+            let expected=base*(1.0-level as f64*0.1);
             assert!((actual-expected).abs()<base*1e-10,"level {level}: {actual} vs {expected}");
-            assert_eq!(loadout.value(loadout.find(skill as i64).unwrap(),319),-10.0*f64::from(level));
+            assert_eq!(loadout.value(loadout.find(skill).unwrap(),319),-10.0*level as f64);
         }
         for (id,kind,location,flag,coefficient) in [
             (implant,13241,owner,89,0.5*0.94),
             (rig,26066,ship,92,0.5*0.94*0.8),
         ] {
-            database.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES($1,$2,$3,$4,$5,1,1)"#,&[&id,&kind,&owner,&location,&flag]).await.unwrap();
-            let loadout=Loadout::load(&database.db,&database.dogma,owner as i64,Some(ship as i64),&HashSet::new()).await.unwrap();
+            insert(id,kind,location,flag);
+            let loadout=load();
             let actual=loadout.value(loadout.ship().unwrap(),153);
             assert!((actual-base*coefficient).abs()<base*1e-10,"type {kind}: {actual} vs {}",base*coefficient);
         }
         // A rig outside the fitting and an unplugged implant no longer apply.
-        database.db.execute(r#"UPDATE entity SET "locationID"=60014689,flag=4 WHERE "itemID"=ANY($1)"#,&[&vec![implant,rig]]).await.unwrap();
-        let loadout=Loadout::load(&database.db,&database.dogma,owner as i64,Some(ship as i64),&HashSet::new()).await.unwrap();
+        database.store.write(|tx| {
+            for id in [implant,rig] {
+                let row=tx.table("entity").get_id(id).unwrap().id;
+                tx.update("entity",row,&[("locationID",V::Int(60014689)),("flag",V::Int(4))])?;
+            }
+            Ok::<_,StoreError>(())
+        }).unwrap();
+        let loadout=load();
         assert!((loadout.value(loadout.ship().unwrap(),153)-base*0.5).abs()<base*1e-10);
-        drop(loadout);
-        database.db.execute(r#"DELETE FROM entity_attributes WHERE "itemID"=ANY($1)"#,&[&ids]).await.unwrap();
-        database.db.execute(r#"DELETE FROM entity WHERE "itemID"=ANY($1)"#,&[&ids]).await.unwrap();
     }
 }

@@ -17,12 +17,11 @@
 use std::collections::HashMap;
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::info;
 
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::Db;
 use crate::svc::membership::{message, Refused};
-use crate::svc::rows::{int, text};
 use crate::world::{Move, WorldState};
 
 /// const.gangLeaderRole; members are 0.
@@ -175,7 +174,7 @@ async fn invite(ctx: &Ctx<'_>, me: i64, invitee: i64, ignore_wars: bool) -> Refu
         return invite_bot(ctx, me, invitee, mine.as_ref());
     }
     if !online {
-        return Err(message_with("GangCandidateOffline", &[("invitee", Value::text(name_of(ctx.db, invitee).await))]));
+        return Err(message_with("GangCandidateOffline", &[("invitee", Value::text(ctx.store.read(|db| name_of(db, invitee))))]));
     }
     if let Some((_, g)) = &mine {
         if g.sitting_leader().is_some_and(|l| l != me) {
@@ -193,20 +192,19 @@ async fn invite(ctx: &Ctx<'_>, me: i64, invitee: i64, ignore_wars: bool) -> Refu
     let members = mine.as_ref().map_or_else(|| vec![me], |(_, g)| g.members.clone());
     let mut member_sides = Vec::new();
     for m in &members {
-        member_sides.push(side_of(ctx.db, *m).await);
+        member_sides.push(ctx.store.read(|db| side_of(db, *m)));
     }
-    let invitee_side = side_of(ctx.db, invitee).await;
+    let invitee_side = ctx.store.read(|db| side_of(db, invitee));
     let gang_enemies: Vec<i64> = dedup(member_sides.iter().flat_map(|s| crate::svc::war::enemies_of(*s)).collect());
     let brought: Vec<i64> = crate::svc::war::enemies_of(invitee_side).into_iter().filter(|e| !gang_enemies.contains(e)).collect();
     if !ignore_wars && !brought.is_empty() {
-        let names = names_of(ctx.db, &brought).await;
+        let names = ctx.store.read(|db| names_of(db, &brought));
         return Err(match names.as_slice() {
             [one] => message_with("GangCandidateDodgy1", &[("corpName", Value::text(one))]),
             many => message_with("GangCandidateDodgyN", &[("corpNames", Value::text(many.join(", ")))]),
         });
     }
-    let my_name = name_of(ctx.db, me).await;
-    let enemy_names = names_of(ctx.db, &gang_enemies).await;
+    let (my_name, enemy_names) = ctx.store.read(|db| (name_of(db, me), names_of(db, &gang_enemies)));
     let (key, args): (&str, Vec<(&str, String)>) = match enemy_names.as_slice() {
         [] => ("AskJoinGang", vec![("name", my_name)]),
         [one] => ("GangMembersDodgy1", vec![("name", my_name), ("corpName", one.clone())]),
@@ -445,29 +443,26 @@ pub(super) fn tell_system(w: &WorldState, char_id: i64, gang_id: Option<i64>) {
 }
 
 /// A character's side in a war: its corporation's alliance, or the corporation.
-pub(super) async fn side_of(db: &impl GenericClient, char_id: i64) -> i64 {
-    let sql = r#"SELECT COALESCE(NULLIF(co."allianceID", 0), c."corporationID")
-                   FROM "character_" c JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                  WHERE c."characterID" = $1"#;
-    db.query_opt(sql, &[&(char_id as i32)]).await.ok().flatten().and_then(|r| int(&r, 0)).unwrap_or(0)
+pub(super) fn side_of(db: &Db, char_id: i64) -> i64 {
+    let Some(corp) = db.table("character_").get_id(char_id).and_then(|c| c.int("corporationID")) else { return 0 };
+    let Some(co) = db.table("corporation").get_id(corp) else { return 0 };
+    co.int("allianceID").filter(|a| *a != 0).unwrap_or(corp)
 }
 
-pub(super) async fn name_of(db: &impl GenericClient, char_id: i64) -> String {
-    let sql = r#"SELECT "characterName" FROM "character_" WHERE "characterID" = $1"#;
-    db.query_opt(sql, &[&(char_id as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_default()
+pub(super) fn name_of(db: &Db, char_id: i64) -> String {
+    db.table("character_").get_id(char_id).and_then(|r| r.text("characterName")).unwrap_or_default().to_string()
 }
 
 /// Corporation and alliance names, in the order given.
-pub(super) async fn names_of(db: &impl GenericClient, owners: &[i64]) -> Vec<String> {
-    let mut names = Vec::new();
-    for o in owners {
-        let sql = r#"SELECT COALESCE((SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $1),
-                                     (SELECT "allianceName" FROM "alliances" WHERE "allianceID" = $1), '')"#;
-        if let Some(n) = db.query_opt(sql, &[&(*o as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)) {
-            names.push(n);
-        }
-    }
-    names
+pub(super) fn names_of(db: &Db, owners: &[i64]) -> Vec<String> {
+    owners
+        .iter()
+        .map(|o| {
+            let corp = db.table("corporation").get_id(*o).and_then(|r| r.text("corporationName"));
+            let alliance = || db.table("alliances").get_id(*o).and_then(|r| r.text("allianceName"));
+            corp.or_else(alliance).unwrap_or_default().to_string()
+        })
+        .collect()
 }
 
 fn dedup(mut v: Vec<i64>) -> Vec<i64> {

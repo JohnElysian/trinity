@@ -13,7 +13,6 @@
 
 use std::time::{Duration, Instant};
 
-use tokio_postgres::Client;
 use tracing::info;
 
 use super::behaviour::{self, Activity, Atlas, Bot};
@@ -21,6 +20,7 @@ use super::politics::Politics;
 use super::presence::{Identity, Presence, Rally};
 use super::sov::{self, News, Siege};
 use crate::combat::Rng;
+use crate::store::{Store, StoreError};
 use crate::world::World;
 
 /// A fleet is one ship for this many pilots in its alliance, within bounds.
@@ -86,7 +86,7 @@ impl Report {
 pub async fn run(
     sieges: &mut Vec<Siege>,
     world: &World,
-    db: &Client,
+    store: &Store,
     atlas: &Atlas,
     bots: &mut [Bot],
     ids: &[Identity],
@@ -96,7 +96,7 @@ pub async fn run(
     clock: u32,
     claim_delay_secs: i64,
     speed: f64,
-) -> Result<Report, tokio_postgres::Error> {
+) -> Result<Report, StoreError> {
     let mut report = Report::default();
     let mut kept = Vec::new();
     for mut s in std::mem::take(sieges) {
@@ -143,8 +143,8 @@ pub async fn run(
             kept.push(s);
             continue;
         };
-        report.news.push(sov::conclude(db, p, &s, won, lost, rng, claim_delay_secs, speed).await?);
-        sov::show_towers(db, world, s.system).await;
+        report.news.push(sov::conclude(store, p, &s, won, lost, rng, claim_delay_secs, speed).await?);
+        sov::show_towers(store, world, s.system).await;
         if let Some(f) = s.fight.take() {
             for i in f.attackers.into_iter().chain(f.defenders) {
                 presence.dismiss(i);

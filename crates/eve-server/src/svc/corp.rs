@@ -4,10 +4,12 @@ pub(crate) use offices::{ensure_schema as ensure_office_schema,ensure_slots_lock
 use eve_marshal::Value;
 use tracing::error;
 
+use crate::items::{invitem_lines, INVITEM_COLUMNS};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, StoreError};
 use crate::svc::bound;
-use crate::svc::inventory::{FLAG_CORP_MARKET, INVITEM_HEADER, INVITEM_SELECT};
-use crate::svc::rows::{cell, index_rowset, int, line, lines, row, rowset};
+use crate::svc::inventory::FLAG_CORP_MARKET;
+use crate::svc::rows::{index_rowset, row, rowset};
 
 pub async fn registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     Some(corp_registry(ctx, &call.method, &call.args).await)
@@ -35,11 +37,15 @@ pub async fn corpmgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             ))
         }
         "GetCorporationStations" => {
-            let sql = r#"SELECT "stationID" AS "itemID", "solarSystemID" AS "locationID",
-                                "stationTypeID" AS "typeID"
-                           FROM "staStations" WHERE "corporationID" = $1 ORDER BY "stationID""#;
-            let corp = ctx.session.corp_id.unwrap_or(0) as i32;
-            ctx.rowset(&["itemID", "locationID", "typeID"], sql, &[&corp]).await
+            let corp = ctx.session.corp_id.unwrap_or(0);
+            let mut stations: Vec<(i64, Vec<Value>)> = ctx.store.read(|db| {
+                db.table("staStations")
+                    .find(&["corporationID"], &[store::Value::Int(corp)])
+                    .map(|r| (r.int("stationID").unwrap_or(0), r.line(&["stationID", "solarSystemID", "stationTypeID"])))
+                    .collect()
+            });
+            stations.sort_by_key(|(id, _)| *id);
+            rowset(&["itemID", "locationID", "typeID"], stations.into_iter().map(|(_, l)| Value::List(l)).collect())
         }
         "GetItemsRented" => return Some(match items_rented(ctx).await {
             Ok(value)=>Outcome::Value(value),Err(error)=>{error!("corporation rentals: {}",crate::logging::chain(&error));Outcome::custom("The corporation's rentals could not be read.")}
@@ -58,7 +64,7 @@ pub async fn corpmgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             let which = call.arg_text(2).unwrap_or_default();
             match own_corp(ctx, arg0) {
                 Some(corp) => asset_items(ctx, corp, call.arg_id(1), &which).await,
-                None => rowset(INVITEM_HEADER, Vec::new()),
+                None => rowset(&INVITEM_COLUMNS, Vec::new()),
             }
         }
         // (memberID, fromDate, toDate, rowsPerPage): item and role audit trails.
@@ -73,44 +79,90 @@ pub async fn corpmgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 }
 
 /// The corporation ID if it is the caller's own; assets are not public.
-fn own_corp(ctx: &Ctx<'_>, corp_id: i64) -> Option<i32> {
-    (ctx.session.corp_id == Some(corp_id)).then_some(corp_id as i32)
+fn own_corp(ctx: &Ctx<'_>, corp_id: i64) -> Option<i64> {
+    (ctx.session.corp_id == Some(corp_id)).then_some(corp_id)
 }
 
 /// The corporation asset and wallet views share these rental records.
-async fn items_rented(ctx: &Ctx<'_>) -> Result<Value,tokio_postgres::Error> {
-    let sql = r#"SELECT "typeID", "stationID" AS "rentedFromID", "startDate",
-                  "rentPeriodInDays", "slotNumber" AS "flag", "periodCost", "balanceDueDate"
-             FROM "rentalInfo" WHERE "renterID" = $1 AND "renterID">0 ORDER BY "stationID", "slotNumber""#;
-    let corp = ctx.session.corp_id.unwrap_or(0) as i32;
+async fn items_rented(ctx: &Ctx<'_>) -> Result<Value,StoreError> {
+    let corp = ctx.session.corp_id.unwrap_or(0);
     let header = ["typeID", "rentedFromID", "startDate", "rentPeriodInDays", "flag", "periodCost", "balanceDueDate"];
     // Earlier builds created offices without rentalInfo. Preserve existing
-    // history while linking those offices under the station rental lock.
-    let stations=ctx.db.query(r#"SELECT DISTINCT "stationID" FROM "crpOffices" WHERE "corporationID"=$1 AND "rentalSlot" IS NULL ORDER BY 1"#,&[&corp]).await?;
+    // history while linking those offices to their stations' rental slots.
+    let mut stations:Vec<i64>=ctx.store.read(|db|db.table("crpOffices").find(&["corporationID"],&[store::Value::Int(corp)])
+        .filter(|o|o.value("rentalSlot").is_null()).filter_map(|o|o.int("stationID")).collect());
+    stations.sort_unstable();stations.dedup();
     if !stations.is_empty() {
-        let mut db=crate::db::connect(ctx.db_url).await?;let tx=db.transaction().await?;
-        for row in stations {
-            let station:i32=row.get(0);
-            if tx.query_opt(r#"SELECT 1 FROM "staStations" WHERE "stationID"=$1 FOR UPDATE"#,&[&station]).await?.is_some() {
-                ensure_office_slots_locked(&tx,station).await?;
+        ctx.store.write(|tx|{
+            for station in stations {
+                if tx.table("staStations").get_id(station).is_some() {
+                    ensure_office_slots_locked(tx,station)?;
+                }
             }
-        }
-        tx.commit().await?;
+            Ok::<_,StoreError>(())
+        })?;
     }
-    Ok(rowset(&header,lines(&ctx.db.query(sql,&[&corp]).await?)))
+    let mut rented:Vec<((i64,i64),Vec<Value>)>=ctx.store.read(|db|db.table("rentalInfo").find(&["renterID"],&[store::Value::Int(corp)])
+        .filter(|r|r.int("renterID").is_some_and(|renter|renter>0))
+        .map(|r|((r.int("stationID").unwrap_or(0),r.int("slotNumber").unwrap_or(0)),
+            r.line(&["typeID","stationID","startDate","rentPeriodInDays","slotNumber","periodCost","balanceDueDate"]))).collect());
+    rented.sort_by_key(|(key,_)|*key);
+    Ok(rowset(&header,rented.into_iter().map(|(_,l)|Value::List(l)).collect()))
 }
 
-/// SQL restricting entity `e` to one kind of corporation asset; $1 is the corp.
-fn asset_scope(which: &str) -> Option<String> {
+/// One kind of corporation asset.
+#[derive(Clone, Copy)]
+enum AssetScope {
+    /// In the corporation's offices.
+    Offices,
+    /// In space, outside the corporation market deliveries.
+    Property,
+    Deliveries,
+}
+
+fn asset_scope(which: &str) -> Option<AssetScope> {
     Some(match which {
-        "offices" => r#"e."ownerID"=$1 AND e."locationID" IN (SELECT "itemID" FROM "crpOffices" WHERE "corporationID" = $1)"#.into(),
-        "property" => format!(
-            r#"e."ownerID" = $1 AND e."flag" <> {FLAG_CORP_MARKET}
-               AND e."locationID" IN (SELECT "solarSystemID" FROM "mapSolarSystems")"#
-        ),
-        "deliveries" => format!(r#"e."ownerID" = $1 AND e."flag" = {FLAG_CORP_MARKET}"#),
+        "offices" => AssetScope::Offices,
+        "property" => AssetScope::Property,
+        "deliveries" => AssetScope::Deliveries,
         _ => return None, // "junk", "jobs": nothing tracks these yet
     })
+}
+
+/// The corporation's items of one kind of asset.
+fn scoped_assets<'d>(db: &'d Db, corp: i64, scope: AssetScope) -> impl Iterator<Item = store::Row<'d>> + 'd {
+    let offices = db.table("crpOffices");
+    let systems = db.table("mapSolarSystems");
+    db.table("entity").find(&["ownerID"], &[store::Value::Int(corp)]).filter(move |e| {
+        let location = e.value("locationID");
+        let flag = e.int("flag");
+        match scope {
+            AssetScope::Offices => offices.find(&["itemID"], std::slice::from_ref(location)).any(|o| o.int("corporationID") == Some(corp)),
+            AssetScope::Property => flag != Some(i64::from(FLAG_CORP_MARKET)) && systems.get(std::slice::from_ref(location)).is_some(),
+            AssetScope::Deliveries => flag == Some(i64::from(FLAG_CORP_MARKET)),
+        }
+    })
+}
+
+/// The distinct places `items` are, ascending: an item in one of the
+/// corporation's offices is at the office's station.
+fn asset_location_rowset<'d>(db: &'d Db, corp: i64, items: impl Iterator<Item = store::Row<'d>>) -> Value {
+    let offices = db.table("crpOffices");
+    let mut locations = std::collections::BTreeSet::new();
+    for e in items {
+        let location = e.value("locationID");
+        let stations: Vec<i64> = offices
+            .find(&["itemID"], std::slice::from_ref(location))
+            .filter(|o| o.int("corporationID") == Some(corp))
+            .filter_map(|o| o.int("stationID"))
+            .collect();
+        if stations.is_empty() {
+            locations.extend(location.int());
+        } else {
+            locations.extend(stations);
+        }
+    }
+    rowset(&["locationID"], locations.into_iter().map(|l| Value::List(vec![Value::Int(l)])).collect())
 }
 
 async fn search_assets(ctx:&Ctx<'_>,call:&Call)->Value {
@@ -120,12 +172,25 @@ async fn search_assets(ctx:&Ctx<'_>,call:&Call)->Value {
     let criterion=|i|call.arg_i64(i).and_then(|n|i32::try_from(n).ok()).filter(|n|*n>0);
     let category=criterion(1);let group=criterion(2);let ty=criterion(3);let quantity=criterion(4).unwrap_or(0);
     if category.is_none() && group.is_none() && ty.is_none() {return empty()}
-    let sql=format!(r#"SELECT DISTINCT COALESCE(o."stationID",e."locationID") AS "locationID" FROM entity e
-      JOIN "invTypes" t ON t."typeID"=e."typeID" JOIN "invGroups" g ON g."groupID"=t."groupID"
-      LEFT JOIN "crpOffices" o ON o."itemID"=e."locationID" AND o."corporationID"=$1
-      WHERE {scope} AND ($2::integer IS NULL OR g."categoryID"=$2) AND ($3::integer IS NULL OR t."groupID"=$3)
-        AND ($4::integer IS NULL OR e."typeID"=$4) AND e.quantity>=$5 ORDER BY 1"#);
-    ctx.rowset(&["locationID"],&sql,&[&(corp as i32),&category,&group,&ty,&quantity]).await
+    let types=searched_types(category,group,ty);
+    ctx.store.read(|db|asset_location_rowset(db,corp,scoped_assets(db,corp,scope).filter(|e|
+        e.int("typeID").is_some_and(|t|types.contains(&(t as i32))) && e.int("quantity").is_some_and(|q|q>=i64::from(quantity)))))
+}
+
+/// The types an asset search's category, group and type criteria (at least
+/// one given) let through; a type whose group is unknown matches none.
+fn searched_types(category:Option<i32>,group:Option<i32>,ty:Option<i32>)->Vec<i32> {
+    let sde=crate::sde::get();
+    let candidates:Vec<i32>=match (ty,group,category) {
+        (Some(t),_,_)=>vec![t],
+        (None,Some(g),_)=>sde.types_in_group(g as i64).to_vec(),
+        (None,None,Some(c))=>sde.types_in_category(c as i64).to_vec(),
+        (None,None,None)=>Vec::new(),
+    };
+    candidates.into_iter().filter(|t|{
+        let Some((g,c))=sde.group_and_category(*t as i64) else {return false};
+        category.is_none_or(|x|x as i64==c) && group.is_none_or(|x|x as i64==g)
+    }).collect()
 }
 
 #[cfg(test)]
@@ -135,13 +200,17 @@ mod asset_tests {
         match value {Value::Instance {state,..}=>state.get_str("lines").and_then(Value::seq).unwrap_or(&[]).iter().filter_map(|line|line.seq()?.first()?.as_i64()).collect(),_=>vec![]}
     }
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn corporation_asset_search_filters_owned_items_and_reports_office_stations() {
-        let fixture=crate::test_support::Database::load().await;let corp=fixture.id().await;let office=fixture.id().await;
-        fixture.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName") VALUES ($1,$2)"#,&[&corp,&format!("Asset corporation {corp}")]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO "crpOffices" ("corporationID","stationID","officeFolderID","itemID") VALUES ($1,60000004,$2,$2)"#,&[&corp,&office]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO entity ("typeID","ownerID","locationID",quantity,flag) VALUES (34,$1,$2,5,4),(35,1,$2,100,4),(34,$1,30000142,9,0)"#,&[&corp,&office]).await.unwrap();
-        let session=crate::session::Session {corp_id:Some(corp as i64),roles_at_all:1,..Default::default()};let ctx=fixture.ctx(&session);
+        let fixture=crate::test_support::Database::load().await;let corp=i64::from(fixture.id().await);let office=i64::from(fixture.id().await);
+        fixture.store.write(|tx|{
+            tx.insert("corporation",&[("corporationID",store::Value::Int(corp)),("corporationName",store::Value::Text(format!("Asset corporation {corp}").into()))])?;
+            tx.insert("crpOffices",&[("corporationID",store::Value::Int(corp)),("stationID",store::Value::Int(60000004)),("officeFolderID",store::Value::Int(office)),("itemID",store::Value::Int(office))])?;
+            for (ty,owner,location,quantity,flag) in [(34,corp,office,5,4),(35,1,office,100,4),(34,corp,30000142,9,0)] {
+                tx.insert("entity",&[("typeID",store::Value::Int(ty)),("ownerID",store::Value::Int(owner)),("locationID",store::Value::Int(location)),("quantity",store::Value::Int(quantity)),("flag",store::Value::Int(flag))])?;
+            }
+            Ok::<_,StoreError>(())
+        }).unwrap();
+        let session=crate::session::Session {corp_id:Some(corp),roles_at_all:1,..Default::default()};let ctx=fixture.ctx(&session);
         let mut call=Call {service:"corpmgr".into(),method:"SearchAssets".into(),args:vec![Value::bytes("offices"),Value::None,Value::None,Value::Int(34),Value::Int(5)],kwargs:vec![]};
         assert_eq!(locations(search_assets(&ctx,&call).await),vec![60000004]);
         call.args[4]=Value::Int(6);assert!(locations(search_assets(&ctx,&call).await).is_empty());
@@ -150,33 +219,35 @@ mod asset_tests {
     }
 }
 
-async fn asset_locations(ctx: &Ctx<'_>, corp: i32, which: &str) -> Value {
+async fn asset_locations(ctx: &Ctx<'_>, corp: i64, which: &str) -> Value {
     let Some(scope) = asset_scope(which) else { return rowset(&["locationID"], Vec::new()) };
     // Office contents sit in the office item; report the station it is in.
-    let sql = format!(
-        r#"SELECT DISTINCT COALESCE(o."stationID", e."locationID") AS "locationID"
-             FROM entity e
-             LEFT JOIN "crpOffices" o ON o."itemID" = e."locationID" AND o."corporationID" = $1
-            WHERE {scope} ORDER BY 1"#
-    );
-    ctx.rowset(&["locationID"], &sql, &[&corp]).await
+    ctx.store.read(|db| asset_location_rowset(db, corp, scoped_assets(db, corp, scope)))
 }
 
-async fn asset_items(ctx: &Ctx<'_>, corp: i32, station_id: i64, which: &str) -> Value {
-    let Some(scope) = asset_scope(which) else { return rowset(INVITEM_HEADER, Vec::new()) };
-    let sql = format!(
-        r#"{INVITEM_SELECT} {scope}
-             AND (e."locationID" = $2 OR e."locationID" IN
-                  (SELECT "itemID" FROM "crpOffices" WHERE "corporationID" = $1 AND "stationID" = $2))
-           ORDER BY e."itemID""#
-    );
-    ctx.rowset(INVITEM_HEADER, &sql, &[&corp, &(station_id as i32)]).await
+async fn asset_items(ctx: &Ctx<'_>, corp: i64, station_id: i64, which: &str) -> Value {
+    let Some(scope) = asset_scope(which) else { return rowset(&INVITEM_COLUMNS, Vec::new()) };
+    let lines = ctx.store.read(|db| {
+        let offices = db.table("crpOffices");
+        let mut items: Vec<store::Row> = scoped_assets(db, corp, scope)
+            .filter(|e| {
+                let location = e.int("locationID");
+                location == Some(station_id)
+                    || offices
+                        .find(&["itemID"], std::slice::from_ref(e.value("locationID")))
+                        .any(|o| o.int("corporationID") == Some(corp) && o.int("stationID") == Some(station_id))
+            })
+            .collect();
+        items.sort_by_key(|e| e.int("itemID"));
+        invitem_lines(items)
+    });
+    rowset(&INVITEM_COLUMNS, lines)
 }
 
 pub async fn corporation_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let arg0 = call.arg_id(0);
     let value = match call.method.as_str() {
-        "GetNPCDivisions" => npc_divisions(ctx).await,
+        "GetNPCDivisions" => npc_divisions(),
         "GetEmploymentRecord" => employment_record(ctx, arg0).await,
         "GetCorpInfo" => corp_market_info(),
         "GetFactionInfo" => faction_info(ctx).await,
@@ -194,10 +265,10 @@ async fn corp_registry(ctx: &Ctx<'_>, method: &str, args: &[Value]) -> Outcome {
         "GetEveOwners" => eve_owners(ctx, corp).await,
         "GetMember" => member(ctx, arg0.unwrap_or(0)).await,
         "GetRoles" => {
-            let roles = roles(ctx).await;
+            let roles = roles();
             rowset(ROLE_HEADER, roles.iter().map(role_line).collect())
         }
-        "GetRoleGroups" => role_groups(ctx).await,
+        "GetRoleGroups" => role_groups(),
         "GetSharesByShareholder" => shares_by_shareholder(ctx, arg0.unwrap_or(0) != 0).await,
         "GetInfoWindowDataForChar" => info_window_data_for_char(ctx, arg0.unwrap_or(0)).await,
         "GetTitles" => index_rowset(TITLE_HEADER, "titleID", Vec::new()),
@@ -223,35 +294,35 @@ const CORP_HEADER: &[&str] = &[
     "walletDivision5", "walletDivision6", "walletDivision7",
 ];
 
-// NPC corporations have no founder (creatorID 0, which no owner record
-// matches); their CEO stands in, so the info window shows "CEO and Founder".
-const CORP_SQL: &str = r#"SELECT "corporationID","corporationName","description","tickerName",
-                                 "url","taxRate","minimumJoinStanding","corporationType",
-                                 "hasPlayerPersonnelManager","sendCharTerminationMessage",
-                                 COALESCE(NULLIF("creatorID", 0), "ceoID"),"ceoID","stationID","raceID","allianceID","shares",
-                                 "memberCount","memberLimit","allowedMemberRaceIDs","graphicID",
-                                 "shape1","shape2","shape3","color1","color2","color3","typeface",
-                                 "division1","division2","division3","division4","division5",
-                                 "division6","division7","balance","deleted",
-                                 NULL::text,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text
-                            FROM "corporation" WHERE "corporationID" = $1"#;
+/// A corporation row as the client's corporation line (`CORP_HEADER`).
+/// NPC corporations have no founder (creatorID 0, which no owner record
+/// matches); their CEO stands in, so the info window shows "CEO and Founder".
+/// No wallet division names are kept.
+fn corp_line(r: &store::Row) -> Vec<Value> {
+    let mut line = r.line(&CORP_HEADER[..36]);
+    if r.int("creatorID") == Some(0) {
+        line[10] = r.cell("ceoID");
+    }
+    line.resize(CORP_HEADER.len(), Value::None);
+    line
+}
 
 async fn corporation_row(ctx: &Ctx<'_>, corp_id: i64) -> Value {
-    match ctx.db.query(CORP_SQL, &[&(corp_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => row(CORP_HEADER, line(&rows[0])),
-        Ok(_) => Value::None,
-        Err(e) => {
-            error!("GetCorporation({corp_id}): {err}", err = crate::logging::chain(&e));
-            Value::None
-        }
-    }
+    ctx.store.read(|db| match db.table("corporation").get_id(corp_id) {
+        Some(r) => row(CORP_HEADER, corp_line(&r)),
+        None => Value::None,
+    })
 }
 
 async fn eve_owners(ctx: &Ctx<'_>, corp_id: i64) -> Value {
     const HEADER: &[&str] = &["ownerID", "ownerName", "typeID"];
-    let sql = r#"SELECT "characterID","characterName","typeID"
-                   FROM "character_" WHERE "corporationID" = $1"#;
-    ctx.rowset(HEADER, sql, &[&(corp_id as i32)]).await
+    let lines = ctx.store.read(|db| {
+        db.table("character_")
+            .find(&["corporationID"], &[store::Value::Int(corp_id)])
+            .map(|r| Value::List(r.line(&["characterID", "characterName", "typeID"])))
+            .collect()
+    });
+    rowset(HEADER, lines)
 }
 
 const MEMBER_HEADER: &[&str] = &[
@@ -274,35 +345,34 @@ enum MemberScope {
 
 /// Member rows (character ID, line), in character ID order.
 async fn member_lines(ctx: &Ctx<'_>, scope: MemberScope) -> Vec<(i64, Vec<Value>)> {
-    let (filter, id) = match scope {
-        MemberScope::One(id) => (r#"c."characterID""#, id),
-        MemberScope::Corporation(id) => (r#"c."corporationID""#, id),
-    };
-    let sql = format!(
-        r#"SELECT c."characterID", c."corporationID", c."title", c."corporationDateTime",
-                  COALESCE(r."rolesAtAll", 0), COALESCE(r."grantableRoles", 0),
-                  COALESCE(r."rolesAtHQ", 0), COALESCE(r."grantableRolesAtHQ", 0),
-                  COALESCE(r."rolesAtBase", 0), COALESCE(r."grantableRolesAtBase", 0),
-                  COALESCE(r."rolesAtOther", 0), COALESCE(r."grantableRolesAtOther", 0),
-                  co."stationID"
-             FROM "character_" c
-             JOIN "corporation" co ON co."corporationID" = c."corporationID"
-             LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
-            WHERE {filter} = $1
-            ORDER BY c."characterID""#
-    );
-    ctx.query(&sql, &[&(id as i32)])
-        .await
-        .iter()
-        .map(|r| {
-            let mask = |i: usize| Value::Long(r.get::<_, Option<i64>>(i).unwrap_or(0));
-            let mut line = vec![cell(r, 0), cell(r, 1), cell(r, 2), cell(r, 3)];
-            line.extend((4..12).map(mask));
-            // baseID, titleMask, divisionID, squadronID.
-            line.extend([cell(r, 12), Value::Long(0), Value::Int(1), Value::Int(1)]);
-            (int(r, 0).unwrap_or(0), line)
-        })
-        .collect()
+    ctx.store.read(|db| {
+        let characters = db.table("character_");
+        let members: Vec<store::Row> = match scope {
+            MemberScope::One(id) => characters.get_id(id).into_iter().collect(),
+            MemberScope::Corporation(id) => characters.find(&["corporationID"], &[store::Value::Int(id)]).collect(),
+        };
+        let mut lines: Vec<(i64, Vec<Value>)> = members
+            .into_iter()
+            .filter_map(|c| {
+                let corp = db.table("corporation").get(std::slice::from_ref(c.value("corporationID")))?;
+                let roles = db.table("chrCorporationRoles").get(std::slice::from_ref(c.value("characterID")));
+                let mask = |column: &str| Value::Long(roles.and_then(|r| r.int(column)).unwrap_or(0));
+                let mut line = c.line(&["characterID", "corporationID", "title", "corporationDateTime"]);
+                line.extend(
+                    [
+                        "rolesAtAll", "grantableRoles", "rolesAtHQ", "grantableRolesAtHQ",
+                        "rolesAtBase", "grantableRolesAtBase", "rolesAtOther", "grantableRolesAtOther",
+                    ]
+                    .map(mask),
+                );
+                // baseID, titleMask, divisionID, squadronID.
+                line.extend([corp.cell("stationID"), Value::Long(0), Value::Int(1), Value::Int(1)]);
+                Some((c.int("characterID").unwrap_or(0), line))
+            })
+            .collect();
+        lines.sort_by_key(|(id, _)| *id);
+        lines
+    })
 }
 
 /// Bound object name of a corporation's member list.
@@ -422,21 +492,17 @@ fn role_text(name: &str) -> Option<(String, String)> {
     Some((general.0.to_string(), general.1.to_string()))
 }
 
-async fn roles(ctx: &Ctx<'_>) -> Vec<CorpRole> {
-    let sql = r#"SELECT "constantID","constantValue" FROM "eveConstants"
-                  WHERE "constantID" LIKE 'corpRole%' AND "constantValue" <> 4294967295
-                  ORDER BY "constantValue""#;
-    let rows = match ctx.db.query(sql, &[]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("GetRoles: {err}", err = crate::logging::chain(&e));
-            Vec::new()
-        }
-    };
+/// The corpRole constants (all but the 0xFFFFFFFF mask), by value.
+fn roles() -> Vec<CorpRole> {
+    let mut constants: Vec<(String, i64)> = crate::sde::table("eveConstants")
+        .rows()
+        .filter_map(|r| Some((r.text("constantID")?, r.int("constantValue")?)))
+        .filter(|(name, value)| name.starts_with("corpRole") && *value != 4294967295)
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    constants.sort_by_key(|(_, value)| *value);
     let mut out = Vec::new();
-    for r in &rows {
-        let name: String = r.get(0);
-        let id: i64 = r.get(1);
+    for (name, id) in constants {
         if let Some((short, long)) = role_text(&name) {
             out.push(CorpRole { id, name, short, long });
         }
@@ -447,8 +513,8 @@ async fn roles(ctx: &Ctx<'_>) -> Vec<CorpRole> {
 const ROLE_GROUP_HEADER: &[&str] =
     &["roleGroupID", "roleGroupName", "roleMask", "isDivisional", "appliesTo", "appliesToGrantable"];
 
-async fn role_groups(ctx: &Ctx<'_>) -> Value {
-    let roles = roles(ctx).await;
+fn role_groups() -> Value {
+    let roles = roles();
     let mask_of = |pred: &dyn Fn(&str) -> bool| -> i64 {
         roles.iter().filter(|r| pred(&r.name)).fold(0i64, |acc, r| acc | r.id)
     };
@@ -487,8 +553,13 @@ async fn shares_by_shareholder(ctx: &Ctx<'_>, corp_shares: bool) -> Value {
         return rowset(HEADER, Vec::new());
     }
     let Some(char_id) = ctx.session.char_id else { return rowset(HEADER, Vec::new()) };
-    let sql = r#"SELECT "corporationID","shares" FROM "crpCharShares" WHERE "characterID" = $1"#;
-    ctx.rowset(HEADER, sql, &[&(char_id as i32)]).await
+    let lines = ctx.store.read(|db| {
+        db.table("crpCharShares")
+            .find(&["characterID"], &[store::Value::Int(char_id)])
+            .map(|r| Value::List(r.line(&["corporationID", "shares"])))
+            .collect()
+    });
+    rowset(HEADER, lines)
 }
 
 async fn info_window_data_for_char(ctx: &Ctx<'_>, char_id: i64) -> Value {
@@ -496,56 +567,43 @@ async fn info_window_data_for_char(ctx: &Ctx<'_>, char_id: i64) -> Value {
         "corpID", "allianceID", "title", "title1", "title2", "title3", "title4", "title5",
         "title6", "title7", "title8",
     ];
-    let sql = r#"SELECT "character_"."corporationID", "corporation"."allianceID",
-                        "character_"."title"
-                   FROM "character_"
-                   JOIN "corporation"
-                     ON "corporation"."corporationID" = "character_"."corporationID"
-                  WHERE "character_"."characterID" = $1"#;
-    match ctx.db.query(sql, &[&(char_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => {
-            let r = &rows[0];
-            let mut line = line(r);
-            line.resize(HEADER.len(), Value::None);
-            row(HEADER, line)
-        }
-        Ok(_) => Value::None,
-        Err(e) => {
-            error!("GetInfoWindowDataForChar({char_id}): {err}", err = crate::logging::chain(&e));
-            Value::None
-        }
-    }
+    ctx.store.read(|db| {
+        let Some(c) = db.table("character_").get_id(char_id) else { return Value::None };
+        let Some(corp) = db.table("corporation").get(std::slice::from_ref(c.value("corporationID"))) else { return Value::None };
+        let mut line = vec![c.cell("corporationID"), corp.cell("allianceID"), c.cell("title")];
+        line.resize(HEADER.len(), Value::None);
+        row(HEADER, line)
+    })
 }
 
 async fn corporation_id_for_character(ctx: &Ctx<'_>, char_id: i64) -> Value {
-    let sql = r#"SELECT "corporationID" FROM "character_" WHERE "characterID" = $1"#;
-    match ctx.db.query(sql, &[&(char_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => cell(&rows[0], 0),
-        Ok(_) => Value::None,
-        Err(e) => {
-            error!("GetCorporationIDForCharacter({char_id}): {err}", err = crate::logging::chain(&e));
-            Value::None
-        }
-    }
+    ctx.store.read(|db| db.table("character_").get_id(char_id).map_or(Value::None, |c| c.cell("corporationID")))
 }
 
-async fn npc_divisions(ctx: &Ctx<'_>) -> Value {
+fn npc_divisions() -> Value {
     const HEADER: &[&str] = &["divisionID", "divisionName", "description", "leaderType"];
-    let sql = r#"SELECT "divisionID","divisionName","description","leaderType"
-                   FROM "crpNPCDivisions" ORDER BY "divisionID""#;
-    ctx.rowset(HEADER, sql, &[]).await
+    let mut divisions: Vec<_> = crate::sde::table("crpNPCDivisions").rows().collect();
+    divisions.sort_by_key(|r| r.int("divisionID"));
+    rowset(HEADER, divisions.iter().map(|r| Value::List(r.line(HEADER))).collect())
 }
 
 async fn employment_record(ctx: &Ctx<'_>, char_id: i64) -> Value {
     // `deleted` is whether the corporation has closed: the info window marks
     // it so (infosvc.py GetEmploymentHistorySubContent).
     const HEADER: &[&str] = &["corporationID", "startDate", "deleted"];
-    let sql = r#"SELECT e."corporationID", e."startDate", COALESCE(c."deleted", 0)::int
-                   FROM "chrEmployment" e
-                   LEFT JOIN "corporation" c ON c."corporationID" = e."corporationID"
-                  WHERE e."characterID" = $1 AND e."deleted" = 0
-                  ORDER BY e."startDate" DESC"#;
-    ctx.rowset(HEADER, sql, &[&(char_id as i32)]).await
+    let mut lines: Vec<(i64, Vec<Value>)> = ctx.store.read(|db| {
+        let corporations = db.table("corporation");
+        db.table("chrEmployment")
+            .find(&["characterID"], &[store::Value::Int(char_id)])
+            .filter(|e| e.int("deleted") == Some(0))
+            .map(|e| {
+                let deleted = corporations.get(std::slice::from_ref(e.value("corporationID"))).and_then(|c| c.int("deleted")).unwrap_or(0);
+                (e.int("startDate").unwrap_or(0), vec![e.cell("corporationID"), e.cell("startDate"), Value::Int(deleted)])
+            })
+            .collect()
+    });
+    lines.sort_by_key(|(start, _)| std::cmp::Reverse(*start));
+    rowset(HEADER, lines.into_iter().map(|(_, l)| Value::List(l)).collect())
 }
 
 fn corp_market_info() -> Value {
@@ -557,55 +615,21 @@ fn corp_market_info() -> Value {
 }
 
 async fn faction_info(ctx: &Ctx<'_>) -> Value {
-    let by_corp = int_pairs(
-        ctx,
-        r#"SELECT "corporationID","factionID" FROM "crpNPCCorporations"
-            WHERE "factionID" IS NOT NULL"#,
-    )
-    .await;
-    let regions = int_lists(
-        ctx,
-        r#"SELECT "factionID","regionID" FROM "mapRegions" WHERE "factionID" IS NOT NULL"#,
-    )
-    .await;
-    let constellations = int_lists(
-        ctx,
-        r#"SELECT "factionID","constellationID" FROM "mapConstellations"
-            WHERE "factionID" IS NOT NULL"#,
-    )
-    .await;
-    let solar_systems = int_lists(
-        ctx,
-        r#"SELECT "factionID","solarSystemID" FROM "mapSolarSystems"
-            WHERE "factionID" IS NOT NULL"#,
-    )
-    .await;
-    let races = int_lists(ctx, r#"SELECT "factionID","raceID" FROM "factionRaces""#).await;
-    let station_count = int_pairs(
-        ctx,
-        r#"SELECT "factionID","stationCount" FROM "chrFactions"
-            WHERE "stationCount" IS NOT NULL"#,
-    )
-    .await;
-    let system_count = int_pairs(
-        ctx,
-        r#"SELECT "factionID","stationSystemCount" FROM "chrFactions"
-            WHERE "stationSystemCount" IS NOT NULL"#,
-    )
-    .await;
+    let by_corp = static_pairs("crpNPCCorporations", "corporationID", "factionID");
+    let regions = static_lists("mapRegions", "factionID", "regionID");
+    let constellations = static_lists("mapConstellations", "factionID", "constellationID");
+    let solar_systems = ctx.store.read(|db| {
+        int_lists(db.table("mapSolarSystems").rows().filter_map(|r| Some((r.int("factionID")?, r.cell("solarSystemID")))))
+    });
+    let races = static_lists("factionRaces", "factionID", "raceID");
+    let station_count = static_pairs("chrFactions", "factionID", "stationCount");
+    let system_count = static_pairs("chrFactions", "factionID", "stationSystemCount");
 
     const NPC_HEADER: &[&str] = &["corporationID", "size", "extent"];
-    let sql = r#"SELECT "corporationID","size","extent" FROM "crpNPCCorporations""#;
-    let npc_info = match ctx.db.query(sql, &[]).await {
-        Ok(rows) => rows
-            .iter()
-            .map(|r| (cell(r, 0), row(NPC_HEADER, line(r))))
-            .collect(),
-        Err(e) => {
-            error!("GetFactionInfo(npcCorpInfo): {err}", err = crate::logging::chain(&e));
-            Vec::new()
-        }
-    };
+    let npc_info = crate::sde::table("crpNPCCorporations")
+        .rows()
+        .map(|r| (r.cell("corporationID"), row(NPC_HEADER, r.line(NPC_HEADER))))
+        .collect();
 
     Value::Tuple(vec![
         Value::Dict(by_corp),
@@ -619,37 +643,40 @@ async fn faction_info(ctx: &Ctx<'_>) -> Value {
     ])
 }
 
-async fn int_pairs(ctx: &Ctx<'_>, sql: &str) -> Vec<(Value, Value)> {
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => rows
-            .iter()
-            .map(|r| {
-                (
-                    cell(r, 0),
-                    cell(r, 1),
-                )
-            })
-            .collect(),
-        Err(e) => {
-            error!("{sql}: {err}", err = crate::logging::chain(&e));
-            Vec::new()
-        }
-    }
+/// A static table's `key: value` pairs, in dump order, leaving out rows
+/// where either is NULL.
+fn static_pairs(table: &str, key: &str, value: &str) -> Vec<(Value, Value)> {
+    crate::sde::table(table)
+        .rows()
+        .filter(|r| !r.value(key).is_null() && !r.value(value).is_null())
+        .map(|r| (r.cell(key), r.cell(value)))
+        .collect()
 }
 
-async fn int_lists(ctx: &Ctx<'_>, sql: &str) -> Vec<(Value, Value)> {
-    let rows = match ctx.db.query(sql, &[]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("{sql}: {err}", err = crate::logging::chain(&e));
-            return Vec::new();
-        }
-    };
+/// A static table's values listed under each (non-NULL) integer key, keys
+/// in the order they first appear in the dump, as [`int_lists`] gives them.
+fn static_lists(table: &str, key: &str, value: &str) -> Vec<(Value, Value)> {
     let mut keys: Vec<i64> = Vec::new();
     let mut vals: Vec<Vec<Value>> = Vec::new();
-    for r in &rows {
-        let k = r.get::<_, i32>(0) as i64;
-        let v = cell(r, 1);
+    for r in crate::sde::table(table).rows() {
+        let Some(k) = r.int(key) else { continue };
+        let v = r.cell(value);
+        match keys.iter().position(|x| *x == k) {
+            Some(i) => vals[i].push(v),
+            None => {
+                keys.push(k);
+                vals.push(vec![v]);
+            }
+        }
+    }
+    keys.into_iter().zip(vals).map(|(k, v)| (Value::Int(k), Value::List(v))).collect()
+}
+
+/// Values listed under each key, keys in the order they first appear.
+fn int_lists(pairs: impl Iterator<Item = (i64, Value)>) -> Vec<(Value, Value)> {
+    let mut keys: Vec<i64> = Vec::new();
+    let mut vals: Vec<Vec<Value>> = Vec::new();
+    for (k, v) in pairs {
         match keys.iter().position(|x| *x == k) {
             Some(i) => vals[i].push(v),
             None => {
@@ -702,74 +729,78 @@ async fn corp_station_mgr(
     Outcome::Value(out)
 }
 
+
 async fn corporate_station_info(ctx: &Ctx<'_>, station: i64) -> Value {
     const OFFICE_HEADER: &[&str] = &["corporationID", "itemID", "officeFolderID"];
 
-    let station = station as i32;
+    let (offices, corp_lines) = ctx.store.read(|db| {
+        let station_offices: Vec<store::Row> = db.table("crpOffices").find(&["stationID"], &[store::Value::Int(station)]).collect();
+        let offices: Vec<Value> = station_offices.iter().map(|o| Value::List(o.line(OFFICE_HEADER))).collect();
+        // The corporations based here and those with an office here.
+        let corp_lines: Vec<Vec<Value>> = db
+            .table("corporation")
+            .rows()
+            .filter(|c| {
+                c.int("stationID") == Some(station)
+                    || station_offices.iter().any(|o| o.int("corporationID") == c.int("corporationID"))
+            })
+            .map(|c| corp_line(&c))
+            .collect();
+        (offices, corp_lines)
+    });
 
-    let office_sql = r#"SELECT "corporationID","itemID","officeFolderID"
-                          FROM "crpOffices" WHERE "stationID" = $1"#;
-    let offices = ctx.rowset(OFFICE_HEADER, office_sql, &[&station]).await;
-
-    let corp_sql = CORP_SQL.replace(
-        r#"WHERE "corporationID" = $1"#,
-        r#"WHERE "stationID" = $1
-              OR "corporationID" IN (SELECT "corporationID" FROM "crpOffices"
-                                      WHERE "stationID" = $1)"#,
-    );
-    let corp_rows = match ctx.db.query(corp_sql.as_str(), &[&station]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("GetCorporateStationInfo({station}) corporations: {err}", err = crate::logging::chain(&e));
-            Vec::new()
-        }
-    };
-    let corporations =
-        rowset(CORP_HEADER, lines(&corp_rows));
-
-    let mut ids: Vec<i32> = Vec::new();
-    for r in &corp_rows {
-        for i in [
-            0usize,
-            10,
-            11,
-        ] {
-            if let Ok(Some(id)) = r.try_get::<_, Option<i32>>(i) {
+    // The owners the client shows: each corporation, its founder and CEO.
+    let mut ids: Vec<i64> = Vec::new();
+    for line in &corp_lines {
+        for i in [0usize, 10, 11] {
+            if let Some(id) = line[i].as_i64() {
                 if id != 0 && !ids.contains(&id) {
                     ids.push(id);
                 }
             }
         }
     }
-    let eveowners = eve_owners_by_id(ctx, &ids).await;
+    let eveowners = ctx.store.read(|db| eve_owners_by_id(db, &ids));
+    let corporations = rowset(CORP_HEADER, corp_lines.into_iter().map(Value::List).collect());
 
-    Value::Tuple(vec![eveowners, corporations, offices])
+    Value::Tuple(vec![eveowners, corporations, rowset(OFFICE_HEADER, offices)])
 }
 
-async fn eve_owners_by_id(ctx: &Ctx<'_>, ids: &[i32]) -> Value {
+/// Each ID's owner name and type, from the static owners, characters (a
+/// character's type is its bloodline's when it has none of its own) or
+/// corporations; an ID none of them names is left out.
+fn eve_owners_by_id(db: &Db, ids: &[i64]) -> Value {
     const HEADER: &[&str] = &["ownerID", "ownerName", "typeID"];
-    if ids.is_empty() {
-        return rowset(HEADER, Vec::new());
+    let bloodline_types = crate::sde::table("bloodlineTypes");
+    let mut lines = Vec::new();
+    for &id in ids {
+        let o = db.table("eveStaticOwners").get_id(id);
+        let c = db.table("character_").get_id(id);
+        let co = db.table("corporation").get_id(id);
+        let name = [o.map(|o| o.cell("ownerName")), c.map(|c| c.cell("characterName")), co.map(|co| co.cell("corporationName"))]
+            .into_iter()
+            .flatten()
+            .find(|v| *v != Value::None);
+        let Some(name) = name else { continue };
+        let own_type = o.and_then(|o| o.int("typeID")).filter(|t| *t != 0).or_else(|| c.and_then(|c| c.int("typeID")).filter(|t| *t != 0));
+        // One row per matching bloodline type, as the join gave.
+        let bloodline: Vec<Option<i64>> = match c.and_then(|c| c.int("bloodlineID")) {
+            Some(b) => bloodline_types.find("bloodlineID", b).filter_map(|r| r.int("typeID")).map(Some).collect(),
+            None => Vec::new(),
+        };
+        let bloodline = if bloodline.is_empty() { vec![None] } else { bloodline };
+        for bt in bloodline {
+            let Some(type_id) = own_type.or(bt).or(co.map(|_| 2)) else { continue };
+            lines.push(Value::List(vec![Value::Int(id), name.clone(), Value::Int(type_id)]));
+        }
     }
-    const SQL: &str = r#"
-        SELECT k.id AS "ownerID",
-               COALESCE(o."ownerName", c."characterName", co."corporationName") AS "ownerName",
-               COALESCE(NULLIF(o."typeID", 0), NULLIF(c."typeID", 0), bt."typeID",
-                        CASE WHEN co."corporationID" IS NOT NULL THEN 2 END) AS "typeID"
-          FROM unnest($1::int[]) AS k(id)
-          LEFT JOIN "eveStaticOwners" o  ON o."ownerID"        = k.id
-          LEFT JOIN "character_"      c  ON c."characterID"    = k.id
-          LEFT JOIN "bloodlineTypes" bt  ON bt."bloodlineID"   = c."bloodlineID"
-          LEFT JOIN "corporation"    co  ON co."corporationID" = k.id
-         WHERE COALESCE(o."ownerName", c."characterName", co."corporationName") IS NOT NULL
-           AND COALESCE(NULLIF(o."typeID", 0), NULLIF(c."typeID", 0), bt."typeID",
-                        CASE WHEN co."corporationID" IS NOT NULL THEN 2 END) IS NOT NULL"#;
-    ctx.rowset(HEADER, SQL, &[&ids]).await
+    rowset(HEADER, lines)
 }
 
 async fn potential_home_stations(ctx: &Ctx<'_>, station: i64) -> Value {
     const HEADER: &[&str] = &["stationID", "typeID"];
-    let sql = r#"SELECT "stationID","stationTypeID" AS "typeID"
-                   FROM "staStations" WHERE "stationID" = $1"#;
-    ctx.rowset(HEADER, sql, &[&(station as i32)]).await
+    let lines = ctx.store.read(|db| {
+        db.table("staStations").get_id(station).map(|s| Value::List(s.line(&["stationID", "stationTypeID"]))).into_iter().collect()
+    });
+    rowset(HEADER, lines)
 }

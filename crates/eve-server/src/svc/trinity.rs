@@ -4,9 +4,13 @@
 //!
 //! Each answer is the shape its caller reads; the file and line are given.
 
+use std::collections::HashSet;
+
 use eve_marshal::Value;
 
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Row};
+use crate::svc::rows::rowset;
 
 /// In-game voice (Vivox) is not available: audioService.Subscriber asks
 /// whether this account may use it.
@@ -30,13 +34,19 @@ pub async fn corp_station_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             let station = crate::svc::bound::parse(&call.service)
                 .and_then(|b| b.params.first().copied())
                 .or(ctx.session.station_id)
-                .unwrap_or(0) as i32;
-            let sql = r#"SELECT GREATEST(COALESCE(t."officeSlots", 0)
-                                  - (SELECT count(*) FROM "crpOffices" o WHERE o."stationID" = s."stationID"), 0)::integer
-                           FROM "staStations" s JOIN "staStationTypes" t ON t."stationTypeID" = s."stationTypeID"
-                          WHERE s."stationID" = $1"#;
-            let n: i32 = ctx.query_one(sql, &[&station]).await.map(|r| r.get(0)).unwrap_or(0);
-            Some(Outcome::Value(Value::Int(n as i64)))
+                .unwrap_or(0);
+            // No count for a station that is gone or whose type the static
+            // data does not know, as joining on them left it out.
+            let n = ctx
+                .store
+                .read(|db| {
+                    let station_type = db.table("staStations").get_id(station)?.int("stationTypeID")?;
+                    let slots = crate::sde::table("staStationTypes").get("stationTypeID", station_type)?.int("officeSlots").unwrap_or(0);
+                    let rented = db.table("crpOffices").find(&["stationID"], &[store::Value::Int(station)]).count() as i64;
+                    Some((slots - rented).max(0))
+                })
+                .unwrap_or(0);
+            Some(Outcome::Value(Value::Int(n)))
         }
         _ => None,
     }
@@ -49,30 +59,36 @@ pub async fn standing2(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     const TO_HEADER: &[&str] = &["toID", "standing"];
     const FROM_HEADER: &[&str] = &["fromID", "standing"];
     const OWNER_HEADER: &[&str] = &["ownerID", "ownerName", "typeID"];
-    let char_id = ctx.session.char_id.unwrap_or(0) as i32;
-    let corp_id = ctx.session.corp_id.unwrap_or(0) as i32;
-    let (mine, prime, npc, id) = match call.method.as_str() {
-        "GetCharStandings" => (
-            r#"SELECT "toID","standing" FROM "chrStandings" WHERE "characterID" = $1"#,
-            r#"SELECT o."ownerID",o."ownerName",o."typeID" FROM "eveStaticOwners" o
-                WHERE o."ownerID" IN (SELECT "toID" FROM "chrStandings" WHERE "characterID" = $1)"#,
-            r#"SELECT "fromID","standing" FROM "chrNPCStandings" WHERE "characterID" = $1"#,
-            char_id,
-        ),
-        "GetCorpStandings" => (
-            r#"SELECT "toID","standing" FROM "ownerStandings" WHERE "fromID" = $1"#,
-            r#"SELECT o."ownerID",o."ownerName",o."typeID" FROM "eveStaticOwners" o
-                WHERE o."ownerID" IN (SELECT "toID" FROM "ownerStandings" WHERE "fromID" = $1)"#,
-            r#"SELECT "fromID","standing" FROM "npcStandings" WHERE "toID" = $1"#,
-            corp_id,
-        ),
+    let char_id = ctx.session.char_id.unwrap_or(0);
+    let corp_id = ctx.session.corp_id.unwrap_or(0);
+    // The standings table and the column holding whose they are, and where
+    // the NPCs' standings toward them are kept.
+    let (mine, owner, npc, id) = match call.method.as_str() {
+        "GetCharStandings" => ("chrStandings", "characterID", Some("chrNPCStandings"), char_id),
+        // NPC standings toward a corporation are static (npcStandings).
+        "GetCorpStandings" => ("ownerStandings", "fromID", None, corp_id),
         _ => return None,
     };
-    Some(Outcome::Value(Value::Tuple(vec![
-        ctx.rowset(TO_HEADER, mine, &[&id]).await,
-        ctx.rowset(OWNER_HEADER, prime, &[&id]).await,
-        ctx.rowset(FROM_HEADER, npc, &[&id]).await,
-    ])))
+    fn lines(rows: &[Row], header: &[&str]) -> Vec<Value> {
+        rows.iter().map(|r| Value::List(r.line(header))).collect()
+    }
+    let (mine, prime, npc) = ctx.store.read(|db| {
+        let standings: Vec<Row> = db.table(mine).find(&[owner], &[store::Value::Int(id)]).collect();
+        let to: HashSet<i64> = standings.iter().filter_map(|r| r.int("toID")).collect();
+        let prime: Vec<Row> = db.table("eveStaticOwners").rows().filter(|o| o.int("ownerID").is_some_and(|o| to.contains(&o))).collect();
+        let npc = npc.map(|t| {
+            let rows: Vec<Row> = db.table(t).find(&["characterID"], &[store::Value::Int(id)]).collect();
+            rowset(FROM_HEADER, lines(&rows, FROM_HEADER))
+        });
+        (rowset(TO_HEADER, lines(&standings, TO_HEADER)), rowset(OWNER_HEADER, lines(&prime, OWNER_HEADER)), npc)
+    });
+    let npc = npc.unwrap_or_else(|| {
+        rowset(
+            FROM_HEADER,
+            crate::sde::table("npcStandings").find("toID", id).map(|r| Value::List(r.line(FROM_HEADER))).collect(),
+        )
+    });
+    Some(Outcome::Value(Value::Tuple(vec![mine, prime, npc])))
 }
 
 /// tutorialsvc.GetContextHelp: rows of (keywords, description, url) for the
@@ -106,10 +122,9 @@ pub async fn character(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
                 "factionID", "factionName", "description", "raceIDs", "solarSystemID", "corporationID",
                 "sizeFactor", "stationCount", "stationSystemCount",
             ];
-            let sql = r#"SELECT "factionID","factionName","description","raceIDs","solarSystemID","corporationID",
-                                "sizeFactor","stationCount","stationSystemCount"
-                           FROM "chrFactions" ORDER BY "factionID""#;
-            Some(Outcome::Value(ctx.rowset(HEADER, sql, &[]).await))
+            let mut factions: Vec<_> = crate::sde::table("chrFactions").rows().collect();
+            factions.sort_by_key(|r| r.int("factionID"));
+            Some(Outcome::Value(rowset(HEADER, factions.iter().map(|r| Value::List(r.line(HEADER))).collect())))
         }
         _ => None,
     }

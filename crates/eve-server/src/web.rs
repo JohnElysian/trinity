@@ -18,14 +18,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Map, Value as Json};
+use serde_json::{json, Value as Json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_postgres::types::Type;
-use tokio_postgres::Row;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::conn::Server;
+use crate::sde;
+use crate::store::{Db, Value};
 
 const INDEX: &str = include_str!("../web/index.html");
 const STYLE: &str = include_str!("../web/style.css");
@@ -104,35 +104,31 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
         "/app.js" => respond(&mut stream, 200, "text/javascript; charset=utf-8", SCRIPT.as_bytes()).await,
         api if api.starts_with("/api/") => {
             let body = match api {
-                "/api/summary" => Some(summary(server).await),
+                "/api/summary" => Some(summary(server)),
                 "/api/news" => Some(news(server)),
                 "/api/sieges" => Some(sieges(server)),
-                "/api/wars" => Some(wars(server).await),
-                "/api/players" => Some(players(server).await),
-                "/api/alliances" => Some(alliances(server).await),
-                "/api/corporations" => Some(corporations(server).await),
-                "/api/systems" => Some(systems(server).await),
-                "/api/map" => Some(map(server).await),
-                "/api/sov" => Some(sov(server).await),
-                "/api/kills" => Some(kills(server).await),
-                "/api/killboard" => Some(killboard(server).await),
-                "/api/market" => Some(Ok(server.world.lock().bot_panels.market.clone())),
-                "/api/relations" => Some(Ok(server.world.lock().bot_panels.relations.clone())),
-                "/api/followed" => Some(Ok(server.world.lock().bot_panels.followed.clone())),
-                "/api/events" => Some(Ok(server.world.lock().bot_panels.events.clone())),
+                "/api/wars" => Some(wars(server)),
+                "/api/players" => Some(players(server)),
+                "/api/alliances" => Some(alliances(server)),
+                "/api/corporations" => Some(corporations(server)),
+                "/api/systems" => Some(systems(server)),
+                "/api/map" => Some(map(server)),
+                "/api/sov" => Some(sov(server)),
+                "/api/kills" => Some(kills(server)),
+                "/api/killboard" => Some(killboard(server)),
+                "/api/market" => Some(server.world.lock().bot_panels.market.clone()),
+                "/api/relations" => Some(server.world.lock().bot_panels.relations.clone()),
+                "/api/followed" => Some(server.world.lock().bot_panels.followed.clone()),
+                "/api/events" => Some(server.world.lock().bot_panels.events.clone()),
                 "/api/pilots" => {
                     let query = target.split_once('?').map_or("", |(_, q)| q);
                     let q = query.split('&').find_map(|kv| kv.strip_prefix("q=")).map(decode).unwrap_or_default();
-                    Some(Ok(pilots(server, &q)))
+                    Some(pilots(server, &q))
                 }
                 _ => None,
             };
             match body {
-                Some(Ok(v)) => respond(&mut stream, 200, "application/json", v.to_string().as_bytes()).await,
-                Some(Err(e)) => {
-                    warn!("web {api}: {}", crate::logging::chain(&e));
-                    respond(&mut stream, 500, "application/json", br#"{"error":"database"}"#).await
-                }
+                Some(v) => respond(&mut stream, 200, "application/json", v.to_string().as_bytes()).await,
                 None => respond(&mut stream, 404, "application/json", br#"{"error":"no such thing"}"#).await,
             }
         }
@@ -159,43 +155,54 @@ async fn respond(stream: &mut TcpStream, status: u16, kind: &str, body: &[u8]) -
     stream.shutdown().await
 }
 
-/// Rows as JSON objects, keyed by their column names.
-fn rows(rows: &[Row]) -> Json {
-    Json::Array(
-        rows.iter()
-            .map(|r| {
-                let mut o = Map::new();
-                for (i, c) in r.columns().iter().enumerate() {
-                    let v = match *c.type_() {
-                        Type::INT2 => r.try_get::<_, Option<i16>>(i).ok().flatten().map(Json::from),
-                        Type::INT4 => r.try_get::<_, Option<i32>>(i).ok().flatten().map(Json::from),
-                        Type::INT8 => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Json::from),
-                        Type::FLOAT4 => r.try_get::<_, Option<f32>>(i).ok().flatten().map(|f| json!(f)),
-                        Type::FLOAT8 => r.try_get::<_, Option<f64>>(i).ok().flatten().map(|f| json!(f)),
-                        Type::BOOL => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Json::from),
-                        _ => r.try_get::<_, Option<String>>(i).ok().flatten().map(Json::from),
-                    };
-                    o.insert(c.name().to_string(), v.unwrap_or(Json::Null));
-                }
-                Json::Object(o)
-            })
-            .collect(),
-    )
+/// A FILETIME as milliseconds since 1970, for the page's Date.
+fn ms(filetime: i64) -> i64 {
+    filetime / 10_000 - UNIX_EPOCH_MS
 }
 
-/// A FILETIME column as milliseconds since 1970, for the page's Date.
-fn ms(column: &str) -> String {
-    format!("({column} / 10000 - {UNIX_EPOCH_MS})::bigint")
+/// A number to one decimal as `round(x::numeric, 1)::float8` gave it: the
+/// float as its 15 significant digits, rounded half away from zero.
+fn round1(x: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let s = format!("{:.14e}", x.abs());
+    let Some((mantissa, exp)) = s.split_once('e') else { return x };
+    let (Ok(digits), Ok(exp)) = (mantissa.replace('.', "").parse::<u128>(), exp.parse::<i32>()) else { return x };
+    // x * 10 = digits * 10^shift.
+    let shift = exp - 13;
+    let tenths = if shift >= 0 {
+        return s.parse::<f64>().map_or(x, |v| v.copysign(x));
+    } else if -shift > 30 {
+        0
+    } else {
+        let unit = 10u128.pow((-shift) as u32);
+        let (q, r) = (digits / unit, digits % unit);
+        if r * 2 >= unit { q + 1 } else { q }
+    };
+    (tenths as f64 / 10.0).copysign(x)
 }
 
-type Answer = Result<Json, crate::db::AcquireError>;
+/// Whether an owner is a bot alliance or corporation.
+fn is_bots(db: &Db, owner: i64) -> bool {
+    db.table("botGroups").get_id(owner).is_some()
+}
 
-async fn summary(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
-    let held: i64 = db.query_one(r#"SELECT count(*) FROM "mapSolarSystems" WHERE "allianceID" IS NOT NULL"#, &[]).await?.get(0);
+/// An owner's name and ticker, as `COALESCE(alliance, corporation, '?')` and
+/// `COALESCE(alliance ticker, corporation ticker, '')` of LEFT JOINs gave them.
+fn side_names(db: &Db, owner: Option<i64>) -> (String, String) {
+    let alliance = owner.and_then(|id| db.table("alliances").get_id(id));
+    let corp = owner.and_then(|id| db.table("corporation").get_id(id));
+    let name = alliance.and_then(|a| a.text("allianceName")).or_else(|| corp.and_then(|c| c.text("corporationName"))).unwrap_or("?");
+    let ticker = alliance.and_then(|a| a.text("shortName")).or_else(|| corp.and_then(|c| c.text("tickerName"))).unwrap_or("");
+    (name.to_string(), ticker.to_string())
+}
+
+fn summary(server: &Server) -> Json {
+    let held = server.store.read(|db| db.table("mapSolarSystems").rows().filter(|s| s.int("allianceID").is_some()).count());
     let w = server.world.lock();
     let b = &w.bot_stats;
-    Ok(json!({
+    json!({
         "players": w.players().len(),
         "bots": { "total": b.total, "online": b.online, "inSpace": b.in_space, "running": b.running },
         "corporations": b.corporations,
@@ -204,14 +211,14 @@ async fn summary(server: &Server) -> Answer {
         "lostInFights": b.lost,
         "systemsHeld": held,
         "uptimeSeconds": STARTED.get().map_or(0, |s| s.elapsed().as_secs()),
-    }))
+    })
 }
 
 /// Sieges announced or under way, soonest first: where to go to see a battle.
-fn sieges(server: &Server) -> Answer {
+fn sieges(server: &Server) -> Json {
     let mut list = server.world.lock().bot_stats.sieges.clone();
     list.sort_by_key(|s| s.starts);
-    Ok(Json::Array(
+    Json::Array(
         list.iter()
             .map(|s| {
                 json!({
@@ -222,140 +229,227 @@ fn sieges(server: &Server) -> Answer {
                 })
             })
             .collect(),
-    ))
+    )
 }
 
 /// What the bot alliances did in null-sec lately, newest first.
-fn news(server: &Server) -> Answer {
+fn news(server: &Server) -> Json {
     let news = server.world.lock().bot_stats.news.clone();
-    Ok(Json::Array(news.iter().rev().map(|(at, what)| json!({ "time": at / 10_000 - UNIX_EPOCH_MS, "text": what })).collect()))
+    Json::Array(news.iter().rev().map(|(at, what)| json!({ "time": at / 10_000 - UNIX_EPOCH_MS, "text": what })).collect())
 }
 
-async fn wars(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
+/// The wars not retracted (or retracted later than now), latest declared
+/// first.
+fn wars(server: &Server) -> Json {
     let now = crate::bulkdata::filetime_now();
-    let sql = format!(
-        r#"SELECT w."warID" AS id,
-                  COALESCE(da."allianceName", dc."corporationName", '?') AS "declaredBy",
-                  COALESCE(da."shortName", dc."tickerName", '') AS "declaredByTicker",
-                  COALESCE(aa."allianceName", ac."corporationName", '?') AS against,
-                  COALESCE(aa."shortName", ac."tickerName", '') AS "againstTicker",
-                  {declared} AS declared, {finished} AS ends,
-                  w."mutual" = 1 AS mutual, EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = w."declaredByID") AS bots
-             FROM "crpWars" w
-             LEFT JOIN alliances da ON da."allianceID" = w."declaredByID"
-             LEFT JOIN "corporation" dc ON dc."corporationID" = w."declaredByID"
-             LEFT JOIN alliances aa ON aa."allianceID" = w."againstID"
-             LEFT JOIN "corporation" ac ON ac."corporationID" = w."againstID"
-            WHERE w."retracted" IS NULL OR w."retracted" > $1
-            ORDER BY w."timeDeclared" DESC LIMIT 200"#,
-        declared = ms(r#"w."timeDeclared""#),
-        finished = ms(r#"w."timeFinished""#),
-    );
-    let found = db.query(sql.as_str(), &[&now]).await?;
+    let mut list: Vec<(i64, Json)> = server.store.read(|db| {
+        let mut found: Vec<_> = db
+            .table("crpWars")
+            .rows()
+            .filter(|w| w.int("retracted").is_none_or(|r| r > now))
+            .collect();
+        found.sort_by_key(|w| std::cmp::Reverse(w.int("timeDeclared")));
+        found.truncate(200);
+        found
+            .iter()
+            .map(|w| {
+                let id = w.int("warID").unwrap_or(0);
+                let declared_by = w.int("declaredByID");
+                let (by, by_ticker) = side_names(db, declared_by);
+                let (against, against_ticker) = side_names(db, w.int("againstID"));
+                let item = json!({
+                    "id": id,
+                    "declaredBy": by,
+                    "declaredByTicker": by_ticker,
+                    "against": against,
+                    "againstTicker": against_ticker,
+                    "declared": w.int("timeDeclared").map(ms),
+                    "ends": w.int("timeFinished").map(ms),
+                    "mutual": w.int("mutual").map(|m| m == 1),
+                    "bots": declared_by.is_some_and(|d| is_bots(db, d)),
+                });
+                (id, item)
+            })
+            .collect()
+    });
     let losses = server.world.lock().bot_stats.war_losses.clone();
-    let mut list = rows(&found);
-    if let Json::Array(items) = &mut list {
-        for (item, r) in items.iter_mut().zip(&found) {
-            let id: i32 = r.get(0);
-            item["losses"] = json!(losses.get(&(id as i64)).copied().unwrap_or(0));
-        }
+    for (id, item) in list.iter_mut() {
+        item["losses"] = json!(losses.get(id).copied().unwrap_or(0));
     }
-    Ok(list)
+    Json::Array(list.into_iter().map(|(_, item)| item).collect())
+}
+
+/// A type's name, as a LEFT JOIN of invTypes gave it: null where there is
+/// no type, or the data has none by that ID.
+fn type_name(type_id: Option<i64>) -> Json {
+    type_id.and_then(|id| sde::table("invTypes").get("typeID", id)).and_then(|t| t.text("typeName")).map_or(Json::Null, Json::from)
 }
 
 /// The people playing, not the bots: where each is and in what.
-async fn players(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
+fn players(server: &Server) -> Json {
     let present = server.world.lock().players();
-    let ids: Vec<i32> = present.iter().map(|p| p.char_id as i32).collect();
-    let sql = r#"SELECT c."characterID" AS id, c."characterName" AS name, co."corporationName" AS corporation,
-                        co."tickerName" AS ticker, a."allianceName" AS alliance, round(c."securityRating"::numeric, 1)::float8 AS security,
-                        t."typeName" AS ship
-                   FROM "character_" c
-                   LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                   LEFT JOIN alliances a ON a."allianceID" = co."allianceID"
-                   LEFT JOIN entity e ON e."itemID" = c."shipID"
-                   LEFT JOIN "invTypes" t ON t."typeID" = e."typeID"
-                  WHERE c."characterID" = ANY($1) ORDER BY c."characterName""#;
-    let found = db.query(sql, &[&ids]).await?;
-    let systems: Vec<i32> = present.iter().map(|p| p.solar_system_id as i32).collect();
-    let names: HashMap<i32, (String, f64)> = db
-        .query(r#"SELECT "solarSystemID", "solarSystemName", "security" FROM "mapSolarSystems" WHERE "solarSystemID" = ANY($1)"#, &[&systems])
-        .await?
-        .iter()
-        .map(|r| (r.get::<_, i32>(0), (r.get::<_, Option<String>>(1).unwrap_or_default(), r.get::<_, Option<f64>>(2).unwrap_or(0.0))))
-        .collect();
-    let mut list = rows(&found);
-    if let Json::Array(items) = &mut list {
-        for item in items.iter_mut() {
-            let id = item["id"].as_i64().unwrap_or(0);
-            if let Some(p) = present.iter().find(|p| p.char_id == id) {
-                let (system, security) = names.get(&(p.solar_system_id as i32)).cloned().unwrap_or_default();
-                item["system"] = json!(system);
-                item["systemSecurity"] = json!((security * 10.0).round() / 10.0);
-                item["docked"] = json!(p.docked);
-            }
+    let (mut list, names) = server.store.read(|db| {
+        let characters = db.table("character_");
+        let mut found: Vec<_> = present.iter().map(|p| p.char_id).collect::<std::collections::BTreeSet<_>>().into_iter().filter_map(|id| characters.get_id(id)).collect();
+        found.sort_by(|a, b| a.text("characterName").cmp(&b.text("characterName")));
+        let list: Vec<Json> = found
+            .iter()
+            .map(|c| {
+                let corp = c.int("corporationID").and_then(|id| db.table("corporation").get_id(id));
+                let alliance = corp.and_then(|co| co.int("allianceID")).and_then(|id| db.table("alliances").get_id(id));
+                let ship = c.int("shipID").and_then(|id| db.table("entity").get_id(id)).and_then(|e| e.int("typeID"));
+                json!({
+                    "id": c.int("characterID"),
+                    "name": c.text("characterName"),
+                    "corporation": corp.and_then(|co| co.text("corporationName")),
+                    "ticker": corp.and_then(|co| co.text("tickerName")),
+                    "alliance": alliance.and_then(|a| a.text("allianceName")),
+                    "security": c.float("securityRating").map(round1),
+                    "ship": ship,
+                })
+            })
+            .collect();
+        let systems = db.table("mapSolarSystems");
+        let names: HashMap<i64, (String, f64)> = present
+            .iter()
+            .filter_map(|p| systems.get_id(p.solar_system_id))
+            .map(|s| (s.int("solarSystemID").unwrap_or(0), (s.text("solarSystemName").unwrap_or_default().to_string(), s.float("security").unwrap_or(0.0))))
+            .collect();
+        (list, names)
+    });
+    for item in list.iter_mut() {
+        // The ship came as its type, named here from the static data.
+        item["ship"] = type_name(item["ship"].as_i64());
+        let id = item["id"].as_i64().unwrap_or(0);
+        if let Some(p) = present.iter().find(|p| p.char_id == id) {
+            let (system, security) = names.get(&p.solar_system_id).cloned().unwrap_or_default();
+            item["system"] = json!(system);
+            item["systemSecurity"] = json!((security * 10.0).round() / 10.0);
+            item["docked"] = json!(p.docked);
         }
     }
-    Ok(list)
+    Json::Array(list)
 }
 
-async fn alliances(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
-    let sql = r#"SELECT a."allianceID" AS id, a."allianceName" AS name, a."shortName" AS ticker,
-                        count(co."corporationID")::int AS corporations, COALESCE(sum(co."memberCount"), 0)::int AS pilots,
-                        CASE g."kind" WHEN 11 THEN 'null-sec' WHEN 12 THEN 'pirate' WHEN 13 THEN 'industrial' ELSE 'players' END AS kind,
-                        r."regionName" AS region,
-                        (SELECT count(*) FROM "mapSolarSystems" s WHERE s."allianceID" = a."allianceID")::int AS systems
-                   FROM alliances a
-                   LEFT JOIN "corporation" co ON co."allianceID" = a."allianceID" AND co."deleted" = 0
-                   LEFT JOIN "botGroups" g ON g."ownerID" = a."allianceID"
-                   LEFT JOIN "mapRegions" r ON r."regionID" = g."regionID"
-                  WHERE a."deleted" = 0
-                  GROUP BY a."allianceID", g."kind", r."regionName"
-                  ORDER BY pilots DESC LIMIT 60"#;
-    Ok(rows(&db.query(sql, &[]).await?))
+/// The alliances standing, with their corporations and pilots, what kind
+/// they are, where a bot one lives, and how many systems they hold; the
+/// biggest first.
+fn alliances(server: &Server) -> Json {
+    server.store.read(|db| {
+        let mut held: HashMap<i64, i64> = HashMap::new();
+        for s in db.table("mapSolarSystems").rows() {
+            if let Some(a) = s.int("allianceID") {
+                *held.entry(a).or_default() += 1;
+            }
+        }
+        let corporations = db.table("corporation");
+        let mut list: Vec<(i64, Json)> = db
+            .table("alliances")
+            .rows()
+            .filter(|a| a.int("deleted") == Some(0))
+            .map(|a| {
+                let id = a.int("allianceID").unwrap_or(0);
+                let members: Vec<_> = corporations.find(&["allianceID"], &[Value::Int(id)]).filter(|co| co.int("deleted") == Some(0)).collect();
+                let pilots: i64 = members.iter().filter_map(|co| co.int("memberCount")).sum();
+                let group = db.table("botGroups").get_id(id);
+                let kind = match group.and_then(|g| g.int("kind")) {
+                    Some(11) => "null-sec",
+                    Some(12) => "pirate",
+                    Some(13) => "industrial",
+                    _ => "players",
+                };
+                let region = group
+                    .and_then(|g| g.int("regionID"))
+                    .and_then(|r| sde::table("mapRegions").get("regionID", r))
+                    .and_then(|r| r.text("regionName"));
+                let item = json!({
+                    "id": id,
+                    "name": a.text("allianceName"),
+                    "ticker": a.text("shortName"),
+                    "corporations": members.len(),
+                    "pilots": pilots,
+                    "kind": kind,
+                    "region": region,
+                    "systems": held.get(&id).copied().unwrap_or(0),
+                });
+                (pilots, item)
+            })
+            .collect();
+        list.sort_by_key(|(pilots, _)| std::cmp::Reverse(*pilots));
+        list.truncate(60);
+        Json::Array(list.into_iter().map(|(_, item)| item).collect())
+    })
 }
 
-async fn corporations(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
-    let sql = r#"SELECT co."corporationID" AS id, co."corporationName" AS name, co."tickerName" AS ticker, co."memberCount" AS members,
-                        a."shortName" AS alliance, EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = co."corporationID") AS bots
-                   FROM "corporation" co
-                   LEFT JOIN alliances a ON a."allianceID" = co."allianceID"
-                  WHERE co."deleted" = 0
-                    AND NOT EXISTS (SELECT 1 FROM "crpNPCCorporations" n WHERE n."corporationID" = co."corporationID")
-                  ORDER BY co."memberCount" DESC LIMIT 40"#;
-    Ok(rows(&db.query(sql, &[]).await?))
+/// The biggest corporations of players and bots (the NPC corporations are
+/// static data, and left out).
+fn corporations(server: &Server) -> Json {
+    let npc = sde::table("crpNPCCorporations");
+    server.store.read(|db| {
+        let mut found: Vec<_> = db
+            .table("corporation")
+            .rows()
+            .filter(|co| co.int("deleted") == Some(0))
+            .filter(|co| co.int("corporationID").is_none_or(|id| npc.get("corporationID", id).is_none()))
+            .collect();
+        found.sort_by_key(|co| std::cmp::Reverse(co.int("memberCount")));
+        found.truncate(40);
+        Json::Array(
+            found
+                .iter()
+                .map(|co| {
+                    let id = co.int("corporationID");
+                    let alliance = co.int("allianceID").and_then(|a| db.table("alliances").get_id(a));
+                    json!({
+                        "id": id,
+                        "name": co.text("corporationName"),
+                        "ticker": co.text("tickerName"),
+                        "members": co.int("memberCount"),
+                        "alliance": alliance.and_then(|a| a.text("shortName")),
+                        "bots": id.is_some_and(|id| is_bots(db, id)),
+                    })
+                })
+                .collect(),
+        )
+    })
 }
 
 /// The busiest systems by pilots online: in space and docked, bots included.
-async fn systems(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
+fn systems(server: &Server) -> Json {
     let (space, docked) = server.world.lock().counts();
     let mut busiest: Vec<(i64, i64, i64)> = space.iter().map(|(s, n)| (*s, *n, docked.get(s).copied().unwrap_or(0))).collect();
     busiest.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then(a.0.cmp(&b.0)));
     busiest.truncate(30);
-    let ids: Vec<i32> = busiest.iter().map(|(s, _, _)| *s as i32).collect();
-    let sql = r#"SELECT s."solarSystemID", s."solarSystemName", round(s."security"::numeric, 1)::float8, r."regionName"
-                   FROM "mapSolarSystems" s JOIN "mapRegions" r ON r."regionID" = s."regionID"
-                  WHERE s."solarSystemID" = ANY($1)"#;
-    let names: HashMap<i32, (String, f64, String)> = db
-        .query(sql, &[&ids])
-        .await?
-        .iter()
-        .map(|r| (r.get(0), (r.get::<_, Option<String>>(1).unwrap_or_default(), r.get::<_, Option<f64>>(2).unwrap_or(0.0), r.get::<_, Option<String>>(3).unwrap_or_default())))
-        .collect();
-    Ok(Json::Array(
+    let regions = sde::table("mapRegions");
+    // Systems in a region the data lacks are not named, as the join with
+    // the regions left them out.
+    let names: HashMap<i64, (String, f64, String)> = server.store.read(|db| {
+        let systems = db.table("mapSolarSystems");
+        busiest
+            .iter()
+            .filter_map(|(id, _, _)| systems.get_id(*id))
+            .filter_map(|s| {
+                let region = regions.find("regionID", s.int("regionID")?).next()?;
+                Some((
+                    s.int("solarSystemID").unwrap_or(0),
+                    (
+                        s.text("solarSystemName").unwrap_or_default().to_string(),
+                        s.float("security").map(round1).unwrap_or(0.0),
+                        region.text("regionName").unwrap_or_default().to_string(),
+                    ),
+                ))
+            })
+            .collect()
+    });
+    Json::Array(
         busiest
             .iter()
             .map(|(id, in_space, in_station)| {
-                let (name, security, region) = names.get(&(*id as i32)).cloned().unwrap_or_default();
+                let (name, security, region) = names.get(id).cloned().unwrap_or_default();
                 json!({ "id": id, "name": name, "security": security, "region": region, "inSpace": in_space, "docked": in_station })
             })
             .collect(),
-    ))
+    )
 }
 
 /// Metres in a light year: the map's coordinates are sent in these.
@@ -367,79 +461,63 @@ static MAP: OnceLock<Json> = OnceLock::new();
 /// [id, name], systems as [id, name, region, constellation, x, z, security]
 /// (x and z in light years, seen from above), and each gate link once as
 /// [from, to].
-async fn map(server: &Server) -> Answer {
+fn map(server: &Server) -> Json {
     if let Some(m) = MAP.get() {
-        return Ok(m.clone());
+        return m.clone();
     }
-    let db=server.db.lease().await?;
-    let regions: Vec<Json> = db
-        .query(r#"SELECT "regionID", "regionName" FROM "mapRegions" ORDER BY "regionName""#, &[])
-        .await?
+    // By name, unnamed regions last, as ORDER BY put them.
+    let mut regions: Vec<sde::Row> = sde::table("mapRegions").rows().collect();
+    regions.sort_by_key(|r| (r.text("regionName").is_none(), r.text("regionName")));
+    let regions: Vec<Json> = regions
         .iter()
-        .map(|r| json!([r.get::<_, i32>(0), r.get::<_, Option<String>>(1).unwrap_or_default()]))
+        .map(|r| json!([r.int("regionID"), r.text("regionName").unwrap_or_default()]))
         .collect();
     let ly = |v: Option<f64>| (v.unwrap_or(0.0) / LIGHT_YEAR * 100.0).round() / 100.0;
-    let systems: Vec<Json> = db
-        .query(
-            r#"SELECT "solarSystemID", "solarSystemName", "regionID", "constellationID", x, z, security
-                 FROM "mapSolarSystems""#,
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|r| {
-            json!([
-                r.get::<_, i32>(0),
-                r.get::<_, Option<String>>(1).unwrap_or_default(),
-                r.get::<_, Option<i32>>(2).unwrap_or(0),
-                r.get::<_, Option<i32>>(3).unwrap_or(0),
-                ly(r.get(4)),
-                ly(r.get(5)),
-                (r.get::<_, Option<f64>>(6).unwrap_or(0.0) * 100.0).round() / 100.0,
-            ])
-        })
-        .collect();
-    let jumps: Vec<Json> = db
-        .query(
-            r#"SELECT "fromSolarSystemID", "toSolarSystemID" FROM "mapSolarSystemJumps"
-                WHERE "fromSolarSystemID" < "toSolarSystemID""#,
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|r| json!([r.get::<_, i32>(0), r.get::<_, i32>(1)]))
+    let systems: Vec<Json> = server.store.read(|db| {
+        db.table("mapSolarSystems")
+            .rows()
+            .map(|r| {
+                json!([
+                    r.int("solarSystemID").unwrap_or(0),
+                    r.text("solarSystemName").unwrap_or_default(),
+                    r.int("regionID").unwrap_or(0),
+                    r.int("constellationID").unwrap_or(0),
+                    ly(r.float("x")),
+                    ly(r.float("z")),
+                    (r.float("security").unwrap_or(0.0) * 100.0).round() / 100.0,
+                ])
+            })
+            .collect()
+    });
+    let jumps: Vec<Json> = sde::table("mapSolarSystemJumps")
+        .rows()
+        .map(|r| (r.int("fromSolarSystemID"), r.int("toSolarSystemID")))
+        .filter(|(from, to)| matches!((from, to), (Some(from), Some(to)) if from < to))
+        .map(|(from, to)| json!([from, to]))
         .collect();
     let m = json!({ "regions": regions, "systems": systems, "jumps": jumps });
-    Ok(MAP.get_or_init(|| m).clone())
+    MAP.get_or_init(|| m).clone()
 }
 
 /// Who holds what: [system, alliance] for every claimed system, and the
 /// alliances holding any as [id, name, ticker].
-async fn sov(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
-    let held: Vec<Json> = db
-        .query(r#"SELECT "solarSystemID", "allianceID" FROM "mapSolarSystems" WHERE "allianceID" IS NOT NULL"#, &[])
-        .await?
-        .iter()
-        .map(|r| json!([r.get::<_, i32>(0), r.get::<_, i32>(1)]))
-        .collect();
-    let alliances: Vec<Json> = db
-        .query(
-            r#"SELECT a."allianceID", a."allianceName", a."shortName" FROM alliances a
-                WHERE EXISTS (SELECT 1 FROM "mapSolarSystems" s WHERE s."allianceID" = a."allianceID")"#,
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|r| {
-            json!([
-                r.get::<_, i32>(0),
-                r.get::<_, Option<String>>(1).unwrap_or_default(),
-                r.get::<_, Option<String>>(2).unwrap_or_default(),
-            ])
-        })
-        .collect();
-    Ok(json!({ "systems": held, "alliances": alliances }))
+fn sov(server: &Server) -> Json {
+    server.store.read(|db| {
+        let claimed: Vec<(i64, i64)> = db
+            .table("mapSolarSystems")
+            .rows()
+            .filter_map(|s| Some((s.int("solarSystemID").unwrap_or(0), s.int("allianceID")?)))
+            .collect();
+        let holders: std::collections::HashSet<i64> = claimed.iter().map(|(_, a)| *a).collect();
+        let held: Vec<Json> = claimed.iter().map(|(s, a)| json!([s, a])).collect();
+        let alliances: Vec<Json> = db
+            .table("alliances")
+            .rows()
+            .filter(|a| a.int("allianceID").is_some_and(|id| holders.contains(&id)))
+            .map(|a| json!([a.int("allianceID").unwrap_or(0), a.text("allianceName").unwrap_or_default(), a.text("shortName").unwrap_or_default()]))
+            .collect();
+        json!({ "systems": held, "alliances": alliances })
+    })
 }
 
 /// A query string's value: `+` for spaces, `%XX` for bytes.
@@ -482,69 +560,142 @@ fn pilots(server: &Server, q: &str) -> Json {
 
 /// The last day's kills and losses by alliance (or corporation outside
 /// one), bots' unseen fights included.
-async fn killboard(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
+fn killboard(server: &Server) -> Json {
     let since = crate::bulkdata::filetime_now() - 24 * 3_600 * 10_000_000;
-    let sql = r#"WITH recent AS (SELECT * FROM "killLog" WHERE "killTime" > $1),
-                      k AS (SELECT COALESCE(NULLIF(p."allianceID", 0), p."corporationID") AS side, count(*)::int AS n
-                              FROM "killLogParticipants" p JOIN recent r ON r."killID" = p."killID" WHERE p."finalBlow" = 1 GROUP BY 1),
-                      l AS (SELECT COALESCE(NULLIF(r."victimAllianceID", 0), r."victimCorpID") AS side, count(*)::int AS n FROM recent r GROUP BY 1),
-                      sides AS (SELECT side FROM k UNION SELECT side FROM l)
-                 SELECT s.side AS id, COALESCE(a."allianceName", c."corporationName", '?') AS name,
-                        COALESCE(a."shortName", c."tickerName", '') AS ticker,
-                        COALESCE(k.n, 0) AS kills, COALESCE(l.n, 0) AS losses,
-                        EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = s.side) AS bots
-                   FROM sides s LEFT JOIN k ON k.side = s.side LEFT JOIN l ON l.side = s.side
-                   LEFT JOIN alliances a ON a."allianceID" = s.side LEFT JOIN "corporation" c ON c."corporationID" = s.side
-                  ORDER BY kills DESC, losses DESC LIMIT 30"#;
-    let sides = rows(&db.query(sql, &[&since]).await?);
-    let total: i64 = db.query_one(r#"SELECT count(*) FROM "killLog" WHERE "killTime" > $1"#, &[&since]).await?.get(0);
-    let ships = rows(
-        &db
-        .query(
-                r#"SELECT t."typeName" AS ship, count(*)::int AS lost FROM "killLog" k JOIN "invTypes" t ON t."typeID" = k."victimShipTypeID"
-                    WHERE k."killTime" > $1 GROUP BY 1 ORDER BY 2 DESC LIMIT 10"#,
-                &[&since],
-            )
-            .await?,
-    );
-    Ok(json!({ "total": total, "sides": sides, "ships": ships }))
+    // A side is an alliance, or the corporation where there is none (0).
+    let side = |alliance: Option<i64>, corp: Option<i64>| alliance.filter(|a| *a != 0).or(corp);
+    let (sides, total, by_type) = server.store.read(|db| {
+        let recent: Vec<_> = db.table("killLog").rows().filter(|k| k.int("killTime").is_some_and(|t| t > since)).collect();
+        // Each side in the order it first counts: kills, then losses.
+        let mut order: Vec<Option<i64>> = Vec::new();
+        let mut kills: HashMap<Option<i64>, i64> = HashMap::new();
+        let participants = db.table("killLogParticipants");
+        for k in &recent {
+            let Some(id) = k.int("killID") else { continue };
+            for p in participants.find(&["killID"], &[Value::Int(id)]).filter(|p| p.int("finalBlow") == Some(1)) {
+                let s = side(p.int("allianceID"), p.int("corporationID"));
+                if !order.contains(&s) {
+                    order.push(s);
+                }
+                *kills.entry(s).or_default() += 1;
+            }
+        }
+        let mut losses: HashMap<Option<i64>, i64> = HashMap::new();
+        let mut by_type: Vec<(Option<i64>, i64)> = Vec::new();
+        for k in &recent {
+            let s = side(k.int("victimAllianceID"), k.int("victimCorpID"));
+            if !order.contains(&s) {
+                order.push(s);
+            }
+            *losses.entry(s).or_default() += 1;
+            let ship = k.int("victimShipTypeID");
+            match by_type.iter_mut().find(|(t, _)| *t == ship) {
+                Some((_, n)) => *n += 1,
+                None => by_type.push((ship, 1)),
+            }
+        }
+        // A side of nobody (NULL) joins no counts.
+        let count = |m: &HashMap<Option<i64>, i64>, s: Option<i64>| s.and_then(|s| m.get(&Some(s)).copied()).unwrap_or(0);
+        let mut sides: Vec<(i64, i64, Json)> = order
+            .into_iter()
+            .map(|s| {
+                let (name, ticker) = side_names(db, s);
+                let (k, l) = (count(&kills, s), count(&losses, s));
+                let item = json!({
+                    "id": s,
+                    "name": name,
+                    "ticker": ticker,
+                    "kills": k,
+                    "losses": l,
+                    "bots": s.is_some_and(|s| is_bots(db, s)),
+                });
+                (k, l, item)
+            })
+            .collect();
+        sides.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        sides.truncate(30);
+        (Json::Array(sides.into_iter().map(|(_, _, item)| item).collect()), recent.len(), by_type)
+    });
+    // The ships lost most, by name: the losses counted by type, which are
+    // named from the static data (losses of a type it lacks left out, as
+    // the join with invTypes left them).
+    let mut lost: Vec<(Option<&str>, i64)> = Vec::new();
+    for (ship, n) in by_type {
+        let Some(ship) = ship.and_then(|id| sde::table("invTypes").get("typeID", id)) else { continue };
+        let name = ship.text("typeName");
+        match lost.iter_mut().find(|(other, _)| *other == name) {
+            Some((_, count)) => *count += n,
+            None => lost.push((name, n)),
+        }
+    }
+    lost.sort_by(|a, b| b.1.cmp(&a.1));
+    lost.truncate(10);
+    let ships = Json::Array(lost.into_iter().map(|(ship, lost)| json!({ "ship": ship, "lost": lost })).collect());
+    json!({ "total": total, "sides": sides, "ships": ships })
 }
 
-async fn kills(server: &Server) -> Answer {
-    let db=server.db.lease().await?;
-    let sql = format!(
-        r#"SELECT k."killID" AS id, {time} AS time, vc."characterName" AS victim, vco."corporationName" AS "victimCorporation",
-                  t."typeName" AS ship, s."solarSystemName" AS system, fc."characterName" AS "finalBlow", k."isPodKill" = 1 AS pod
-             FROM "killLog" k
-             LEFT JOIN "character_" vc ON vc."characterID" = k."victimCharID"
-             LEFT JOIN "corporation" vco ON vco."corporationID" = k."victimCorpID"
-             LEFT JOIN "invTypes" t ON t."typeID" = k."victimShipTypeID"
-             LEFT JOIN "mapSolarSystems" s ON s."solarSystemID" = k."solarSystemID"
-             LEFT JOIN "character_" fc ON fc."characterID" = k."finalBlowID"
-            ORDER BY k."killID" DESC LIMIT 30"#,
-        time = ms(r#"k."killTime""#)
-    );
-    Ok(rows(&db.query(sql.as_str(), &[]).await?))
+/// The latest kills.
+fn kills(server: &Server) -> Json {
+    let mut list: Vec<Json> = server.store.read(|db| {
+        let mut found: Vec<_> = db.table("killLog").rows().collect();
+        found.sort_by_key(|k| std::cmp::Reverse(k.int("killID")));
+        found.truncate(30);
+        let name = |id: Option<i64>| id.and_then(|id| db.table("character_").get_id(id)).and_then(|c| c.text("characterName"));
+        found
+            .iter()
+            .map(|k| {
+                json!({
+                    "id": k.int("killID"),
+                    "time": k.int("killTime").map(ms),
+                    "victim": name(k.int("victimCharID")),
+                    "victimCorporation": k.int("victimCorpID").and_then(|id| db.table("corporation").get_id(id)).and_then(|c| c.text("corporationName")),
+                    "ship": k.int("victimShipTypeID"),
+                    "system": k.int("solarSystemID").and_then(|id| db.table("mapSolarSystems").get_id(id)).and_then(|s| s.text("solarSystemName")),
+                    "finalBlow": name(k.int("finalBlowID")),
+                    "pod": k.int("isPodKill").map(|p| p == 1),
+                })
+            })
+            .collect()
+    });
+    // The ship came as its type, named here from the static data.
+    for item in list.iter_mut() {
+        item["ship"] = type_name(item["ship"].as_i64());
+    }
+    Json::Array(list)
 }
 
-#[cfg(test)] mod recovery_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
+
+    #[test]
+    fn rounds_to_one_decimal_as_numeric_did() {
+        assert_eq!(round1(0.15), 0.2);
+        assert_eq!(round1(-0.25), -0.3);
+        assert_eq!(round1(2.449_999), 2.4);
+        assert_eq!(round1(0.04), 0.0);
+        assert_eq!(round1(5.0), 5.0);
+    }
+
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable database; terminates only its own backend"]
-    async fn dashboard_database_requests_recover_on_the_next_request() {
-        let f=crate::test_support::Database::load().await;
-        let admin=crate::db::connect(&f.url).await.unwrap();
-        let server=Server {table:Default::default(),db:crate::db::Shared::new(f.db,f.url.clone()),db_url:f.url,
-            node_id:1,bulk:f.bulk,dogma:f.dogma,world:f.world,services:crate::svc::registry(),
-            dump_dir:Default::default(),alliance_join_delay_secs:0,sov_claim_delay_secs:0};
-        let before=summary(&server).await.unwrap();
-        let original=server.db.snapshot();
-        let pid:i32=original.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        admin.query_one("SELECT pg_terminate_backend($1)",&[&pid]).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3),async {while !original.is_closed(){tokio::task::yield_now().await;}}).await.unwrap();
-        let after=summary(&server).await.unwrap();
-        assert_eq!(before["systemsHeld"],after["systemsHeld"]);
-        assert!(!std::sync::Arc::ptr_eq(&original,&server.db.snapshot()));
+    async fn every_view_reads_a_fresh_world() {
+        let f = crate::test_support::Database::load().await;
+        let server = Server {
+            table: Default::default(),
+            store: f.store,
+            node_id: 1,
+            bulk: f.bulk,
+            dogma: f.dogma,
+            world: f.world,
+            services: crate::svc::registry(),
+            dump_dir: Default::default(),
+            alliance_join_delay_secs: 0,
+            sov_claim_delay_secs: 0,
+        };
+        assert!(summary(&server)["systemsHeld"].is_u64());
+        for view in [wars, players, alliances, corporations, systems, sov, killboard, kills] {
+            view(&server);
+        }
+        assert!(map(&server)["systems"].as_array().is_some_and(|s| !s.is_empty()));
     }
 }

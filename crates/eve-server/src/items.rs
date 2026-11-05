@@ -1,20 +1,30 @@
-//! Item changes made in one database transaction, and the `OnItemChange`
-//! events that tell the client about them.
+//! Item changes made in one store transaction, and the `OnItemChange` events
+//! that tell the client about them.
 //!
-//! Every item an operation touches is locked and snapshotted the first time it
-//! is read; on commit each one is compared with how it ended up, so an
+//! Every item an operation touches is snapshotted the first time it is read;
+//! [`ItemTxn::events`] compares each one with how it ended up, so an
 //! operation only says what to do and the events follow from the data
 //! (invCache.py:111 reads them: an item at quantity 0 is gone, one whose old
-//! location is 0 is new).
+//! location is 0 is new). The store runs one write at a time, so an item
+//! read here cannot change under the operation before it commits.
+//!
+//! ```ignore
+//! let events = ctx.store.write(|tx| -> Result<_, StoreError> {
+//!     let mut items = ItemTxn::new(tx);
+//!     items.move_to(id, station, FLAG_HANGAR)?;
+//!     Ok(items.events())
+//! })?;
+//! crate::items::notify(ctx.world, ctx.client_id, events);
+//! ```
 
-use std::collections::{HashMap,HashSet};
+use std::collections::{HashMap, HashSet};
 
 use eve_marshal::Value;
-use tokio_postgres::{Client, Transaction};
 
-use crate::svc::inventory::{invitem_cells, item_change, INVITEM_SELECT, IX_LOCATION_ID, IX_QUANTITY};
+use crate::store::{self, Row, StoreError, Tx};
+use crate::svc::inventory::{item_change, IX_LOCATION_ID, IX_QUANTITY};
 
-pub type DbResult<T> = Result<T, tokio_postgres::Error>;
+pub type DbResult<T> = Result<T, StoreError>;
 
 /// What an operation needs to know about an item.
 #[derive(Debug, Clone)]
@@ -31,205 +41,268 @@ pub struct Item {
     pub volume: f64,
 }
 
-/// The item row columns compared on commit: itemID up to quantity.
+/// The client's item row columns (`invItem`): `INVITEM_HEADER`.
+pub const INVITEM_COLUMNS: [&str; 11] =
+    ["itemID", "typeID", "ownerID", "locationID", "flag", "contraband", "singleton", "quantity", "groupID", "categoryID", "customInfo"];
+
+/// Positions of the group and category in an item row.
+const IX_GROUP_ID: usize = 8;
+const IX_CATEGORY_ID: usize = 9;
+
+/// An entity row as the client's item row, its group and category from the
+/// static data; None for an item of a type it does not know (or whose group
+/// it does not know), which the item SQL left out by joining the type
+/// tables. `customInfo` is sent as bytes.
+pub fn invitem_cells(row: &Row) -> Option<Vec<Value>> {
+    let mut cells = item_cells(row)?;
+    cells.push(match row.text("customInfo") {
+        Some(s) => Value::Bytes(s.as_bytes().to_vec()),
+        None => Value::None,
+    });
+    Some(cells)
+}
+
+/// As [`invitem_cells`], with `customInfo` as `svc::rows::cell` sent text
+/// (`Value::text`): for listings that sent the item query's rows to the
+/// client as they came.
+pub fn invitem_line(row: &Row) -> Option<Vec<Value>> {
+    let mut cells = item_cells(row)?;
+    cells.push(row.cell("customInfo"));
+    Some(cells)
+}
+
+/// [`invitem_line`] of each row, as rowset lines.
+pub fn invitem_lines<'a>(rows: impl IntoIterator<Item = Row<'a>>) -> Vec<Value> {
+    rows.into_iter().filter_map(|r| invitem_line(&r)).map(Value::List).collect()
+}
+
+fn item_cells(row: &Row) -> Option<Vec<Value>> {
+    let type_id = row.int("typeID")?;
+    let (group, category) = crate::sde::get().group_and_category(type_id)?;
+    let mut cells: Vec<Value> = INVITEM_COLUMNS[..IX_GROUP_ID].iter().map(|c| row.int(c).map_or(Value::None, Value::Int)).collect();
+    cells.push(Value::Int(group));
+    cells.push(Value::Int(category));
+    debug_assert_eq!(cells.len(), IX_CATEGORY_ID + 1);
+    Some(cells)
+}
+
+/// The item row columns compared for events: itemID up to quantity.
 const COMPARED_COLUMNS: usize = 8;
 
-pub struct ItemTxn<'c> {
-    tx: Transaction<'c>,
+pub struct ItemTxn<'t, 'd> {
+    tx: &'t mut Tx<'d>,
     /// Each touched item as it was before this transaction; None if it is new.
     before: HashMap<i64, Option<Vec<Value>>>,
     order: Vec<i64>,
 }
 
-impl<'c> ItemTxn<'c> {
-    pub async fn begin(client: &'c mut Client) -> DbResult<Self> {
-        Ok(ItemTxn { tx: client.transaction().await?, before: HashMap::new(), order: Vec::new() })
+impl<'t, 'd> ItemTxn<'t, 'd> {
+    pub fn new(tx: &'t mut Tx<'d>) -> Self {
+        ItemTxn { tx, before: HashMap::new(), order: Vec::new() }
     }
 
-    /// The transaction, for writes that are not item changes (wallets, orders).
-    pub fn tx(&self) -> &Transaction<'c> {
-        &self.tx
+    /// The transaction, for changes that are not item changes (wallets,
+    /// orders).
+    pub fn tx(&mut self) -> &mut Tx<'d> {
+        self.tx
     }
 
-    /// Lock `id` and read it; the first read is the snapshot.
-    pub async fn item(&mut self, id: i64) -> DbResult<Option<Item>> {
-        let sql = format!(
-            r#"{} e."itemID" = $1 FOR UPDATE OF e"#,
-            INVITEM_SELECT.replace(r#"e."customInfo""#, r#"e."customInfo", t."volume""#)
-        );
-        let Some(r) = self.tx.query_opt(&sql, &[&(id as i32)]).await? else { return Ok(None) };
+    /// The data as the transaction has made it so far.
+    pub fn db(&self) -> &store::Db {
+        self.tx.db()
+    }
+
+    fn entity_row(&self, id: i64) -> Option<store::RowId> {
+        self.tx.table("entity").get_id(id).map(|r| r.id)
+    }
+
+    /// Read `id`; the first read is the snapshot.
+    pub fn item(&mut self, id: i64) -> DbResult<Option<Item>> {
+        let entity = self.tx.table("entity");
+        let Some(row) = entity.get_id(id) else { return Ok(None) };
+        // An item of a type the static data does not know is no item here,
+        // as when the type tables were joined.
+        let Some(cells) = invitem_cells(&row) else { return Ok(None) };
+        let type_id = row.int("typeID").unwrap_or(0);
+        let item = Item {
+            id,
+            type_id,
+            owner_id: row.int("ownerID").unwrap_or(0),
+            location_id: row.int("locationID").unwrap_or(0),
+            flag: row.int("flag").unwrap_or(0),
+            singleton: row.int("singleton").unwrap_or(0) != 0,
+            quantity: row.int("quantity").unwrap_or(0),
+            category_id: cells[IX_CATEGORY_ID].as_i64().unwrap_or(0),
+            volume: crate::sde::table("invTypes").get("typeID", type_id).and_then(|t| t.float("volume")).unwrap_or(0.0),
+        };
         if let std::collections::hash_map::Entry::Vacant(slot) = self.before.entry(id) {
-            slot.insert(Some(invitem_cells(&r)));
+            slot.insert(Some(cells));
             self.order.push(id);
         }
-        let int = |i: usize| r.get::<_, i32>(i) as i64;
-        Ok(Some(Item {
-            id,
-            type_id: int(1),
-            owner_id: int(2),
-            location_id: int(3),
-            flag: int(4),
-            singleton: int(6) != 0,
-            quantity: int(7),
-            category_id: int(9),
-            volume: r.get::<_, Option<f64>>(11).unwrap_or(0.0),
-        }))
+        Ok(Some(item))
     }
 
-    /// Lock and read several items; missing ones are left out.
-    pub async fn items(&mut self, ids: &[i64]) -> DbResult<Vec<Item>> {
+    /// Read several items; missing ones are left out.
+    pub fn items(&mut self, ids: &[i64]) -> DbResult<Vec<Item>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            out.extend(self.item(*id).await?);
+            out.extend(self.item(*id)?);
         }
         Ok(out)
     }
 
-    async fn touch(&mut self, id: i64) -> DbResult<()> {
+    fn touch(&mut self, id: i64) -> DbResult<()> {
         if !self.before.contains_key(&id) {
-            self.item(id).await?;
+            self.item(id)?;
         }
         Ok(())
     }
 
-    pub async fn move_to(&mut self, id: i64, location_id: i64, flag: i64) -> DbResult<()> {
-        self.touch(id).await?;
-        self.tx
-            .execute(
-                r#"UPDATE entity SET "locationID" = $2, "flag" = $3 WHERE "itemID" = $1"#,
-                &[&(id as i32), &(location_id as i32), &(flag as i32)],
-            )
-            .await?;
-        Ok(())
+    /// Set columns of the entity row of `id` (nothing if there is none, as
+    /// an UPDATE matching no row did).
+    fn set(&mut self, id: i64, sets: store::Sets) -> DbResult<()> {
+        match self.entity_row(id) {
+            Some(row) => self.tx.update("entity", row, sets),
+            None => Ok(()),
+        }
+    }
+
+    pub fn move_to(&mut self, id: i64, location_id: i64, flag: i64) -> DbResult<()> {
+        self.touch(id)?;
+        self.set(id, &[("locationID", store::Value::Int(location_id)), ("flag", store::Value::Int(flag))])
     }
 
     /// Set a stack's size; 0 destroys the item.
-    pub async fn set_quantity(&mut self, id: i64, quantity: i64) -> DbResult<()> {
+    pub fn set_quantity(&mut self, id: i64, quantity: i64) -> DbResult<()> {
         if quantity <= 0 {
-            return self.destroy(id).await;
+            return self.destroy(id);
         }
-        self.touch(id).await?;
-        self.tx
-            .execute(r#"UPDATE entity SET "quantity" = $2 WHERE "itemID" = $1"#, &[&(id as i32), &(quantity as i32)])
-            .await?;
-        Ok(())
+        self.touch(id)?;
+        self.set(id, &[("quantity", store::Value::Int(quantity))])
     }
 
-    pub async fn set_owner(&mut self, id: i64, owner_id: i64) -> DbResult<()> {
-        self.touch(id).await?;
-        self.tx
-            .execute(r#"UPDATE entity SET "ownerID" = $2 WHERE "itemID" = $1"#, &[&(id as i32), &(owner_id as i32)])
-            .await?;
-        Ok(())
+    pub fn set_owner(&mut self, id: i64, owner_id: i64) -> DbResult<()> {
+        self.touch(id)?;
+        self.set(id, &[("ownerID", store::Value::Int(owner_id))])
     }
 
-    /// Where an item floats in space (not compared on commit: the client
+    /// Where an item floats in space (not compared for events: the client
     /// learns positions from destiny).
-    pub async fn set_position(&mut self, id: i64, pos: (f64, f64, f64)) -> DbResult<()> {
-        self.tx
-            .execute(r#"UPDATE entity SET "x" = $2, "y" = $3, "z" = $4 WHERE "itemID" = $1"#, &[&(id as i32), &pos.0, &pos.1, &pos.2])
-            .await?;
-        Ok(())
+    pub fn set_position(&mut self, id: i64, pos: (f64, f64, f64)) -> DbResult<()> {
+        self.set(id, &[("x", store::Value::Float(pos.0)), ("y", store::Value::Float(pos.1)), ("z", store::Value::Float(pos.2))])
     }
 
     /// Where every item touched so far was before this transaction.
     pub fn origins(&self) -> Vec<i64> {
-        let mut out: Vec<i64> = self
-            .before
-            .values()
-            .flatten()
-            .filter_map(|cells| cells.get(IX_LOCATION_ID as usize).and_then(|v| v.as_i64()))
-            .collect();
+        let mut out: Vec<i64> =
+            self.before.values().flatten().filter_map(|cells| cells.get(IX_LOCATION_ID as usize).and_then(|v| v.as_i64())).collect();
         out.sort_unstable();
         out.dedup();
         out
     }
 
-    pub async fn set_singleton(&mut self, id: i64, singleton: bool) -> DbResult<()> {
-        self.touch(id).await?;
-        self.tx
-            .execute(
-                r#"UPDATE entity SET "singleton" = $2 WHERE "itemID" = $1"#,
-                &[&(id as i32), &i32::from(singleton)],
-            )
-            .await?;
-        Ok(())
+    pub fn set_singleton(&mut self, id: i64, singleton: bool) -> DbResult<()> {
+        self.touch(id)?;
+        self.set(id, &[("singleton", store::Value::Int(i64::from(singleton)))])
     }
 
-    pub async fn destroy(&mut self, id: i64) -> DbResult<()> {
-        self.touch(id).await?;
-        self.tx.execute(r#"DELETE FROM entity_attributes WHERE "itemID" = $1"#, &[&(id as i32)]).await?;
-        self.tx.execute(r#"DELETE FROM entity WHERE "itemID" = $1"#, &[&(id as i32)]).await?;
-        Ok(())
-    }
-
-    /// Destroy only the subtree still attached when each row is locked. A
-    /// transfer that wins a child lock may move its entire subtree away; do
-    /// not follow or delete it using a stale list collected before the wait.
-    /// `protected` lets ship loss retain its pilot even in malformed nesting.
-    pub async fn destroy_tree(&mut self, root:i64, expected_parent:Option<i64>, protected:&[i64]) -> DbResult<()> {
-        let mut pending=vec![(root,expected_parent)];
-        let mut seen=HashSet::new();
-        while let Some((id,parent))=pending.pop() {
-            if protected.contains(&id) || seen.contains(&id) { continue; }
-            let Some(item)=self.item(id).await? else { continue; };
-            if parent.is_some_and(|parent|item.location_id!=parent) { continue; }
-            seen.insert(id);
-            let children=self.tx.query(r#"SELECT "itemID" FROM entity WHERE "locationID"=$1 ORDER BY "itemID""#,
-                &[&(id as i32)]).await?;
-            for row in children.into_iter().rev() { pending.push((i64::from(row.get::<_,i32>(0)),Some(id))); }
-            self.destroy(id).await?;
+    /// Delete an item and its stored attributes (and, through the store's
+    /// foreign keys, what was kept for it).
+    pub fn destroy(&mut self, id: i64) -> DbResult<()> {
+        self.touch(id)?;
+        self.tx.delete_where("entity_attributes", &["itemID"], &[store::Value::Int(id)])?;
+        if let Some(row) = self.entity_row(id) {
+            self.tx.delete("entity", row)?;
         }
         Ok(())
     }
 
-    /// Hand over the subtree still attached when each item is locked. Children
-    /// moved elsewhere while we waited are no longer part of the handover.
-    /// False means custody was invalid; callers must roll back the transaction.
-    pub async fn transfer_tree(&mut self, root:i64, from:i64, to:i64) -> DbResult<bool> {
-        let mut pending=vec![(root,None)];
-        let mut seen=HashSet::new();
-        while let Some((id,parent))=pending.pop() {
-            if !seen.insert(id) { return Ok(false); }
-            let Some(item)=self.item(id).await? else {
-                if id==root { return Ok(false); }
+    /// The items directly inside `id`, by itemID.
+    fn children(&self, id: i64) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.tx.table("entity").find(&["locationID"], &[store::Value::Int(id)]).filter_map(|r| r.int("itemID")).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Destroy `root` and everything inside it. With `expected_parent`, only
+    /// if `root` is still there; `protected` items (and what is in them) are
+    /// kept, so a ship loss retains its pilot even in malformed nesting.
+    pub fn destroy_tree(&mut self, root: i64, expected_parent: Option<i64>, protected: &[i64]) -> DbResult<()> {
+        let mut pending = vec![(root, expected_parent)];
+        let mut seen = HashSet::new();
+        while let Some((id, parent)) = pending.pop() {
+            if protected.contains(&id) || seen.contains(&id) {
+                continue;
+            }
+            let Some(item) = self.item(id)? else { continue };
+            if parent.is_some_and(|parent| item.location_id != parent) {
+                continue;
+            }
+            seen.insert(id);
+            for child in self.children(id).into_iter().rev() {
+                pending.push((child, Some(id)));
+            }
+            self.destroy(id)?;
+        }
+        Ok(())
+    }
+
+    /// Hand `root` and everything inside it from owner `from` to `to`. False
+    /// means custody was invalid; callers must refuse (returning an error
+    /// from the store write undoes what this did).
+    pub fn transfer_tree(&mut self, root: i64, from: i64, to: i64) -> DbResult<bool> {
+        let mut pending = vec![(root, None)];
+        let mut seen = HashSet::new();
+        while let Some((id, parent)) = pending.pop() {
+            if !seen.insert(id) {
+                return Ok(false);
+            }
+            let Some(item) = self.item(id)? else {
+                if id == root {
+                    return Ok(false);
+                }
                 continue;
             };
-            if parent.is_some_and(|parent|item.location_id!=parent) { continue; }
-            if item.owner_id!=from || matches!(item.flag,7|36|57|61|88|89) {
+            if parent.is_some_and(|parent| item.location_id != parent) {
+                continue;
+            }
+            if item.owner_id != from || matches!(item.flag, 7 | 36 | 57 | 61 | 88 | 89) {
                 return Ok(false);
             }
             // Characters and their active ships cannot be handed over as cargo.
-            if self.tx.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 OR "shipID"=$1 LIMIT 1"#,
-                &[&(id as i32)]).await?.is_some() { return Ok(false); }
-            let children=self.tx.query(r#"SELECT "itemID" FROM entity WHERE "locationID"=$1 ORDER BY "itemID""#,
-                &[&(id as i32)]).await?;
-            for row in children.into_iter().rev() { pending.push((i64::from(row.get::<_,i32>(0)),Some(id))); }
-            self.set_owner(id,to).await?;
+            let characters = self.tx.table("character_");
+            if characters.get_id(id).is_some() || characters.find(&["shipID"], &[store::Value::Int(id)]).next().is_some() {
+                return Ok(false);
+            }
+            for child in self.children(id).into_iter().rev() {
+                pending.push((child, Some(id)));
+            }
+            self.set_owner(id, to)?;
         }
         Ok(true)
     }
 
     /// A new item; returns its ID.
-    pub async fn create(&mut self, new: NewItem) -> DbResult<i64> {
-        let r = self
-            .tx
-            .query_one(
-                r#"INSERT INTO entity ("itemID","itemName","typeID","ownerID","locationID","flag",
-                                       "contraband","singleton","quantity","x","y","z","customInfo")
-                   VALUES (nextval('dyn_id_seq'), '', $1, $2, $3, $4, 0, $5, $6, 0, 0, 0, NULL)
-                   RETURNING "itemID""#,
-                &[
-                    &(new.type_id as i32),
-                    &(new.owner_id as i32),
-                    &(new.location_id as i32),
-                    &(new.flag as i32),
-                    &i32::from(new.singleton),
-                    &(new.quantity as i32),
-                ],
-            )
-            .await?;
-        let id = r.get::<_, i32>(0) as i64;
+    pub fn create(&mut self, new: NewItem) -> DbResult<i64> {
+        let id = self.tx.nextval("dyn_id_seq")?;
+        self.tx.insert(
+            "entity",
+            &[
+                ("itemID", store::Value::Int(id)),
+                ("itemName", store::Value::Text("".into())),
+                ("typeID", store::Value::Int(new.type_id)),
+                ("ownerID", store::Value::Int(new.owner_id)),
+                ("locationID", store::Value::Int(new.location_id)),
+                ("flag", store::Value::Int(new.flag)),
+                ("contraband", store::Value::Int(0)),
+                ("singleton", store::Value::Int(i64::from(new.singleton))),
+                ("quantity", store::Value::Int(new.quantity)),
+                ("x", store::Value::Float(0.0)),
+                ("y", store::Value::Float(0.0)),
+                ("z", store::Value::Float(0.0)),
+                ("customInfo", store::Value::Null),
+            ],
+        )?;
         self.before.insert(id, None);
         self.order.push(id);
         Ok(id)
@@ -237,87 +310,53 @@ impl<'c> ItemTxn<'c> {
 
     /// Add `quantity` of a type to a stack at (owner, location, flag), making
     /// one if there is none. Returns the stack's ID.
-    pub async fn stack_onto(&mut self, new: NewItem) -> DbResult<i64> {
+    pub fn stack_onto(&mut self, new: NewItem) -> DbResult<i64> {
         let existing = self
             .tx
-            .query_opt(
-                r#"SELECT "itemID" FROM entity
-                    WHERE "ownerID" = $1 AND "locationID" = $2 AND "flag" = $3
-                      AND "typeID" = $4 AND "singleton" = 0
-                    ORDER BY "itemID" LIMIT 1 FOR UPDATE"#,
-                &[
-                    &(new.owner_id as i32),
-                    &(new.location_id as i32),
-                    &(new.flag as i32),
-                    &(new.type_id as i32),
-                ],
-            )
-            .await?;
+            .table("entity")
+            .find(&["ownerID", "locationID", "flag"], &[store::Value::Int(new.owner_id), store::Value::Int(new.location_id), store::Value::Int(new.flag)])
+            .filter(|r| r.int("typeID") == Some(new.type_id) && r.int("singleton") == Some(0))
+            .filter_map(|r| r.int("itemID"))
+            .min();
         match existing {
-            Some(r) => {
-                let id = r.get::<_, i32>(0) as i64;
-                let Some(item)=self.item(id).await? else { return self.create(new).await; };
-                if item.quantity.checked_add(new.quantity).is_none_or(|n|n>i32::MAX as i64) {
-                    return self.create(new).await;
+            Some(id) => {
+                let Some(item) = self.item(id)? else { return self.create(new) };
+                if item.quantity.checked_add(new.quantity).is_none_or(|n| n > i32::MAX as i64) {
+                    return self.create(new);
                 }
-                self.set_quantity(id, item.quantity + new.quantity).await?;
+                self.set_quantity(id, item.quantity + new.quantity)?;
                 Ok(id)
             }
-            None => self.create(new).await,
+            None => self.create(new),
         }
     }
 
-    /// Commit, and return the `OnItemChange` argument tuples for everything
-    /// that changed.
-    pub async fn commit(self) -> DbResult<Vec<Value>> {
-        let events=self.prepare_events().await?;
-        self.commit_prepared().await?;
-        Ok(events)
-    }
-
-    /// Capture notifications before an operation's final acceptance check.
-    /// Durable operation owners retain these across a lost COMMIT reply;
-    /// publishing them still requires proof that the transaction committed.
-    pub(crate) async fn prepare_events(&self) -> DbResult<Vec<Value>> {
-        let ids: Vec<i32> = self.order.iter().map(|i| *i as i32).collect();
-        let sql = format!(r#"{INVITEM_SELECT} e."itemID" = ANY($1)"#);
-        let after: HashMap<i64, Vec<Value>> = self
-            .tx
-            .query(&sql, &[&ids])
-            .await?
-            .iter()
-            .map(|r| (r.get::<_, i32>(0) as i64, invitem_cells(r)))
-            .collect();
+    /// The `OnItemChange` argument tuples for everything this transaction
+    /// changed. Return them from the store write and publish them once it
+    /// has committed.
+    pub fn events(&self) -> Vec<Value> {
+        let entity = self.tx.table("entity");
         let mut events = Vec::new();
         for id in &self.order {
             let before = self.before.get(id).cloned().flatten();
-            let event = match (before, after.get(id)) {
+            let after = entity.get_id(*id).and_then(|r| invitem_cells(&r));
+            let event = match (before, after) {
                 (Some(old), Some(now)) => {
-                    let changed: Vec<(i64, Value)> = (0..COMPARED_COLUMNS)
-                        .filter(|&i| old[i] != now[i])
-                        .map(|i| (i as i64, old[i].clone()))
-                        .collect();
-                    (!changed.is_empty()).then(|| item_change(now.clone(), changed))
+                    let changed: Vec<(i64, Value)> =
+                        (0..COMPARED_COLUMNS).filter(|&i| old[i] != now[i]).map(|i| (i as i64, old[i].clone())).collect();
+                    (!changed.is_empty()).then(|| item_change(now, changed))
                 }
                 (Some(mut old), None) => {
                     let quantity = old[IX_QUANTITY as usize].clone();
                     old[IX_QUANTITY as usize] = Value::Int(0);
                     Some(item_change(old, vec![(IX_QUANTITY, quantity)]))
                 }
-                (None, Some(now)) => Some(item_change(
-                    now.clone(),
-                    vec![(IX_LOCATION_ID, Value::Int(0)), (IX_QUANTITY, Value::Int(0))],
-                )),
+                (None, Some(now)) => Some(item_change(now, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_QUANTITY, Value::Int(0))])),
                 (None, None) => None,
             };
             events.extend(event);
         }
-        Ok(events)
-    }
-
-    /// Send only COMMIT, with no intervening query after final validation.
-    pub(crate) async fn commit_prepared(self) -> DbResult<()> {
-        self.tx.commit().await
+        events
     }
 }
 
@@ -341,85 +380,76 @@ pub fn notify(world: &crate::world::World, client_id: i64, events: Vec<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
 
-    /// Wait on PostgreSQL's lock graph, not a timing assumption: the competing
-    /// operation must already have reached the locked row before we commit.
-    async fn wait_for_lock(db:&Client,pid:i32) {
-        tokio::time::timeout(std::time::Duration::from_secs(10),async {
-            loop {
-                if db.query_one("SELECT cardinality(pg_blocking_pids($1))>0",&[&pid]).await.unwrap().get::<_,bool>(0) { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }).await.expect("worker reaches the competing transaction's row lock");
+    fn store() -> Store {
+        crate::test_support::store()
     }
 
-    #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn recursive_cleanup_keeps_a_subtree_moved_while_waiting_for_its_lock() {
-        let mut fixture=crate::test_support::Database::load().await;
-        let owner=i64::from(fixture.id().await);
-        let mut seed=ItemTxn::begin(&mut fixture.db).await.unwrap();
-        let root=seed.create(NewItem {type_id:3293,owner_id:owner,location_id:30000142,flag:0,quantity:1,singleton:true}).await.unwrap();
-        let moved=seed.create(NewItem {type_id:3293,owner_id:owner,location_id:root,flag:0,quantity:1,singleton:true}).await.unwrap();
-        let nested=seed.create(NewItem {type_id:34,owner_id:owner,location_id:moved,flag:5,quantity:12,singleton:false}).await.unwrap();
-        let attached=seed.create(NewItem {type_id:35,owner_id:owner,location_id:root,flag:0,quantity:3,singleton:false}).await.unwrap();
-        seed.tx().execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,3,1)"#,&[&(nested as i32)]).await.unwrap();
-        seed.commit().await.unwrap();
-        let mut moving_db=crate::db::connect(&fixture.url).await.unwrap();
-        let mut moving=ItemTxn::begin(&mut moving_db).await.unwrap();
-        moving.move_to(moved,60014689,4).await.unwrap();
-        let mut deleting_db=crate::db::connect(&fixture.url).await.unwrap();
-        let pid:i32=deleting_db.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        let cleanup=tokio::spawn(async move {
-            let mut tx=ItemTxn::begin(&mut deleting_db).await.unwrap();
-            tx.destroy_tree(root,None,&[]).await.unwrap();
-            tx.commit().await.unwrap()
-        });
-        wait_for_lock(&fixture.db,pid).await;
-        moving.commit().await.unwrap();
-        cleanup.await.unwrap();
-        let rows=fixture.db.query(r#"SELECT "itemID","locationID" FROM entity WHERE "itemID"=ANY($1) ORDER BY "itemID""#,
-            &[&vec![root as i32,moved as i32,nested as i32,attached as i32]]).await.unwrap();
-        assert_eq!(rows.len(),2,"only the moved container and its contents survive");
-        assert_eq!((rows[0].get::<_,i32>(0) as i64,rows[0].get::<_,i32>(1)),(moved,60014689));
-        assert_eq!((rows[1].get::<_,i32>(0) as i64,rows[1].get::<_,i32>(1) as i64),(nested,moved));
-        assert!(fixture.db.query_opt(r#"SELECT 1 FROM entity_attributes WHERE "itemID"=$1"#,&[&(nested as i32)]).await.unwrap().is_some());
-        // A stale root expectation also protects the complete subtree.
-        let mut tx=ItemTxn::begin(&mut fixture.db).await.unwrap();
-        tx.destroy_tree(moved,Some(root),&[]).await.unwrap();
-        tx.commit().await.unwrap();
-        assert_eq!(fixture.db.query_one(r#"SELECT count(*) FROM entity WHERE "itemID"=ANY($1)"#,&[&vec![moved as i32,nested as i32]]).await.unwrap().get::<_,i64>(0),2);
-        let mut tx=ItemTxn::begin(&mut fixture.db).await.unwrap();
-        tx.destroy_tree(moved,None,&[]).await.unwrap();
-        tx.commit().await.unwrap();
+    fn new(type_id: i64, owner: i64, location: i64, flag: i64, quantity: i64, singleton: bool) -> NewItem {
+        NewItem { type_id, owner_id: owner, location_id: location, flag, quantity, singleton }
     }
 
-    #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn stacking_recreates_a_target_deleted_while_waiting_instead_of_losing_goods() {
-        let mut fixture=crate::test_support::Database::load().await;
-        let owner=i64::from(fixture.id().await);
-        let mut seed=ItemTxn::begin(&mut fixture.db).await.unwrap();
-        let old=seed.create(NewItem {type_id:34,owner_id:owner,location_id:60014689,flag:4,quantity:5,singleton:false}).await.unwrap();
-        seed.commit().await.unwrap();
-        let mut deleting_db=crate::db::connect(&fixture.url).await.unwrap();
-        let mut deleting=ItemTxn::begin(&mut deleting_db).await.unwrap();
-        deleting.destroy(old).await.unwrap();
-        let mut adding_db=crate::db::connect(&fixture.url).await.unwrap();
-        let pid:i32=adding_db.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        let adding=tokio::spawn(async move {
-            let mut tx=ItemTxn::begin(&mut adding_db).await.unwrap();
-            let id=tx.stack_onto(NewItem {type_id:34,owner_id:owner,location_id:60014689,flag:4,quantity:7,singleton:false}).await.unwrap();
-            tx.commit().await.unwrap();
-            id
+    #[test]
+    fn destroying_a_tree_keeps_a_subtree_moved_out_first() {
+        let store = store();
+        let owner = 90_000_001;
+        let (root, moved, nested, attached) = store
+            .write(|tx| -> DbResult<_> {
+                let mut items = ItemTxn::new(tx);
+                let root = items.create(new(3293, owner, 30000142, 0, 1, true))?;
+                let moved = items.create(new(3293, owner, root, 0, 1, true))?;
+                let nested = items.create(new(34, owner, moved, 5, 12, false))?;
+                let attached = items.create(new(35, owner, root, 0, 3, false))?;
+                items.tx().insert("entity_attributes", &[("itemID", store::Value::Int(nested)), ("attributeID", store::Value::Int(3)), ("valueInt", store::Value::Int(1))])?;
+                Ok((root, moved, nested, attached))
+            })
+            .unwrap();
+        store.write(|tx| ItemTxn::new(tx).move_to(moved, 60014689, 4)).unwrap();
+        store.write(|tx| ItemTxn::new(tx).destroy_tree(root, None, &[])).unwrap();
+        store.read(|db| {
+            let e = db.table("entity");
+            assert!(e.get_id(root).is_none() && e.get_id(attached).is_none());
+            assert_eq!(e.get_id(moved).unwrap().int("locationID"), Some(60014689));
+            assert_eq!(e.get_id(nested).unwrap().int("locationID"), Some(moved));
+            assert!(db.table("entity_attributes").find(&["itemID"], &[store::Value::Int(nested)]).next().is_some());
         });
-        wait_for_lock(&fixture.db,pid).await;
-        deleting.commit().await.unwrap();
-        let new=adding.await.unwrap();
-        assert_ne!(new,old);
-        let rows=fixture.db.query(r#"SELECT "itemID",quantity FROM entity WHERE "ownerID"=$1 AND "locationID"=60014689 AND "typeID"=34"#,&[&(owner as i32)]).await.unwrap();
-        assert_eq!(rows.len(),1);
-        assert_eq!((rows[0].get::<_,i32>(0) as i64,rows[0].get::<_,i32>(1)),(new,7));
-        fixture.db.execute(r#"DELETE FROM entity WHERE "itemID"=$1"#,&[&(new as i32)]).await.unwrap();
+        // A stale expected parent protects the whole subtree.
+        store.write(|tx| ItemTxn::new(tx).destroy_tree(moved, Some(root), &[])).unwrap();
+        assert!(store.read(|db| db.table("entity").get_id(nested).is_some()));
+        store.write(|tx| ItemTxn::new(tx).destroy_tree(moved, None, &[])).unwrap();
+        store.read(|db| {
+            assert!(db.table("entity").get_id(nested).is_none());
+            assert!(db.table("entity_attributes").find(&["itemID"], &[store::Value::Int(nested)]).next().is_none());
+        });
+    }
+
+    #[test]
+    fn stacking_after_the_stack_is_gone_makes_a_new_one_and_events_say_what_changed() {
+        let store = store();
+        let owner = 90_000_002;
+        let old = store.write(|tx| ItemTxn::new(tx).create(new(34, owner, 60014689, 4, 5, false))).unwrap();
+        store.write(|tx| ItemTxn::new(tx).destroy(old)).unwrap();
+        let (id, events) = store
+            .write(|tx| -> DbResult<_> {
+                let mut items = ItemTxn::new(tx);
+                let id = items.stack_onto(new(34, owner, 60014689, 4, 7, false))?;
+                Ok((id, items.events()))
+            })
+            .unwrap();
+        assert_ne!(id, old);
+        assert_eq!(events.len(), 1);
+        let (again, events) = store
+            .write(|tx| -> DbResult<_> {
+                let mut items = ItemTxn::new(tx);
+                let id = items.stack_onto(new(34, owner, 60014689, 4, 3, false))?;
+                Ok((id, items.events()))
+            })
+            .unwrap();
+        assert_eq!(again, id);
+        assert_eq!(store.read(|db| db.table("entity").get_id(id).unwrap().int("quantity")), Some(10));
+        // One change: quantity, with its old value.
+        let Value::Tuple(parts) = &events[0] else { panic!("an OnItemChange tuple") };
+        assert_eq!(parts[1], Value::Dict(vec![(Value::Int(IX_QUANTITY), Value::Int(7))]));
     }
 }

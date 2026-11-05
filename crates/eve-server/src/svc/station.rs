@@ -1,8 +1,9 @@
 use eve_marshal::Value;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{cell, row, rowset};
+use crate::store::{Db, Row};
+use crate::svc::rows::{row, rowset};
 
 pub async fn station(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
@@ -15,18 +16,13 @@ pub async fn station(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 pub async fn station_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
-        "GetStation" => get_station(ctx, call.arg_id(0)).await,
-        "GetSolarSystem" => get_solar_system(ctx, call.arg_id(0)).await,
-        "GetConstellation" => get_constellation(ctx, call.arg_id(0)).await,
-        "GetRegion" => get_region(ctx, call.arg_id(0)).await,
-        "GetAllianceSystems" => alliance_systems(ctx).await,
-        "GetAllianceConstellations" => ctx.rowset(&["constellationID","allianceID"],
-            r#"SELECT "constellationID","allianceID" FROM "mapConstellations"
-               WHERE "allianceID" IS NOT NULL AND "allianceID"<>0 ORDER BY "constellationID""#, &[]).await,
-        "GetStationsByRegion" => ctx.rowset(&["stationID","stationName","solarSystemID","constellationID","regionID","x","y","z"],
-            r#"SELECT "stationID","stationName","solarSystemID","constellationID","regionID",x,y,z
-               FROM "staStations" WHERE "regionID"=$1 ORDER BY "stationName","stationID""#,
-            &[&(call.arg_id(0) as i32)]).await,
+        "GetStation" => ctx.store.read(|db| get_station(db, call.arg_id(0))),
+        "GetSolarSystem" => ctx.store.read(|db| get_solar_system(db, call.arg_id(0))),
+        "GetConstellation" => get_constellation(call.arg_id(0)),
+        "GetRegion" => get_region(call.arg_id(0)),
+        "GetAllianceSystems" => ctx.store.read(alliance_systems),
+        "GetAllianceConstellations" => alliance_constellations(),
+        "GetStationsByRegion" => ctx.store.read(|db| stations_by_region(db, call.arg_id(0))),
         _ => return None,
     };
     Some(Outcome::Value(value))
@@ -35,7 +31,7 @@ pub async fn station_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 /// The station-related part of the `map` service.
 pub async fn map(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     match call.method.as_str() {
-        "GetStationExtraInfo" => Some(Outcome::Value(station_extra_info(ctx).await)),
+        "GetStationExtraInfo" => Some(Outcome::Value(ctx.store.read(station_extra_info))),
         _ => None,
     }
 }
@@ -44,28 +40,15 @@ async fn station_item_bits(ctx: &Ctx<'_>) -> Value {
     let Some(station_id) = ctx.session.station_id else {
         return Value::List(vec![Value::None; 5]);
     };
-    let sql = r#"SELECT stt."hangarGraphicID",
-                        COALESCE(e."ownerID", st."corporationID") AS "ownerID",
-                        st."stationID",
-                        COALESCE((SELECT bit_or(os."serviceID")
-                                    FROM "staOperationServices" os
-                                   WHERE os."operationID"
-                                         = COALESCE(st."operationID", stt."operationID")), 0)
-                          AS "serviceMask",
-                        st."stationTypeID"
-                   FROM "staStations" st
-                   LEFT JOIN "staStationTypes" stt
-                          ON stt."stationTypeID" = st."stationTypeID"
-                   LEFT JOIN "entity" e ON e."itemID" = st."stationID"
-                  WHERE st."stationID" = $1"#;
-    match ctx.db.query(sql, &[&(station_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => Value::List(cells(&rows[0])),
-        Ok(_) => {
+    let line = ctx.store.read(|db| {
+        let st = db.table("staStations").get_id(station_id)?;
+        let j = joined(db, &st);
+        Some(vec![Value::int_or_none(j.hangar), Value::int_or_none(j.owner), st.cell("stationID"), Value::Int(j.mask), st.cell("stationTypeID")])
+    });
+    match line {
+        Some(line) => Value::List(line),
+        None => {
             warn!("GetStationItemBits: no staStations row for {station_id}");
-            Value::List(vec![Value::None; 5])
-        }
-        Err(e) => {
-            error!("GetStationItemBits: {err}", err = crate::logging::chain(&e));
             Value::List(vec![Value::None; 5])
         }
     }
@@ -75,31 +58,26 @@ async fn station_item_bits(ctx: &Ctx<'_>) -> Value {
 /// station/base.py GetGuests unpacks each into three.
 async fn guests(ctx: &Ctx<'_>) -> Value {
     let Some(station_id) = ctx.session.station_id else { return Value::List(Vec::new()) };
-    let sql = r#"SELECT c."characterID", c."corporationID", NULLIF(co."allianceID", 0)
-                   FROM "character_" c
-                   LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                  WHERE c."stationID" = $1 AND c."accountID" IS NOT NULL"#;
-    match ctx.db.query(sql, &[&(station_id as i32)]).await {
-        Ok(rows) => Value::List(
-            rows.iter()
-                .map(|r| {
-                    let id = |i: usize| r.try_get::<_, Option<i32>>(i).ok().flatten();
-                    Value::Tuple(vec![
-                        Value::int_or_none(id(0).map(i64::from)),
-                        Value::int_or_none(id(1).map(i64::from)),
-                        Value::int_or_none(id(2).map(i64::from)),
-                    ])
+    ctx.store.read(|db| {
+        let corporations = db.table("corporation");
+        Value::List(
+            db.table("character_")
+                .find(&["stationID"], &[crate::store::Value::Int(station_id)])
+                .filter(|c| c.int("accountID").is_some())
+                .map(|c| {
+                    let corp = c.int("corporationID");
+                    let alliance = corp
+                        .and_then(|corp| corporations.get_id(corp))
+                        .and_then(|co| co.int("allianceID"))
+                        .filter(|a| *a != 0);
+                    Value::Tuple(vec![Value::int_or_none(c.int("characterID")), Value::int_or_none(corp), Value::int_or_none(alliance)])
                 })
                 .collect(),
-        ),
-        Err(e) => {
-            error!("GetGuests: {err}", err = crate::logging::chain(&e));
-            Value::List(Vec::new())
-        }
-    }
+        )
+    })
 }
 
-async fn get_station(ctx: &Ctx<'_>, station_id: i64) -> Value {
+fn get_station(db: &Db, station_id: i64) -> Value {
     const HEADER: &[&str] = &[
         "stationID", "security", "dockingCostPerVolume", "maxShipVolumeDockable",
         "officeRentalCost", "operationID", "stationTypeID", "corporationID",
@@ -107,85 +85,98 @@ async fn get_station(ctx: &Ctx<'_>, station_id: i64) -> Value {
         "reprocessingEfficiency", "reprocessingStationsTake", "reprocessingHangarFlag",
         "ownerID", "description", "serviceMask", "hangarGraphicID", "dockingBayGraphicID",
     ];
-    let sql = r#"SELECT st."stationID", st."security", st."dockingCostPerVolume",
-                        st."maxShipVolumeDockable", st."officeRentalCost", st."operationID",
-                        st."stationTypeID", st."corporationID", st."solarSystemID",
-                        st."constellationID", st."regionID", st."stationName",
-                        st."x", st."y", st."z", st."reprocessingEfficiency",
-                        st."reprocessingStationsTake", st."reprocessingHangarFlag",
-                        COALESCE(e."ownerID", st."corporationID") AS "ownerID",
-                        COALESCE(op."description", '') AS "description",
-                        COALESCE((SELECT bit_or(os."serviceID")
-                                    FROM "staOperationServices" os
-                                   WHERE os."operationID"
-                                         = COALESCE(st."operationID", stt."operationID")), 0)
-                          AS "serviceMask",
-                        stt."hangarGraphicID", stt."dockingBayGraphicID"
-                   FROM "staStations" st
-                   LEFT JOIN "staStationTypes" stt
-                          ON stt."stationTypeID" = st."stationTypeID"
-                   LEFT JOIN "staOperations" op
-                          ON op."operationID" = COALESCE(st."operationID", stt."operationID")
-                   LEFT JOIN "entity" e ON e."itemID" = st."stationID"
-                  WHERE st."stationID" = $1"#;
-    single_row(ctx, "GetStation", sql, station_id, HEADER).await
+    let Some(st) = db.table("staStations").get_id(station_id) else { return Value::None };
+    let j = joined(db, &st);
+    let description = j
+        .operation
+        .and_then(|op| crate::sde::table("staOperations").get("operationID", op))
+        .and_then(|op| op.text("description"))
+        .unwrap_or("");
+    let mut line = st.line(&HEADER[..18]);
+    line.extend([
+        Value::int_or_none(j.owner),
+        Value::text(description),
+        Value::Int(j.mask),
+        Value::int_or_none(j.hangar),
+        Value::int_or_none(j.bay),
+    ]);
+    row(HEADER, line)
 }
 
-async fn get_solar_system(ctx: &Ctx<'_>, solar_system_id: i64) -> Value {
+fn get_solar_system(db: &Db, solar_system_id: i64) -> Value {
     const HEADER: &[&str] = &[
         "solarSystemID", "solarSystemName", "regionID", "constellationID", "x", "y", "z",
         "luminosity", "border", "fringe", "corridor", "hub", "international", "regional",
         "constellation", "security", "factionID", "radius", "sunTypeID", "securityClass",
         "allianceID", "itemID", "sovereigntyLevel", "constellationSovereignty",
     ];
-    let sql = r#"SELECT "solarSystemID", "solarSystemName", "regionID", "constellationID",
-                        "x", "y", "z", "luminosity", "border", "fringe", "corridor", "hub",
-                        "international", "regional", "constellation", "security", "factionID",
-                        "radius", "sunTypeID", "securityClass", "allianceID",
-                        "solarSystemID" AS "itemID", COALESCE("sovereigntyLevel", 0),
-                        NULL::int AS "constellationSovereignty"
-                   FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#;
-    single_row(ctx, "GetSolarSystem", sql, solar_system_id, HEADER).await
+    let Some(r) = db.table("mapSolarSystems").get_id(solar_system_id) else { return Value::None };
+    let mut line = r.line(&HEADER[..21]);
+    // "itemID" is the system's ID again; the sovereignty level 0 when unset.
+    line.push(r.cell("solarSystemID"));
+    line.push(Value::Int(r.int("sovereigntyLevel").unwrap_or(0)));
+    line.push(Value::None);
+    row(HEADER, line)
 }
 
-async fn get_constellation(ctx: &Ctx<'_>, constellation_id: i64) -> Value {
+fn stations_by_region(db: &Db, region_id: i64) -> Value {
+    const HEADER: &[&str] = &["stationID", "stationName", "solarSystemID", "constellationID", "regionID", "x", "y", "z"];
+    let mut stations: Vec<Row> = db.table("staStations").rows().filter(|r| r.int("regionID") == Some(region_id)).collect();
+    // By name (unnamed last), then ID.
+    stations.sort_by(|a, b| {
+        let (x, y) = (a.text("stationName"), b.text("stationName"));
+        (x.is_none(), x).cmp(&(y.is_none(), y)).then(a.int("stationID").cmp(&b.int("stationID")))
+    });
+    rowset(HEADER, stations.iter().map(|r| Value::List(r.line(HEADER))).collect())
+}
+
+fn get_constellation(constellation_id: i64) -> Value {
     const HEADER: &[&str] = &[
         "constellationID", "constellationName", "regionID", "x", "y", "z",
         "xMin", "xMax", "yMin", "yMax", "zMin", "zMax", "factionID", "radius", "itemID",
     ];
-    let sql = r#"SELECT "constellationID", "constellationName", "regionID", "x", "y", "z",
-                        "xMin", "xMax", "yMin", "yMax", "zMin", "zMax", "factionID", "radius",
-                        "constellationID" AS "itemID"
-                   FROM "mapConstellations" WHERE "constellationID" = $1"#;
-    single_row(ctx, "GetConstellation", sql, constellation_id, HEADER).await
+    // The last column is "constellationID" again, as "itemID".
+    const COLUMNS: &[&str] = &[
+        "constellationID", "constellationName", "regionID", "x", "y", "z",
+        "xMin", "xMax", "yMin", "yMax", "zMin", "zMax", "factionID", "radius", "constellationID",
+    ];
+    crate::sde::table("mapConstellations")
+        .get("constellationID", constellation_id as i32 as i64)
+        .map_or(Value::None, |r| row(HEADER, r.line(COLUMNS)))
 }
 
-async fn get_region(ctx: &Ctx<'_>, region_id: i64) -> Value {
+fn get_region(region_id: i64) -> Value {
     const HEADER: &[&str] = &[
         "regionID", "regionName", "x", "y", "z",
         "xMin", "xMax", "yMin", "yMax", "zMin", "zMax", "factionID", "radius", "itemID",
     ];
-    let sql = r#"SELECT "regionID", "regionName", "x", "y", "z",
-                        "xMin", "xMax", "yMin", "yMax", "zMin", "zMax", "factionID", "radius",
-                        "regionID" AS "itemID"
-                   FROM "mapRegions" WHERE "regionID" = $1"#;
-    single_row(ctx, "GetRegion", sql, region_id, HEADER).await
+    // The last column is "regionID" again, as "itemID".
+    const COLUMNS: &[&str] = &[
+        "regionID", "regionName", "x", "y", "z",
+        "xMin", "xMax", "yMin", "yMax", "zMin", "zMax", "factionID", "radius", "regionID",
+    ];
+    crate::sde::table("mapRegions")
+        .get("regionID", region_id as i32 as i64)
+        .map_or(Value::None, |r| row(HEADER, r.line(COLUMNS)))
 }
 
-async fn alliance_systems(ctx: &Ctx<'_>) -> Value {
+fn alliance_constellations() -> Value {
+    const HEADER: &[&str] = &["constellationID", "allianceID"];
+    let mut held: Vec<_> = crate::sde::table("mapConstellations")
+        .rows()
+        .filter(|r| r.int("allianceID").is_some_and(|a| a != 0))
+        .collect();
+    held.sort_by_key(|r| r.int("constellationID"));
+    rowset(HEADER, held.iter().map(|r| Value::List(r.line(HEADER))).collect())
+}
+
+fn alliance_systems(db: &Db) -> Value {
     const HEADER: &[&str] = &["solarSystemID", "allianceID"];
-    let sql = r#"SELECT "solarSystemID", "allianceID" FROM "mapSolarSystems"
-                  WHERE "allianceID" IS NOT NULL"#;
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => rowset(HEADER, rows.iter().map(|r| Value::List(cells(r))).collect()),
-        Err(e) => {
-            error!("GetAllianceSystems: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+    let held = db.table("mapSolarSystems").rows().filter(|r| r.int("allianceID").is_some());
+    rowset(HEADER, held.map(|r| Value::List(r.line(HEADER))).collect())
 }
 
-async fn station_extra_info(ctx: &Ctx<'_>) -> Value {
+fn station_extra_info(db: &Db) -> Value {
     const STATIONS: &[&str] = &[
         "stationID", "operationID", "stationTypeID", "corporationID", "ownerID",
         "solarSystemID", "constellationID", "regionID", "serviceMask", "security",
@@ -195,68 +186,70 @@ async fn station_extra_info(ctx: &Ctx<'_>) -> Value {
     const OPSERVICES: &[&str] = &["operationID", "serviceID"];
     const SERVICES: &[&str] = &["serviceID", "serviceName", "description"];
 
-    let stations_sql = r#"SELECT st."stationID", st."operationID", st."stationTypeID",
-                                 st."corporationID",
-                                 COALESCE(e."ownerID", st."corporationID") AS "ownerID",
-                                 st."solarSystemID", st."constellationID", st."regionID",
-                                 COALESCE((SELECT bit_or(os."serviceID")
-                                             FROM "staOperationServices" os
-                                            WHERE os."operationID"
-                                                  = COALESCE(st."operationID",
-                                                             stt."operationID")), 0)
-                                   AS "serviceMask",
-                                 st."security", st."officeRentalCost",
-                                 st."maxShipVolumeDockable", st."dockingCostPerVolume",
-                                 st."reprocessingEfficiency", st."reprocessingStationsTake",
-                                 st."reprocessingHangarFlag"
-                            FROM "staStations" st
-                            LEFT JOIN "staStationTypes" stt
-                                   ON stt."stationTypeID" = st."stationTypeID"
-                            LEFT JOIN "entity" e ON e."itemID" = st."stationID"
-                           ORDER BY st."stationID""#;
-    let opservices_sql = r#"SELECT "operationID","serviceID" FROM "staOperationServices"
-                             ORDER BY "operationID","serviceID""#;
-    let services_sql = r#"SELECT "serviceID","serviceName","description" FROM "staServices"
-                           ORDER BY "serviceID""#;
+    let mut stations: Vec<Row> = db.table("staStations").rows().collect();
+    stations.sort_by_key(|r| r.int("stationID"));
+    let stations = stations
+        .iter()
+        .map(|st| {
+            let j = joined(db, st);
+            let mut line = st.line(&STATIONS[..4]);
+            line.push(Value::int_or_none(j.owner));
+            line.extend(st.line(&STATIONS[5..8]));
+            line.push(Value::Int(j.mask));
+            line.extend(st.line(&STATIONS[9..]));
+            Value::List(line)
+        })
+        .collect();
+
+    let mut opservices: Vec<_> = crate::sde::table("staOperationServices").rows().collect();
+    opservices.sort_by_key(|r| (r.int("operationID"), r.int("serviceID")));
+    let mut services: Vec<_> = crate::sde::table("staServices").rows().collect();
+    services.sort_by_key(|r| r.int("serviceID"));
 
     Value::Tuple(vec![
-        plain_rowset(ctx, "GetStationExtraInfo/stations", stations_sql, STATIONS).await,
-        plain_rowset(ctx, "GetStationExtraInfo/opservices", opservices_sql, OPSERVICES).await,
-        plain_rowset(ctx, "GetStationExtraInfo/services", services_sql, SERVICES).await,
+        rowset(STATIONS, stations),
+        rowset(OPSERVICES, opservices.iter().map(|r| Value::List(r.line(OPSERVICES))).collect()),
+        rowset(SERVICES, services.iter().map(|r| Value::List(r.line(SERVICES))).collect()),
     ])
 }
 
+/// What a station's rows were joined with: its type's graphics
+/// (staStationTypes), its operation (its own, else its type's) and that
+/// operation's service mask (0 without services), and its owner (the
+/// station item's, else its corporation).
+struct Joined {
+    hangar: Option<i64>,
+    bay: Option<i64>,
+    operation: Option<i64>,
+    mask: i64,
+    owner: Option<i64>,
+}
 
-
-
-async fn single_row(
-    ctx: &Ctx<'_>,
-    what: &str,
-    sql: &str,
-    id: i64,
-    header: &[&str],
-) -> Value {
-    match ctx.db.query(sql, &[&(id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => row(header, cells(&rows[0])),
-        Ok(_) => Value::None,
-        Err(e) => {
-            error!("{what}: {err}", err = crate::logging::chain(&e));
-            Value::None
-        }
+fn joined(db: &Db, st: &Row) -> Joined {
+    let stt = st.int("stationTypeID").and_then(|t| crate::sde::table("staStationTypes").get("stationTypeID", t));
+    let operation = st.int("operationID").or_else(|| stt.and_then(|t| t.int("operationID")));
+    let (operations, masks) = service_masks();
+    let mask = operation
+        .and_then(|op| operations.iter().position(|o| i64::from(*o) == op))
+        .map_or(0, |i| i64::from(masks[i]));
+    let owner = db.table("entity").get_id(st.int("stationID").unwrap_or(0)).and_then(|e| e.int("ownerID")).or(st.int("corporationID"));
+    Joined {
+        hangar: stt.and_then(|t| t.int("hangarGraphicID")),
+        bay: stt.and_then(|t| t.int("dockingBayGraphicID")),
+        operation,
+        mask,
+        owner,
     }
 }
 
-async fn plain_rowset(ctx: &Ctx<'_>, what: &str, sql: &str, header: &[&str]) -> Value {
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => rowset(header, rows.iter().map(|r| Value::List(cells(r))).collect()),
-        Err(e) => {
-            error!("{what}: {err}", err = crate::logging::chain(&e));
-            rowset(header, Vec::new())
-        }
+/// Each station operation's services as one mask (the `bit_or` of its
+/// staOperationServices), as parallel lists of operations and masks. An
+/// operation without services has no entry.
+pub(crate) fn service_masks() -> (Vec<i32>, Vec<i32>) {
+    let mut masks: std::collections::BTreeMap<i32, i32> = std::collections::BTreeMap::new();
+    for r in crate::sde::table("staOperationServices").rows() {
+        let (Some(operation), Some(service)) = (r.int("operationID"), r.int("serviceID")) else { continue };
+        *masks.entry(operation as i32).or_insert(0) |= service as i32;
     }
+    masks.into_iter().unzip()
 }
-
-fn cells(r: &tokio_postgres::Row) -> Vec<Value> {
-    (0..r.columns().len()).map(|i| cell(r, i)).collect()
-}
-

@@ -2,6 +2,10 @@
 //! sent to it. A site opens when its pilot first heads there and lives in
 //! the system's park; when the last of its rats dies the mission's
 //! objective is done (`Job::SiteCleared`).
+//!
+//! A new pilot's personal tutorial site is one too, belonging to no mission
+//! ([`TUTORIAL`]): the client's tutorial warps a pilot there on first
+//! undocking in a rookie system (`WarpToStuff("tutorial")`).
 
 use eve_marshal::Value;
 
@@ -13,6 +17,13 @@ use crate::svc::space::{self, entry};
 pub const TYPE_BEACON: i64 = 25354;
 const BEACON_RADIUS: f64 = 1_000.0;
 const OWNER_SYSTEM: i64 = 1;
+
+/// The mission of a personal tutorial site: none.
+pub const TUTORIAL: i64 = 0;
+/// How far from the pilot a tutorial site opens: a short warp.
+const TUTORIAL_DISTANCE: f64 = 5_000_000_000.0;
+/// The strength of its rats: what the safest space holds (a few frigates).
+const TUTORIAL_SECURITY: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct Site {
@@ -54,7 +65,11 @@ pub fn open(park: &mut Park, mut site: Site, security: f64, now: i64) -> Vec<Val
     for id in &site.rats {
         entries.extend(space::add_ball_entries(park, *id));
     }
-    tracing::info!("mission {} site {} opened with {} rat(s)", site.mission_id, site.id, site.rats.len());
+    if site.mission_id == TUTORIAL {
+        tracing::info!("tutorial site {} of {} opened with {} rat(s)", site.id, site.char_id, site.rats.len());
+    } else {
+        tracing::info!("mission {} site {} opened with {} rat(s)", site.mission_id, site.id, site.rats.len());
+    }
     park.sites.insert(site.id, site);
     entries
 }
@@ -70,6 +85,29 @@ pub fn close(park: &mut Park, mission_id: i64) -> Vec<Value> {
         }
     }
     vec![entry(park.tick, "RemoveBalls", vec![Value::List(gone)])]
+}
+
+/// `char_id`'s tutorial site in this park, opened a short warp from `near`
+/// if there is none (or if its rats are all dead, so there is practice
+/// again): where it is and its radius, and the destiny entries that show
+/// a new one.
+pub fn tutorial(park: &mut Park, char_id: i64, near: Vec3, now: i64) -> (Vec3, f64, Vec<Value>) {
+    let mine = park.sites.values().find(|s| s.mission_id == TUTORIAL && s.char_id == char_id).map(|s| (s.id, s.pos, s.rats.is_empty()));
+    let mut entries = Vec::new();
+    match mine {
+        Some((_, pos, false)) => return (pos, BEACON_RADIUS, entries),
+        Some((id, _, true)) => {
+            park.sites.remove(&id);
+            entries.push(entry(park.tick, "RemoveBalls", vec![Value::List(vec![Value::Int(id)])]));
+        }
+        None => {}
+    }
+    let mut direction = park.rng.in_sphere(1.0);
+    direction.y *= 0.1;
+    let pos = near + direction.unit() * TUTORIAL_DISTANCE;
+    let site = Site { id: crate::npc::next_id(), mission_id: TUTORIAL, char_id, name: "Tutorial Site".into(), pos, rats: Vec::new() };
+    entries.extend(open(park, site, TUTORIAL_SECURITY, now));
+    (pos, BEACON_RADIUS, entries)
 }
 
 /// A rat died: if it was a site's, and the last, the site's mission is done.

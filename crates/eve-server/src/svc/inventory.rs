@@ -1,8 +1,9 @@
 use eve_marshal::Value;
-use tokio_postgres::types::ToSql;
 use tracing::error;
 
+use crate::items::{invitem_cells, invitem_lines};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Row};
 use crate::svc::bound;
 use crate::svc::rows::{row, rowset};
 
@@ -22,10 +23,10 @@ const CONTAINER_CORP_MARKET: i64 = 10012;
 pub const FLAG_HANGAR: i32 = 4;
 pub const FLAG_CORP_MARKET: i32 = 62;
 
-const CATEGORY_BLUEPRINT: i32 = 9;
+const CATEGORY_BLUEPRINT: i64 = 9;
 
-const STATION_ID_MIN: i32 = 60_000_000;
-const STATION_ID_MAX: i32 = 64_000_000;
+const STATION_ID_MIN: i64 = 60_000_000;
+const STATION_ID_MAX: i64 = 64_000_000;
 
 const UNLIMITED_CAPACITY: f64 = 9_000_000_000_000_000.0;
 
@@ -37,18 +38,8 @@ pub const FLAG_FACTORY_BLUEPRINT: i32 = 36;
 /// them off ListStationBlueprintItems); None for a blueprint never researched.
 const BLUEPRINT_COLUMNS: &[&str] = &["copy", "materialLevel", "productivityLevel", "licensedProductionRunsRemaining"];
 
-pub const INVITEM_HEADER: &[&str] = &[
-    "itemID", "typeID", "ownerID", "locationID", "flag", "contraband", "singleton",
-    "quantity", "groupID", "categoryID", "customInfo",
-];
-
-pub const INVITEM_SELECT: &str = r#"SELECT e."itemID",e."typeID",e."ownerID",e."locationID",e."flag",
-                                       e."contraband",e."singleton",e."quantity",
-                                       t."groupID",g."categoryID",e."customInfo"
-                                  FROM "entity" e
-                                  JOIN "invTypes" t ON t."typeID" = e."typeID"
-                                  JOIN "invGroups" g ON g."groupID" = t."groupID"
-                                 WHERE "#;
+/// The client's item row columns.
+pub const INVITEM_HEADER: &[&str] = &crate::items::INVITEM_COLUMNS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
@@ -106,7 +97,7 @@ async fn container_method(ctx: &Ctx<'_>, container: Container, call: &Call) -> O
         }
     }
     if let (Container::Item(id), "List") = (container, method) {
-        if let Some(office) = crate::svc::corphangar::office(ctx.db, id).await {
+        if let Some(office) = ctx.store.read(|db| crate::svc::corphangar::office(db, id)) {
             if !crate::svc::corphangar::mine(ctx, office) {
                 return Outcome::custom("That is not your corporation's office.");
             }
@@ -155,35 +146,63 @@ fn container_from_params(params: &[i64]) -> Container {
     }
 }
 
-fn contents_scope(ctx: &Ctx<'_>, container: Container) -> Option<(String, Vec<i32>)> {
+/// Which items a container holds: those whose `columns` equal `values`, with
+/// a flag perhaps excluded.
+struct Scope {
+    columns: &'static [&'static str],
+    values: Vec<i64>,
+    flag: FlagRule,
+}
+
+#[derive(Clone, Copy)]
+enum FlagRule {
+    Any,
+    Not(i64),
+}
+
+impl Scope {
+    fn rows<'d>(&self, db: &'d Db) -> impl Iterator<Item = Row<'d>> + 'd {
+        let values: Vec<store::Value> = self.values.iter().map(|v| store::Value::Int(*v)).collect();
+        let flag = self.flag;
+        db.table("entity").find(self.columns, &values).filter(move |r| {
+            let f = r.int("flag");
+            match flag {
+                FlagRule::Any => true,
+                FlagRule::Not(x) => f.is_some_and(|f| f != x),
+            }
+        })
+    }
+}
+
+fn contents_scope(ctx: &Ctx<'_>, container: Container) -> Option<Scope> {
     match container {
-        Container::Item(item_id) => {
-            Some((r#"e."locationID" = $1"#.to_string(), vec![item_id as i32]))
-        }
+        Container::Item(item_id) => Some(Scope { columns: &["locationID"], values: vec![item_id], flag: FlagRule::Any }),
         Container::Special { container_id, owner_id } => match container_id {
             CONTAINER_HANGAR => {
                 let station = ctx.session.station_id?;
                 let owner = owner_id.or(ctx.session.char_id)?;
-                Some((
-                    r#"e."locationID" = $1 AND e."ownerID" = $2 AND e."flag" <> $3"#.to_string(),
-                    vec![station as i32, owner as i32, FLAG_FACTORY_BLUEPRINT],
-                ))
+                Some(Scope {
+                    columns: &["ownerID", "locationID"],
+                    values: vec![owner, station],
+                    flag: FlagRule::Not(i64::from(FLAG_FACTORY_BLUEPRINT)),
+                })
             }
             CONTAINER_CORP_MARKET => {
                 let station = ctx.session.station_id?;
                 let owner = owner_id.or(ctx.session.corp_id)?;
-                Some((
-                    r#"e."locationID" = $1 AND e."ownerID" = $2 AND e."flag" = $3"#.to_string(),
-                    vec![station as i32, owner as i32, FLAG_CORP_MARKET],
-                ))
+                Some(Scope {
+                    columns: &["ownerID", "locationID", "flag"],
+                    values: vec![owner, station, i64::from(FLAG_CORP_MARKET)],
+                    flag: FlagRule::Any,
+                })
             }
             CONTAINER_GLOBAL => {
                 let owner = ctx.session.char_id?;
-                Some((r#"e."ownerID" = $1 AND e."flag" <> $2"#.to_string(), vec![owner as i32, FLAG_FACTORY_BLUEPRINT]))
+                Some(Scope { columns: &["ownerID"], values: vec![owner], flag: FlagRule::Not(i64::from(FLAG_FACTORY_BLUEPRINT)) })
             }
             CONTAINER_CHARACTER => {
                 let char_id = ctx.session.char_id?;
-                Some((r#"e."locationID" = $1"#.to_string(), vec![char_id as i32]))
+                Some(Scope { columns: &["locationID"], values: vec![char_id], flag: FlagRule::Any })
             }
             CONTAINER_WALLET
             | CONTAINER_SOLAR_SYSTEM
@@ -198,18 +217,21 @@ fn contents_scope(ctx: &Ctx<'_>, container: Container) -> Option<(String, Vec<i3
     }
 }
 
+/// The items at `location` under `flag`, as listing rows.
+fn items_at(ctx: &Ctx<'_>, location: i64, flag: i64) -> Vec<Value> {
+    ctx.store.read(|db| invitem_lines(db.table("entity").find(&["locationID", "flag"], &[store::Value::Int(location), store::Value::Int(flag)])))
+}
+
 pub async fn list(ctx: &Ctx<'_>, container: Container) -> Value {
-    if let Container::Item(id)=container {if super::maintenance::is_array(ctx.db,id).await.unwrap_or(false){
+    if let Container::Item(id)=container {if ctx.store.read(|db|super::maintenance::is_array(db,id)).unwrap_or(false){
         if super::maintenance::view(ctx,id).await.is_none(){return rowset(INVITEM_HEADER,vec![]);}
-        let sql=format!(r#"{INVITEM_SELECT} e."locationID"=$1 AND e.flag=0"#);
-        return ctx.rowset(INVITEM_HEADER,&sql,&[&(id as i32)]).await;
+        return rowset(INVITEM_HEADER,items_at(ctx,id,0));
     }}
     let ordinary=may_read(ctx,container).await;
     if !ordinary { if let Container::Item(id)=container {
         if Some(id)!=ctx.session.ship_id {
             if let Some((_,flag))=super::maintenance::view(ctx,id).await {
-                let sql=format!(r#"{INVITEM_SELECT} e."locationID"=$1 AND e.flag=$2"#);
-                return ctx.rowset(INVITEM_HEADER,&sql,&[&(id as i32),&(flag as i32)]).await;
+                return rowset(INVITEM_HEADER,items_at(ctx,id,flag));
             }
         }
     }}
@@ -217,17 +239,23 @@ pub async fn list(ctx: &Ctx<'_>, container: Container) -> Value {
         return rowset(INVITEM_HEADER, Vec::new());
     }
     if let Container::Item(id) = container {
-        if let Some((corp, _)) = crate::svc::corphangar::office(ctx.db, id).await {
-            let flags = crate::svc::corphangar::visible_flags(ctx);
-            let sql = format!(r#"{INVITEM_SELECT} e."locationID"=$1 AND e."ownerID"=$2 AND e.flag=ANY($3)"#);
-            return ctx.rowset(INVITEM_HEADER, &sql, &[&(id as i32),&(corp as i32),&flags]).await;
+        if let Some((corp, _)) = ctx.store.read(|db| crate::svc::corphangar::office(db, id)) {
+            let flags: Vec<i64> = crate::svc::corphangar::visible_flags(ctx).into_iter().map(i64::from).collect();
+            let lines = ctx.store.read(|db| {
+                invitem_lines(
+                    db.table("entity")
+                        .find(&["ownerID", "locationID"], &[store::Value::Int(corp), store::Value::Int(id)])
+                        .filter(|r| r.int("flag").is_some_and(|f| flags.contains(&f))),
+                )
+            });
+            return rowset(INVITEM_HEADER, lines);
         }
     }
-    let Some((where_sql, vals)) = contents_scope(ctx, container) else {
+    let Some(scope) = contents_scope(ctx, container) else {
         return rowset(INVITEM_HEADER, Vec::new());
     };
-    let sql = format!("{}{} AND e.flag<>{FLAG_FACTORY_BLUEPRINT}", INVITEM_SELECT, where_sql);
-    query_items(ctx, &sql, &vals).await
+    let blueprint = i64::from(FLAG_FACTORY_BLUEPRINT);
+    item_rows(ctx.store.read(|db| scope.rows(db).filter(|r| r.int("flag") != Some(blueprint)).filter_map(|r| invitem_cells(&r)).collect()))
 }
 
 /// A bound inventory reference is an address, not an access grant. In particular,
@@ -247,7 +275,7 @@ async fn may_read(ctx: &Ctx<'_>, container: Container) -> bool {
     let mut visited = std::collections::HashSet::new();
     for _ in 0..8 {
         if !visited.insert(id) { return false; }
-        if let Some(office) = crate::svc::corphangar::office(ctx.db,id).await {
+        if let Some(office) = ctx.store.read(|db| crate::svc::corphangar::office(db,id)) {
             return crate::svc::corphangar::mine(ctx,office) && corp_chain;
         }
         if let Some(allowed) = crate::svc::starbase::may(ctx,id,crate::svc::starbase::Access::ViewPut).await {
@@ -262,16 +290,13 @@ async fn may_read(ctx: &Ctx<'_>, container: Container) -> bool {
         if let (Some(system),Some(ship)) = (ctx.session.solar_system_id,ctx.session.ship_id) {
             if crate::loot::in_reach(ctx.world,system,ship,id) { return true; }
         }
-        let row = ctx.db.query_opt(r#"SELECT "ownerID","locationID",flag FROM entity WHERE "itemID"=$1"#, &[&(id as i32)]).await;
-        let Ok(Some(row)) = row else { return false };
-        let owner = row.get::<_,i32>(0) as i64;
-        let parent = row.get::<_,i32>(1) as i64;
-        let flag = row.get::<_,i32>(2) as i64;
+        let row = ctx.store.read(|db| db.table("entity").get_id(id).map(|r| (r.int("ownerID"), r.int("locationID"), r.int("flag"))));
+        let Some((Some(owner), Some(parent), Some(flag))) = row else { return false };
         if flag==i64::from(FLAG_FACTORY_BLUEPRINT) { return false; }
         own_chain &= owner==me;
         corp_chain &= Some(owner)==ctx.session.corp_id;
         if own_chain && (id==me || Some(id)==ctx.session.ship_id) { return true; }
-        if let Some(office) = crate::svc::corphangar::office(ctx.db,parent).await {
+        if let Some(office) = ctx.store.read(|db| crate::svc::corphangar::office(db,parent)) {
             return corp_chain && crate::svc::corphangar::mine(ctx,office) && crate::svc::corphangar::may_query(ctx,flag);
         }
         if ctx.session.station_id==Some(parent) { return own_chain; }
@@ -290,48 +315,39 @@ pub async fn list_station_items(
         Some(o) => o,
         None => return rowset(INVITEM_HEADER, Vec::new()),
     };
-    let mut where_sql = String::from(
-        r#"e."ownerID" = $1 AND e."flag" <> $3
-             AND (e."locationID" = $2
-                  OR e."locationID" IN (SELECT c."itemID" FROM "entity" c
-                                         WHERE c."locationID" = $2 AND c."ownerID" = $1))"#,
-    );
-    let mut vals = vec![owner as i32, station_id as i32, FLAG_FACTORY_BLUEPRINT];
-    if for_corp {
-        where_sql.push_str(" AND ");
-        where_sql.push_str(&queryable_divisions(ctx,Some(station_id)));
-    }
-    if !blueprints_only {
-        let sql = format!("{}{}", INVITEM_SELECT, where_sql);
-        return query_items(ctx, &sql, &vals).await;
-    }
-    where_sql.push_str(r#" AND g."categoryID" = $4"#);
-    vals.push(CATEGORY_BLUEPRINT);
-    let select = INVITEM_SELECT.replace(
-        r#"FROM "entity" e"#,
-        r#", b."copy", b."materialLevel", b."productivityLevel", b."licensedProductionRunsRemaining"
-           FROM "entity" e LEFT JOIN "invBlueprints" b ON b."itemID" = e."itemID""#,
-    );
-    let sql = format!("{select}{where_sql}");
-    let params: Vec<&(dyn ToSql + Sync)> = vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+    let divisions = for_corp.then(|| queryable_divisions(ctx, Some(station_id)));
+    let blueprint_types = crate::sde::get().types_in_category(CATEGORY_BLUEPRINT);
     let header: Vec<&str> = INVITEM_HEADER.iter().chain(BLUEPRINT_COLUMNS).copied().collect();
-    match ctx.db.query(&sql, &params).await {
-        Ok(rows) => {
-            let lines = rows
-                .iter()
-                .map(|r| {
-                    let mut cells = invitem_cells(r);
-                    cells.extend((0..BLUEPRINT_COLUMNS.len()).map(|i| crate::svc::rows::cell(r, INVITEM_HEADER.len() + i)));
-                    Value::List(cells)
-                })
-                .collect();
-            rowset(&header, lines)
+    let lines = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        // Items in the station itself or directly inside the owner's
+        // containers there.
+        let here = |location: Option<i64>| {
+            location == Some(station_id)
+                || location.and_then(|l| entity.get_id(l)).is_some_and(|c| c.int("locationID") == Some(station_id) && c.int("ownerID") == Some(owner))
+        };
+        let rows = entity.find(&["ownerID"], &[store::Value::Int(owner)]).filter(|r| {
+            r.int("flag").is_some_and(|f| f != i64::from(FLAG_FACTORY_BLUEPRINT))
+                && here(r.int("locationID"))
+                && divisions.as_ref().is_none_or(|d| r.int("flag").is_some_and(|f| d.contains(&f)))
+        });
+        if !blueprints_only {
+            return rows.filter_map(|r| invitem_cells(&r)).collect::<Vec<_>>();
         }
-        Err(e) => {
-            error!("invbroker blueprint listing: {err}", err = crate::logging::chain(&e));
-            rowset(&header, Vec::new())
-        }
+        let blueprints = db.table("invBlueprints");
+        rows.filter(|r| r.int("typeID").is_some_and(|t| blueprint_types.iter().any(|b| i64::from(*b) == t)))
+            .filter_map(|r| {
+                let mut cells = invitem_cells(&r)?;
+                let b = r.int("itemID").and_then(|id| blueprints.get_id(id));
+                cells.extend(BLUEPRINT_COLUMNS.iter().map(|c| b.map_or(Value::None, |b| b.cell(c))));
+                Some(cells)
+            })
+            .collect()
+    });
+    if !blueprints_only {
+        return item_rows(lines);
     }
+    rowset(&header, lines.into_iter().map(Value::List).collect())
 }
 
 pub async fn list_stations(ctx: &Ctx<'_>, blueprints_only: bool, for_corp: bool) -> Value {
@@ -340,53 +356,50 @@ pub async fn list_stations(ctx: &Ctx<'_>, blueprints_only: bool, for_corp: bool)
         Some(o) => o,
         None => return rowset(HEADER, Vec::new()),
     };
-    let mut vals: Vec<i32> = vec![owner as i32, STATION_ID_MIN, STATION_ID_MAX];
-    let sql = if blueprints_only {
-        vals.push(CATEGORY_BLUEPRINT);
-        r#"SELECT e."locationID", count(*)::int AS "itemCount"
-             FROM "entity" e
-             JOIN "invTypes" t ON t."typeID" = e."typeID"
-             JOIN "invGroups" g ON g."groupID" = t."groupID"
-            WHERE e."ownerID" = $1 AND e."locationID" >= $2 AND e."locationID" < $3
-              AND g."categoryID" = $4 AND e."flag" <> 36
-            GROUP BY e."locationID""#
-    } else {
-        r#"SELECT e."locationID", count(*)::int AS "itemCount"
-             FROM "entity" e
-            WHERE e."ownerID" = $1 AND e."locationID" >= $2 AND e."locationID" < $3
-            GROUP BY e."locationID""#
-    };
-    let sql = if for_corp {
-        let hq=ctx.session.hq_id.unwrap_or(0);
-        let base=ctx.session.base_id.unwrap_or(0);
-        let flags=format!(r#" AND CASE WHEN e."locationID"={hq} THEN {} WHEN e."locationID"={base} THEN {} ELSE {} END GROUP BY e."locationID""#,
-            queryable_divisions(ctx,Some(hq)),queryable_divisions(ctx,Some(base)),queryable_divisions(ctx,None));
-        sql.replace(r#"GROUP BY e."locationID""#,&flags)
-    } else {sql.to_string()};
-    let params: Vec<&(dyn ToSql + Sync)> = vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-    match ctx.db.query(&sql, &params).await {
-        Ok(rows) => {
-            let lines = rows
-                .iter()
-                .map(|r| Value::List(vec![int_at(r, 0), int_at(r, 1)]))
-                .collect();
-            rowset(HEADER, lines)
+    let blueprint_types = crate::sde::get().types_in_category(CATEGORY_BLUEPRINT);
+    // A corporation sees, per station, the divisions its roles there let it
+    // query: those at its headquarters, its base, or anywhere else.
+    let divisions = for_corp.then(|| {
+        let hq = ctx.session.hq_id.unwrap_or(0);
+        let base = ctx.session.base_id.unwrap_or(0);
+        (hq, queryable_divisions(ctx, Some(hq)), base, queryable_divisions(ctx, Some(base)), queryable_divisions(ctx, None))
+    });
+    let counts = ctx.store.read(|db| {
+        let mut counts: Vec<(i64, i64)> = Vec::new();
+        for r in db.table("entity").find(&["ownerID"], &[store::Value::Int(owner)]) {
+            let (Some(location), Some(flag)) = (r.int("locationID"), r.int("flag")) else { continue };
+            if !(STATION_ID_MIN..STATION_ID_MAX).contains(&location) {
+                continue;
+            }
+            if blueprints_only
+                && (flag == 36 || !r.int("typeID").is_some_and(|t| blueprint_types.iter().any(|b| i64::from(*b) == t)))
+            {
+                continue;
+            }
+            if let Some((hq, at_hq, base, at_base, elsewhere)) = &divisions {
+                let allowed = if location == *hq { at_hq } else if location == *base { at_base } else { elsewhere };
+                if !allowed.contains(&flag) {
+                    continue;
+                }
+            }
+            match counts.iter_mut().find(|(l, _)| *l == location) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((location, 1)),
+            }
         }
-        Err(e) => {
-            error!("invbroker ListStations: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+        counts
+    });
+    rowset(HEADER, counts.into_iter().map(|(location, n)| Value::List(vec![Value::Int(location), Value::Int(n)])).collect())
 }
 
-fn queryable_divisions(ctx:&Ctx<'_>,station:Option<i64>)->String {
-    let flags=crate::svc::corphangar::flags().filter(|flag|crate::svc::corphangar::may_query_at(ctx,*flag,station)).map(|flag|flag.to_string()).collect::<Vec<_>>().join(",");
-    if flags.is_empty() {"false".into()} else {format!("e.flag IN ({flags})")}
+/// The hangar divisions the caller's roles at `station` let it query.
+fn queryable_divisions(ctx:&Ctx<'_>,station:Option<i64>)->Vec<i64> {
+    crate::svc::corphangar::flags().filter(|flag|crate::svc::corphangar::may_query_at(ctx,*flag,station)).collect()
 }
 
 pub async fn get_item(ctx: &Ctx<'_>, container: Container) -> Value {
     let bay=match container{Container::Item(id)=>super::maintenance::view(ctx,id).await.is_some(),_=>false};
-    if let Container::Item(id)=container {if !bay && super::maintenance::is_array(ctx.db,id).await.unwrap_or(false){return row(INVITEM_HEADER,vec![Value::None;INVITEM_HEADER.len()]);}}
+    if let Container::Item(id)=container {if !bay && ctx.store.read(|db|super::maintenance::is_array(db,id)).unwrap_or(false){return row(INVITEM_HEADER,vec![Value::None;INVITEM_HEADER.len()]);}}
     if !bay && !may_read(ctx,container).await { return row(INVITEM_HEADER, vec![Value::None; INVITEM_HEADER.len()]); }
     let item_id = match container {
         Container::Item(id) => id,
@@ -395,16 +408,9 @@ pub async fn get_item(ctx: &Ctx<'_>, container: Container) -> Value {
             None => return row(INVITEM_HEADER, vec![Value::None; INVITEM_HEADER.len()]),
         },
     };
-    let sql = format!("{}{}", INVITEM_SELECT, r#"e."itemID" = $1"#);
-    match ctx.db.query(&sql, &[&(item_id as i32)]).await {
-        Ok(rows) => match rows.first() {
-            Some(r) => row(INVITEM_HEADER, invitem_cells(r)),
-            None => row(INVITEM_HEADER, vec![Value::None; INVITEM_HEADER.len()]),
-        },
-        Err(e) => {
-            error!("invbroker GetItem: {err}", err = crate::logging::chain(&e));
-            row(INVITEM_HEADER, vec![Value::None; INVITEM_HEADER.len()])
-        }
+    match ctx.store.read(|db| db.table("entity").get_id(item_id).and_then(|r| invitem_cells(&r))) {
+        Some(cells) => row(INVITEM_HEADER, cells),
+        None => row(INVITEM_HEADER, vec![Value::None; INVITEM_HEADER.len()]),
     }
 }
 
@@ -413,71 +419,63 @@ pub async fn get_capacity(ctx: &Ctx<'_>, container: Container, flag: Option<i64>
     if let Container::Item(id)=container {
         if let Some((capacity,bay_flag))=super::maintenance::view(ctx,id).await {
             if flag==Some(bay_flag) || (bay_flag==0 && flag.is_none()) {
-                let used=super::maintenance::used(ctx.db,id,bay_flag,None).await.unwrap_or(0.0);
+                let used=ctx.store.read(|db|super::maintenance::used(db,id,bay_flag,None)).unwrap_or(0.0);
                 return row(HEADER,vec![Value::Double(capacity),Value::Double(used)]);
             }
         }
-        if super::maintenance::is_array(ctx.db,id).await.unwrap_or(false){return row(HEADER,vec![Value::Double(0.0),Value::Double(0.0)]);}
+        if ctx.store.read(|db|super::maintenance::is_array(db,id)).unwrap_or(false){return row(HEADER,vec![Value::Double(0.0),Value::Double(0.0)]);}
     }
     if !may_read(ctx,container).await { return row(HEADER,vec![Value::Double(0.0),Value::Double(0.0)]); }
 
     let capacity = match container {
         Container::Item(item_id) => {
             // A silo's tower may raise its capacity.
-            let silo = match crate::svc::moonmining::silo_capacity(ctx.db, item_id).await {
+            let silo = match ctx.store.read(|db| crate::svc::moonmining::silo_capacity(db, item_id)) {
                 Ok(silo) => silo,
                 Err(e) => {
                     error!("invbroker GetCapacity silo: {err}", err = crate::logging::chain(&e));
                     None
                 }
             };
-            let sql = r#"SELECT t."capacity" FROM "entity" e
-                           JOIN "invTypes" t ON t."typeID" = e."typeID"
-                          WHERE e."itemID" = $1"#;
             match silo {
                 Some(capacity) => capacity,
-                None => match ctx.db.query(sql, &[&(item_id as i32)]).await {
-                    Ok(rows) => rows
-                        .first()
-                        .and_then(|r| r.try_get::<_, f64>(0).ok())
-                        .unwrap_or(0.0),
-                    Err(e) => {
-                        error!("invbroker GetCapacity capacity: {err}", err = crate::logging::chain(&e));
-                        0.0
-                    }
-                },
+                None => ctx
+                    .store
+                    .read(|db| db.table("entity").get_id(item_id).and_then(|r| r.int("typeID")))
+                    .and_then(|type_id| crate::sde::table("invTypes").get("typeID", type_id))
+                    .and_then(|t| t.float("capacity"))
+                    .unwrap_or(0.0),
             }
         }
         Container::Special { .. } => UNLIMITED_CAPACITY,
     };
 
     let used = match contents_scope(ctx, container) {
-        Some((mut where_sql, mut vals)) => {
+        Some(scope) => {
+            let mut visible: Option<Vec<i64>> = None;
             if let Container::Item(id) = container {
-                if crate::svc::corphangar::office(ctx.db,id).await.is_some() {
-                    let visible = crate::svc::corphangar::visible_flags(ctx).into_iter().map(|flag|flag.to_string()).collect::<Vec<_>>().join(",");
-                    where_sql.push_str(&if visible.is_empty() {" AND false".into()} else {format!(" AND e.flag IN ({visible})")});
+                if ctx.store.read(|db| crate::svc::corphangar::office(db,id)).is_some() {
+                    visible = Some(crate::svc::corphangar::visible_flags(ctx).into_iter().map(i64::from).collect());
                 }
             }
-            if let Some(f) = flag {
-                where_sql.push_str(&format!(r#" AND e."flag" = ${}"#, vals.len() + 1));
-                vals.push(f as i32);
-            }
-            let sql = format!(
-                r#"SELECT e."typeID",t."groupID",e.singleton,e.quantity,COALESCE(t.volume,0)::float8
-                     FROM "entity" e
-                     JOIN "invTypes" t ON t."typeID" = e."typeID"
-                    WHERE {where_sql}"#
-            );
-            let params: Vec<&(dyn ToSql + Sync)> =
-                vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            match ctx.db.query(&sql, &params).await {
-                Ok(rows) => rows.iter().map(|r|super::maintenance::unit_volume(i64::from(r.get::<_,i32>(0)),r.get(1),r.get::<_,i32>(2)!=0,r.get(4))*f64::from(r.get::<_,i32>(3))).sum(),
-                Err(e) => {
-                    error!("invbroker GetCapacity used: {err}", err = crate::logging::chain(&e));
-                    0.0
-                }
-            }
+            // Items of a type the static data does not know take no room, as
+            // joining on it left them out.
+            let types = crate::sde::table("invTypes");
+            ctx.store.read(|db| {
+                scope
+                    .rows(db)
+                    .filter(|r| {
+                        let f = r.int("flag");
+                        visible.as_ref().is_none_or(|v| f.is_some_and(|f| v.contains(&f))) && flag.is_none_or(|want| f == Some(want))
+                    })
+                    .filter_map(|r| {
+                        let type_id = r.int("typeID")?;
+                        let t = types.get("typeID", type_id)?;
+                        let group = t.int("groupID")? as i32;
+                        Some(super::maintenance::unit_volume(type_id, group, r.int("singleton")? != 0, t.float("volume").unwrap_or(0.0)) * r.int("quantity")? as f64)
+                    })
+                    .sum()
+            })
         }
         None => 0.0,
     };
@@ -485,18 +483,9 @@ pub async fn get_capacity(ctx: &Ctx<'_>, container: Container, flag: Option<i64>
     row(HEADER, vec![Value::Double(capacity), Value::Double(used)])
 }
 
-async fn query_items(ctx: &Ctx<'_>, sql: &str, vals: &[i32]) -> Value {
-    let params: Vec<&(dyn ToSql + Sync)> = vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-    match ctx.db.query(sql, &params).await {
-        Ok(rows) => {
-            let lines = rows.iter().map(|r| Value::List(invitem_cells(r))).collect();
-            rowset(INVITEM_HEADER, lines)
-        }
-        Err(e) => {
-            error!("invbroker item listing: {err}", err = crate::logging::chain(&e));
-            rowset(INVITEM_HEADER, Vec::new())
-        }
-    }
+/// Item rows as a listing rowset.
+fn item_rows(cells: Vec<Vec<Value>>) -> Value {
+    rowset(INVITEM_HEADER, cells.into_iter().map(Value::List).collect())
 }
 
 #[cfg(test)]
@@ -508,36 +497,38 @@ mod custody_tests {
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn inventory_custody_hides_private_and_unpermitted_hangars_and_keeps_job_blueprints() {
         let db=crate::test_support::Database::load().await;
-        let me=db.id().await;let other=db.id().await;let corp=db.id().await;
-        let office=db.id().await;let ship=db.id().await;let foreign_ship=db.id().await;
-        let nested=db.id().await;let secret=db.id().await;let visible=db.id().await;let hidden=db.id().await;let blueprint=db.id().await;let corp_blueprint=db.id().await;
-        let station:i32=db.db.query_one(r#"SELECT "stationID" FROM "staStations" ORDER BY "stationID" LIMIT 1"#,&[]).await.unwrap().get(0);
-        db.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName") VALUES($1,$2)"#,&[&corp,&format!("Custody {corp}")]).await.unwrap();
-        db.db.execute(r#"INSERT INTO "crpOffices" ("corporationID","stationID","officeFolderID","itemID") VALUES($1,$2,$3,$3)"#,&[&corp,&station,&office]).await.unwrap();
-        for (id,ty,owner,location,flag) in [(ship,587,me,station,4),(foreign_ship,587,other,station,4),(nested,3296,corp,office,4),(secret,34,other,foreign_ship,5),(visible,34,corp,office,4),(hidden,35,corp,office,116),(blueprint,691,me,station,36),(corp_blueprint,691,corp,station,4)] {
-            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES($1,$2,$3,$4,$5,1,1)"#,&[&id,&ty,&owner,&location,&flag]).await.unwrap();
-        }
-        let mut session=crate::session::Session {char_id:Some(me as i64),ship_id:Some(ship as i64),corp_id:Some(corp as i64),station_id:Some(station as i64),hq_id:Some(station as i64+1),roles_at_hq:8_192|1_048_576,..Default::default()};
+        let mut ids=Vec::new();for _ in 0..12 {ids.push(i64::from(db.id().await));}
+        let [me,other,corp,office,ship,foreign_ship,nested,secret,visible,hidden,blueprint,corp_blueprint]=ids[..] else {unreachable!()};
+        let station=db.store.read(|d|d.table("staStations").rows().filter_map(|r|r.int("stationID")).min()).unwrap();
+        db.store.write(|tx|->Result<(),crate::store::StoreError> {
+            tx.insert("corporation",&[("corporationID",store::Value::Int(corp)),("corporationName",store::Value::Text(format!("Custody {corp}").into()))])?;
+            tx.insert("crpOffices",&[("corporationID",store::Value::Int(corp)),("stationID",store::Value::Int(station)),("officeFolderID",store::Value::Int(office)),("itemID",store::Value::Int(office))])?;
+            for (id,ty,owner,location,flag) in [(ship,587,me,station,4),(foreign_ship,587,other,station,4),(nested,3296,corp,office,4),(secret,34,other,foreign_ship,5),(visible,34,corp,office,4),(hidden,35,corp,office,116),(blueprint,691,me,station,36),(corp_blueprint,691,corp,station,4)] {
+                tx.insert("entity",&[("itemID",store::Value::Int(id)),("typeID",store::Value::Int(ty)),("ownerID",store::Value::Int(owner)),("locationID",store::Value::Int(location)),
+                    ("flag",store::Value::Int(flag)),("quantity",store::Value::Int(1)),("singleton",store::Value::Int(1))])?;
+            }
+            Ok(())
+        }).unwrap();
+        let mut session=crate::session::Session {char_id:Some(me),ship_id:Some(ship),corp_id:Some(corp),station_id:Some(station),hq_id:Some(station+1),roles_at_hq:8_192|1_048_576,..Default::default()};
         let ctx=db.ctx(&session);
-        assert!(item_ids(list(&ctx,Container::Item(foreign_ship as i64)).await).is_empty());
-        assert!(item_ids(list(&ctx,Container::Special {container_id:CONTAINER_HANGAR,owner_id:Some(other as i64)}).await).is_empty());
-        assert!(item_ids(list(&ctx,Container::Item(office as i64)).await).is_empty(),"HQ roles do not grant access at another office");
-        assert!(!may_read(&ctx,Container::Item(nested as i64)).await);
-        assert!(item_ids(list_station_items(&ctx,station as i64,true,true).await).is_empty(),"remote blueprint listing also checks the target station's roles");
+        assert!(item_ids(list(&ctx,Container::Item(foreign_ship)).await).is_empty());
+        assert!(item_ids(list(&ctx,Container::Special {container_id:CONTAINER_HANGAR,owner_id:Some(other)}).await).is_empty());
+        assert!(item_ids(list(&ctx,Container::Item(office)).await).is_empty(),"HQ roles do not grant access at another office");
+        assert!(!may_read(&ctx,Container::Item(nested)).await);
+        assert!(item_ids(list_station_items(&ctx,station,true,true).await).is_empty(),"remote blueprint listing also checks the target station's roles");
         assert!(item_ids(list_stations(&ctx,true,true).await).is_empty());
-        assert!(!item_ids(list(&ctx,Container::Special {container_id:CONTAINER_HANGAR,owner_id:None}).await).contains(&(blueprint as i64)));
-        let call=Call {service:"invcontainer".into(),method:"Add".into(),args:vec![Value::Int(blueprint as i64)],kwargs:vec![]};
+        assert!(!item_ids(list(&ctx,Container::Special {container_id:CONTAINER_HANGAR,owner_id:None}).await).contains(&blueprint));
+        let call=Call {service:"invcontainer".into(),method:"Add".into(),args:vec![Value::Int(blueprint)],kwargs:vec![]};
         let result=crate::svc::moves::container_write(&ctx,Container::Special {container_id:CONTAINER_HANGAR,owner_id:None},&call).await.unwrap();
         assert!(!matches!(result,Outcome::Value(_)),"ordinary moves cannot retrieve an installed blueprint");
         session.roles_at_other=1_048_576;
         let ctx=db.ctx(&session);
-        assert_eq!(item_ids(list(&ctx,Container::Item(office as i64)).await).into_iter().collect::<std::collections::BTreeSet<_>>(),[nested as i64,visible as i64].into_iter().collect());
-        assert!(may_read(&ctx,Container::Item(nested as i64)).await);
-        assert_eq!(item_ids(list_station_items(&ctx,station as i64,true,true).await),vec![corp_blueprint as i64]);
-        assert!(item_ids(list_stations(&ctx,true,true).await).contains(&(station as i64)));
+        assert_eq!(item_ids(list(&ctx,Container::Item(office)).await).into_iter().collect::<std::collections::BTreeSet<_>>(),[nested,visible].into_iter().collect());
+        assert!(may_read(&ctx,Container::Item(nested)).await);
+        assert_eq!(item_ids(list_station_items(&ctx,station,true,true).await),vec![corp_blueprint]);
+        assert!(item_ids(list_stations(&ctx,true,true).await).contains(&station));
         assert!(!crate::svc::corphangar::may_take(&ctx,4));
         session.roles_at_other=8_192;
         let ctx=db.ctx(&session);
@@ -545,7 +536,7 @@ mod custody_tests {
         assert!(!crate::svc::corphangar::may_query(&ctx,4),"take and query are distinct original roles");
         session.roles_at_all=crate::session::CORP_ROLE_DIRECTOR;
         let ctx=db.ctx(&session);
-        assert!(item_ids(list(&ctx,Container::Item(office as i64)).await).contains(&(hidden as i64)));
+        assert!(item_ids(list(&ctx,Container::Item(office)).await).contains(&hidden));
     }
 }
 
@@ -562,21 +553,3 @@ pub fn item_change(cells: Vec<Value>, before: Vec<(i64, Value)>) -> Value {
         Value::Dict(before.into_iter().map(|(ix, v)| (Value::Int(ix), v)).collect()),
     ])
 }
-
-pub fn invitem_cells(r: &tokio_postgres::Row) -> Vec<Value> {
-    let mut cells: Vec<Value> = (0..10).map(|i| int_at(r, i)).collect();
-    cells.push(match r.try_get::<_, Option<String>>(10) {
-        Ok(Some(s)) => Value::Bytes(s.into_bytes()),
-        _ => Value::None,
-    });
-    cells
-}
-
-fn int_at(r: &tokio_postgres::Row, i: usize) -> Value {
-    match r.try_get::<_, i32>(i) {
-        Ok(v) => Value::Int(v as i64),
-        Err(_) => Value::None,
-    }
-}
-
-

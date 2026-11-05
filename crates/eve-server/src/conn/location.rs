@@ -12,6 +12,7 @@ use super::{Conn, Result};
 use crate::ballpark::{Command, Ship, Vec3};
 use crate::destiny;
 use crate::exceptions::{custom_error, user_error};
+use crate::store::{Store, StoreError, Tx, Value as StoreValue};
 use crate::svc::jumps::PreparedJump;
 #[cfg(test)] use crate::svc::jumps::FuelCost;
 use crate::svc::{bound, inflight, space};
@@ -58,30 +59,59 @@ impl JumpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::StoreError;
+
+    /// The first station (by ID): its ID, system, constellation and region.
+    fn first_station(store: &Store) -> (i64, i64, i64, i64) {
+        store.read(|db| {
+            let s = db.table("staStations").rows().min_by_key(|s| s.int("stationID")).unwrap();
+            let id = |column: &str| s.int(column).unwrap();
+            (id("stationID"), id("solarSystemID"), id("constellationID"), id("regionID"))
+        })
+    }
+
+    /// `UPDATE table SET .. WHERE <primary key>=id` for fixture changes.
+    fn set(store: &Store, table: &str, id: i64, sets: &[(&str, StoreValue)]) {
+        store.write(|tx| update_by_id(tx, table, id, sets)).unwrap();
+    }
+
+    fn int(store: &Store, table: &str, id: i64, column: &str) -> Option<i64> {
+        store.read(|db| db.table(table).get_id(id).and_then(|r| r.int(column)))
+    }
+
+    fn entity(id: i64, type_id: i64, owner: i64, location: i64, flag: i64, quantity: i64, singleton: i64) -> Vec<(&'static str, StoreValue)> {
+        vec![("itemID", StoreValue::Int(id)), ("typeID", StoreValue::Int(type_id)), ("ownerID", StoreValue::Int(owner)),
+            ("locationID", StoreValue::Int(location)), ("flag", StoreValue::Int(flag)), ("quantity", StoreValue::Int(quantity)),
+            ("singleton", StoreValue::Int(singleton))]
+    }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn disconnect_saves_actual_capsule_with_unprocessed_clone_jump_session() {
         let fixture = crate::test_support::Database::load().await;
-        let pilot = fixture.id().await;
-        let old_hull = fixture.id().await;
-        let capsule = fixture.id().await;
-        let other_hull = fixture.id().await;
-        let derelict = fixture.id().await;
-        let place = fixture.db.query_one(r#"SELECT "stationID","solarSystemID" FROM "staStations" ORDER BY "stationID" LIMIT 1"#, &[]).await.unwrap();
-        let station = place.get::<_, i32>(0);
-        let origin = place.get::<_, i32>(1);
-        let destination: i32 = fixture.db.query_one(r#"SELECT "solarSystemID" FROM "mapSolarSystems" WHERE "solarSystemID"<>$1 ORDER BY "solarSystemID" LIMIT 1"#, &[&origin]).await.unwrap().get(0);
+        let pilot = i64::from(fixture.id().await);
+        let old_hull = i64::from(fixture.id().await);
+        let capsule = i64::from(fixture.id().await);
+        let other_hull = i64::from(fixture.id().await);
+        let derelict = i64::from(fixture.id().await);
+        let (station, origin, _, _) = first_station(&fixture.store);
+        let destination = fixture.store.read(|db| {
+            db.table("mapSolarSystems").rows().filter_map(|s| s.int("solarSystemID")).filter(|id| *id != origin).min().unwrap()
+        });
         // The clone jump has committed and published its capsule, but the
         // connection still has the old docked session when its socket closes.
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","stationID","solarSystemID") VALUES ($1,$2,$3,0,$4)"#, &[&pilot,&format!("Stale clone session {pilot}"),&capsule,&destination]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,587,$3,$4,4,1,1),($2,670,$3,$5,0,1,1)"#, &[&old_hull,&capsule,&pilot,&station,&destination]).await.unwrap();
+        fixture.store.write(|tx| {
+            tx.insert("character_", &[("characterID", StoreValue::Int(pilot)), ("characterName", StoreValue::Text(format!("Stale clone session {pilot}").into())),
+                ("shipID", StoreValue::Int(capsule)), ("stationID", StoreValue::Int(0)), ("solarSystemID", StoreValue::Int(destination))])?;
+            tx.insert("entity", &entity(old_hull, 587, pilot, station, 4, 1, 1))?;
+            tx.insert("entity", &entity(capsule, 670, pilot, destination, 0, 1, 1))?;
+            Ok::<_, StoreError>(())
+        }).unwrap();
         let current = crate::session::Session {
-            char_id: Some(pilot as i64), ship_id: Some(capsule as i64),
-            solar_system_id: Some(destination as i64), solar_system_id2: Some(destination as i64),
+            char_id: Some(pilot), ship_id: Some(capsule),
+            solar_system_id: Some(destination), solar_system_id2: Some(destination),
             ..Default::default()
         };
-        let mut ship = inflight::ship_for_space(&fixture.ctx(&current), pilot as i64, capsule as i64).await.unwrap();
+        let mut ship = inflight::ship_for_space(&fixture.ctx(&current), pilot, capsule).await.unwrap();
         ship.arrive(Vec3::new(12345.0, -67890.0, 34567.0));
         let fight = ship.fight.as_mut().unwrap();
         fight.vitals.armor_damage = 7.0;
@@ -94,33 +124,33 @@ mod tests {
         let client = client.unwrap();
         let (socket, peer) = accepted.unwrap();
         let server = std::sync::Arc::new(super::super::Server {
-            table: Default::default(), db:crate::db::Shared::new(fixture.db,fixture.url.clone()), db_url: fixture.url, node_id: 1,
+            table: Default::default(), store: fixture.store, node_id: 1,
             bulk: fixture.bulk, dogma: fixture.dogma, services: crate::svc::registry(),
             world: fixture.world, dump_dir: Default::default(),
             alliance_join_delay_secs: 0, sov_claim_delay_secs: 0,
         });
         let mut conn = Conn::new(socket, peer, server, 9292);
         conn.session = crate::session::Session {
-            char_id: Some(pilot as i64), ship_id: Some(old_hull as i64),
-            station_id: Some(station as i64), solar_system_id2: Some(origin as i64),
+            char_id: Some(pilot), ship_id: Some(old_hull),
+            station_id: Some(station), solar_system_id2: Some(origin),
             ..Default::default()
         };
         ship.client_id = conn.client_id;
-        let other = Ship::new(other_hull as i64, conn.client_id + 1, ship.stats.clone(), ship.pilot.clone(), Vec3::ZERO, Vec3::ZERO);
-        let mut empty = Ship::new(derelict as i64, conn.client_id, ship.stats.clone(), ship.pilot.clone(), Vec3::ZERO, Vec3::ZERO);
+        let other = Ship::new(other_hull, conn.client_id + 1, ship.stats.clone(), ship.pilot.clone(), Vec3::ZERO, Vec3::ZERO);
+        let mut empty = Ship::new(derelict, conn.client_id, ship.stats.clone(), ship.pilot.clone(), Vec3::ZERO, Vec3::ZERO);
         empty.unpiloted = true;
         let _notifications = {
             let mut world = conn.server.world.lock();
             let notifications = world.connect(conn.client_id);
             world.set_presence(conn.client_id, conn.presence());
-            let mut park = crate::ballpark::Park::new(destination as i64, vec![], destiny::tick_now());
-            park.ships.insert(capsule as i64, ship);
-            park.ships.insert(other_hull as i64, other);
-            park.ships.insert(derelict as i64, empty);
-            world.parks.insert(destination as i64, park);
+            let mut park = crate::ballpark::Park::new(destination, vec![], destiny::tick_now());
+            park.ships.insert(capsule, ship);
+            park.ships.insert(other_hull, other);
+            park.ships.insert(derelict, empty);
+            world.parks.insert(destination, park);
             world.push_move(conn.client_id, Move::Relocate {
-                station_id: None, solar_system_id: destination as i64,
-                constellation_id: 0, region_id: 0, ship_id: capsule as i64,
+                station_id: None, solar_system_id: destination,
+                constellation_id: 0, region_id: 0, ship_id: capsule,
             });
             notifications
         };
@@ -128,41 +158,47 @@ mod tests {
         conn.leave_world().await;
         {
             let world = conn.server.world.lock();
-            let ships = &world.parks[&(destination as i64)].ships;
-            assert!(!ships.contains_key(&(capsule as i64)));
-            assert!(ships.contains_key(&(other_hull as i64)), "another client's hull stays in space");
-            assert!(ships.contains_key(&(derelict as i64)), "unpiloted hull stays even with a stale client ID");
-            assert!(world.clients_of(pilot as i64).is_empty());
+            let ships = &world.parks[&destination].ships;
+            assert!(!ships.contains_key(&capsule));
+            assert!(ships.contains_key(&other_hull), "another client's hull stays in space");
+            assert!(ships.contains_key(&derelict), "unpiloted hull stays even with a stale client ID");
+            assert!(world.clients_of(pilot).is_empty());
         }
-        let saved = conn.db.query_one(r#"SELECT x,y,z FROM entity WHERE "itemID"=$1"#, &[&capsule]).await.unwrap();
-        assert_eq!((saved.get::<_, f64>(0),saved.get::<_, f64>(1),saved.get::<_, f64>(2)), (12345.0,-67890.0,34567.0));
-        let loaded = inflight::ship_for_space(&conn.ctx(), pilot as i64, capsule as i64).await.unwrap();
+        let saved = conn.server.store.read(|db| {
+            let e = db.table("entity").get_id(capsule).unwrap();
+            (e.float("x"), e.float("y"), e.float("z"))
+        });
+        assert_eq!(saved, (Some(12345.0), Some(-67890.0), Some(34567.0)));
+        let loaded = inflight::ship_for_space(&conn.ctx(), pilot, capsule).await.unwrap();
         let vitals = &loaded.fight.as_ref().unwrap().vitals;
         assert_eq!(vitals.armor_damage, 7.0);
         assert!(vitals.capacitor.at(crate::combat::now_ms()) < 18.0, "stale docked session must not refill the space capsule");
-        assert_eq!(conn.session.station_id, Some(station as i64), "test never consumes the queued relocation");
+        assert_eq!(conn.session.station_id, Some(station), "test never consumes the queued relocation");
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn pending_docking_keeps_commands_and_disconnect_responsive_and_commits_on_arrival() {
         let fixture = crate::test_support::Database::load().await;
-        let pilot = fixture.id().await;
-        let hull = fixture.id().await;
-        let place=fixture.db.query_one(r#"SELECT "stationID","solarSystemID" FROM "staStations" ORDER BY "stationID" LIMIT 1"#,&[]).await.unwrap();
-        let station = place.get::<_, i32>(0);
-        let system = place.get::<_, i32>(1);
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","accountID","characterName","shipID","stationID","solarSystemID","corporationID") VALUES ($1,$1,$2,$3,0,$4,1000002)"#,&[&pilot,&format!("Approach fixture {pilot}"),&hull,&system]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,singleton,x) VALUES ($1,587,$2,$3,1,1,10000)"#,&[&hull,&pilot,&system]).await.unwrap();
+        let pilot = i64::from(fixture.id().await);
+        let hull = i64::from(fixture.id().await);
+        let (station, system, _, _) = first_station(&fixture.store);
+        fixture.store.write(|tx| {
+            tx.insert("character_", &[("characterID", StoreValue::Int(pilot)), ("accountID", StoreValue::Int(pilot)),
+                ("characterName", StoreValue::Text(format!("Approach fixture {pilot}").into())), ("shipID", StoreValue::Int(hull)),
+                ("stationID", StoreValue::Int(0)), ("solarSystemID", StoreValue::Int(system)), ("corporationID", StoreValue::Int(1000002))])?;
+            tx.insert("entity", &[("itemID", StoreValue::Int(hull)), ("typeID", StoreValue::Int(587)), ("ownerID", StoreValue::Int(pilot)),
+                ("locationID", StoreValue::Int(system)), ("quantity", StoreValue::Int(1)), ("singleton", StoreValue::Int(1)), ("x", StoreValue::Float(10000.0))])?;
+            Ok::<_, StoreError>(())
+        }).unwrap();
         let session = crate::session::Session {
-            char_id: Some(pilot as i64),
-            ship_id: Some(hull as i64),
-            solar_system_id: Some(system as i64),
-            solar_system_id2: Some(system as i64),
+            char_id: Some(pilot),
+            ship_id: Some(hull),
+            solar_system_id: Some(system),
+            solar_system_id2: Some(system),
             corp_id: Some(1000002),
             ..Default::default()
         };
-        let mut ship = inflight::ship_for_space(&fixture.ctx(&session), pilot as i64, hull as i64)
+        let mut ship = inflight::ship_for_space(&fixture.ctx(&session), pilot, hull)
             .await
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -174,8 +210,7 @@ mod tests {
         let (socket, peer) = accepted.unwrap();
         let server = std::sync::Arc::new(super::super::Server {
             table: Default::default(),
-            db:crate::db::Shared::new(fixture.db,fixture.url.clone()),
-            db_url: fixture.url,
+            store: fixture.store,
             node_id: 1,
             bulk: fixture.bulk,
             dogma: fixture.dogma,
@@ -193,7 +228,7 @@ mod tests {
             let notifications = world.connect(conn.client_id);
             world.set_presence(conn.client_id, conn.presence());
             let station_ball = crate::ballpark::Celestial {
-                id: station as i64,
+                id: station,
                 type_id: 1529,
                 group_id: 15,
                 name: "Docking fixture".into(),
@@ -202,15 +237,15 @@ mod tests {
                 jump: None,
             };
             let mut park =
-                crate::ballpark::Park::new(system as i64, vec![station_ball], destiny::tick_now());
-            park.ships.insert(hull as i64, ship);
-            world.parks.insert(system as i64, park);
+                crate::ballpark::Park::new(system, vec![station_ball], destiny::tick_now());
+            park.ships.insert(hull, ship);
+            world.parks.insert(system, park);
             notifications
         };
         let request = MachoPacket::call_req(Value::None);
         tokio::time::timeout(
             Duration::from_secs(1),
-            conn.dock(&request, station as i64, false),
+            conn.dock(&request, station, false),
         )
         .await
         .expect("approach must not hold the connection until arrival")
@@ -225,85 +260,78 @@ mod tests {
         conn.handle_call(&request, &stop).await.unwrap();
         assert!(conn.pending_dock.is_none());
         assert!(matches!(
-            conn.server.world.lock().parks[&(system as i64)].ships[&(hull as i64)].command,
+            conn.server.world.lock().parks[&system].ships[&hull].command,
             Command::Stop
         ));
 
-        conn.dock(&request, station as i64, false).await.unwrap();
+        conn.dock(&request, station, false).await.unwrap();
         assert!(conn.pending_dock.is_some());
         tokio::time::timeout(Duration::from_secs(1), conn.leave_world())
             .await
             .expect("disconnect must not wait for docking");
         assert!(conn.pending_dock.is_none());
-        assert!(!conn.server.world.lock().parks[&(system as i64)]
+        assert!(!conn.server.world.lock().parks[&system]
             .ships
-            .contains_key(&(hull as i64)));
-        assert!(conn.server.world.lock().clients_of(pilot as i64).is_empty());
+            .contains_key(&hull));
+        assert!(conn.server.world.lock().clients_of(pilot).is_empty());
 
         // A fresh character selection reconstructs the ship before GetFormations.
         let _reconnected = conn.server.world.lock().connect(conn.client_id);
         conn.session = crate::session::Session {
-            user_id: Some(pilot as i64),
+            user_id: Some(pilot),
             ..Default::default()
         };
-        conn.select_character(&request, pilot as i64).await.unwrap();
+        conn.select_character(&request, pilot).await.unwrap();
         assert_eq!(
             conn.session.station_id, None,
             "persisted stationID=0 means space, not station zero"
         );
-        assert_eq!(conn.session.solar_system_id, Some(system as i64));
-        assert!(conn.server.world.lock().parks[&(system as i64)]
+        assert_eq!(conn.session.solar_system_id, Some(system));
+        assert!(conn.server.world.lock().parks[&system]
             .ships
-            .contains_key(&(hull as i64)));
-        conn.dock(&request, station as i64, false).await.unwrap();
+            .contains_key(&hull));
+        conn.dock(&request, station, false).await.unwrap();
         assert!(conn.pending_dock.is_some());
         conn.server
             .world
             .lock()
             .parks
-            .get_mut(&(system as i64))
+            .get_mut(&system)
             .unwrap()
             .ships
-            .get_mut(&(hull as i64))
+            .get_mut(&hull)
             .unwrap()
             .pos = Vec3::new(2000.0, 0.0, 0.0);
         conn.poll_docking().await.unwrap();
         assert!(conn.pending_dock.is_none());
-        assert_eq!(conn.session.station_id, Some(station as i64));
-        assert!(!conn.server.world.lock().parks[&(system as i64)]
+        assert_eq!(conn.session.station_id, Some(station));
+        assert!(!conn.server.world.lock().parks[&system]
             .ships
-            .contains_key(&(hull as i64)));
-        let saved: i32 = conn
-            .db
-            .query_one(
-                r#"SELECT "stationID" FROM "character_" WHERE "characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(saved, station);
+            .contains_key(&hull));
+        assert_eq!(int(&conn.server.store, "character_", pilot, "stationID"), Some(station));
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn dock_undock_and_reconnect_persist_all_locations_or_none() {
         let db = crate::test_support::Database::load().await;
-        let pilot = db.id().await;
-        let hull = db.id().await;
-        let place=db.db.query_one(r#"SELECT "stationID","solarSystemID","constellationID","regionID" FROM "staStations" ORDER BY "stationID" LIMIT 1"#,&[]).await.unwrap();
-        let station = place.get::<_, i32>(0);
-        let system = place.get::<_, i32>(1);
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","stationID","solarSystemID") VALUES ($1,$2,$3,$4,$5)"#,&[&pilot,&format!("Dock fixture {pilot}"),&hull,&station,&system]).await.unwrap();
-        db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,587,$2,$3,4,1,1),($2,1377,$2,$3,0,1,1)"#,&[&hull,&pilot,&station]).await.unwrap();
+        let pilot = i64::from(db.id().await);
+        let hull = i64::from(db.id().await);
+        let (station, system, _, _) = first_station(&db.store);
+        db.store.write(|tx| {
+            tx.insert("character_", &[("characterID", StoreValue::Int(pilot)), ("characterName", StoreValue::Text(format!("Dock fixture {pilot}").into())),
+                ("shipID", StoreValue::Int(hull)), ("stationID", StoreValue::Int(station)), ("solarSystemID", StoreValue::Int(system))])?;
+            tx.insert("entity", &entity(hull, 587, pilot, station, 4, 1, 1))?;
+            tx.insert("entity", &entity(pilot, 1377, pilot, station, 0, 1, 1))?;
+            Ok::<_, StoreError>(())
+        }).unwrap();
         let session = crate::session::Session {
-            char_id: Some(pilot as i64),
-            ship_id: Some(hull as i64),
-            station_id: Some(station as i64),
-            solar_system_id2: Some(system as i64),
+            char_id: Some(pilot),
+            ship_id: Some(hull),
+            station_id: Some(station),
+            solar_system_id2: Some(system),
             ..Default::default()
         };
-        let mut ship = inflight::ship_for_space(&db.ctx(&session), pilot as i64, hull as i64)
+        let mut ship = inflight::ship_for_space(&db.ctx(&session), pilot, hull)
             .await
             .unwrap();
         ship.pos = Vec3::new(1234.0, 5678.0, 9012.0);
@@ -311,27 +339,24 @@ mod tests {
         fight.vitals.armor_damage = 12.0;
         fight.vitals.capacitor.recharge_ms = 0.0;
         fight.vitals.capacitor.set(crate::combat::now_ms(), 37.0);
-        persist_undock(&db.url, pilot as i64, station as i64, system as i64, &ship)
+        persist_undock(&db.store, pilot, station, system, &ship)
             .await
             .unwrap();
-        let saved=db.db.query_one(r#"SELECT c."stationID",s."locationID",p."locationID",s.x,s.y,s.z FROM "character_" c JOIN entity s ON s."itemID"=c."shipID" JOIN entity p ON p."itemID"=c."characterID" WHERE c."characterID"=$1"#,&[&pilot]).await.unwrap();
-        assert_eq!(saved.get::<_, i32>(0), 0);
-        assert_eq!(saved.get::<_, i32>(1), system);
-        assert_eq!(saved.get::<_, i32>(2), system);
-        assert_eq!(
-            (
-                saved.get::<_, f64>(3),
-                saved.get::<_, f64>(4),
-                saved.get::<_, f64>(5)
-            ),
-            (1234.0, 5678.0, 9012.0)
-        );
+        let saved = db.store.read(|db| {
+            let s = db.table("entity").get_id(hull).unwrap();
+            (int_of(db, "character_", pilot, "stationID"), s.int("locationID"), int_of(db, "entity", pilot, "locationID"),
+                (s.float("x"), s.float("y"), s.float("z")))
+        });
+        assert_eq!(saved.0, Some(0));
+        assert_eq!(saved.1, Some(system));
+        assert_eq!(saved.2, Some(system));
+        assert_eq!(saved.3, (Some(1234.0), Some(5678.0), Some(9012.0)));
         assert!(
-            persist_undock(&db.url, pilot as i64, station as i64, system as i64, &ship)
+            persist_undock(&db.store, pilot, station, system, &ship)
                 .await
                 .is_err()
         );
-        let resumed = reconnect_ship(&db.ctx(&session), pilot as i64, hull as i64, system as i64)
+        let resumed = reconnect_ship(&db.ctx(&session), pilot, hull, system)
             .await
             .unwrap();
         assert_eq!(resumed.pos, ship.pos);
@@ -346,66 +371,47 @@ mod tests {
                 .at(crate::combat::now_ms())
                 < 38.0
         );
-        db.db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=0 WHERE "itemID"=$1"#,
-                &[&hull],
-            )
-            .await
-            .unwrap();
+        set(&db.store, "entity", hull, &[("ownerID", StoreValue::Int(0))]);
         assert!(
-            persist_dock(&db.url, pilot as i64, system as i64, station as i64, &ship)
+            persist_dock(&db.store, pilot, system, station, &ship)
                 .await
                 .is_err()
         );
         assert!(
-            reconnect_ship(&db.ctx(&session), pilot as i64, hull as i64, system as i64)
+            reconnect_ship(&db.ctx(&session), pilot, hull, system)
                 .await
                 .is_err()
         );
-        let still: i32 = db
-            .db
-            .query_one(
-                r#"SELECT "stationID" FROM "character_" WHERE "characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(still, 0);
-        db.db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,
-                &[&hull, &pilot],
-            )
+        assert_eq!(int(&db.store, "character_", pilot, "stationID"), Some(0));
+        set(&db.store, "entity", hull, &[("ownerID", StoreValue::Int(pilot))]);
+        persist_dock(&db.store, pilot, system, station, &ship)
             .await
             .unwrap();
-        persist_dock(&db.url, pilot as i64, system as i64, station as i64, &ship)
-            .await
-            .unwrap();
-        let saved=db.db.query_one(r#"SELECT c."stationID",s."locationID",p."locationID",s.flag FROM "character_" c JOIN entity s ON s."itemID"=c."shipID" JOIN entity p ON p."itemID"=c."characterID" WHERE c."characterID"=$1"#,&[&pilot]).await.unwrap();
-        assert_eq!(
-            (
-                saved.get::<_, i32>(0),
-                saved.get::<_, i32>(1),
-                saved.get::<_, i32>(2),
-                saved.get::<_, i32>(3)
-            ),
-            (station, station, station, 4)
-        );
-        let charges:i64=db.db.query_one(r#"SELECT count(*) FROM entity_attributes WHERE "itemID"=$1 AND "attributeID" IN (18,264)"#,&[&hull]).await.unwrap().get(0);
+        let saved = db.store.read(|db| {
+            (int_of(db, "character_", pilot, "stationID"), int_of(db, "entity", hull, "locationID"),
+                int_of(db, "entity", pilot, "locationID"), int_of(db, "entity", hull, "flag"))
+        });
+        assert_eq!(saved, (Some(station), Some(station), Some(station), Some(4)));
+        let charges = db.store.read(|db| {
+            [18, 264].iter().filter(|a| db.table("entity_attributes").get(&[StoreValue::Int(hull), StoreValue::Int(**a)]).is_some()).count()
+        });
         assert_eq!(charges, 0);
-        let other=db.db.query_one(r#"SELECT "solarSystemID","constellationID","regionID" FROM "mapSolarSystems" WHERE "solarSystemID"<>$1 ORDER BY "solarSystemID" LIMIT 1"#,&[&system]).await.unwrap();
+        let other = db.store.read(|db| {
+            let s = db.table("mapSolarSystems").rows().filter(|s| s.int("solarSystemID") != Some(system))
+                .min_by_key(|s| s.int("solarSystemID")).unwrap();
+            let id = |column: &str| s.int(column).unwrap();
+            (id("solarSystemID"), id("constellationID"), id("regionID"))
+        });
         ship.pos = Vec3::new(999.0, 888.0, 777.0);
         persist_relocation(
-            &db.url,
-            pilot as i64,
-            system as i64,
-            Some(station as i64),
-            other.get::<_, i32>(0) as i64,
+            &db.store,
+            pilot,
+            system,
+            Some(station),
+            other.0,
             None,
-            other.get::<_, i32>(1) as i64,
-            other.get::<_, i32>(2) as i64,
+            other.1,
+            other.2,
             &ship,
         )
         .await
@@ -413,9 +419,9 @@ mod tests {
         assert_eq!(
             reconnect_ship(
                 &db.ctx(&session),
-                pilot as i64,
-                hull as i64,
-                other.get::<_, i32>(0) as i64
+                pilot,
+                hull,
+                other.0
             )
             .await
             .unwrap()
@@ -424,30 +430,22 @@ mod tests {
         );
     }
 
+    fn int_of(db: &crate::store::Db, table: &str, id: i64, column: &str) -> Option<i64> {
+        db.table(table).get_id(id).and_then(|r| r.int(column))
+    }
+
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn jump_persistence_moves_pilot_and_ship_or_neither() {
         let fixture = crate::test_support::Database::load().await;
-        let pilot = fixture.id().await;
-        let ship = fixture.id().await;
-        fixture
-            .db
-            .execute(
-                r#"INSERT INTO "character_" ("characterID","characterName","shipID","solarSystemID")
-            VALUES ($1,$2,$3,30000142)"#,
-                &[&pilot, &format!("Jump test {pilot}"), &ship],
-            )
-            .await
-            .unwrap();
-        fixture
-            .db
-            .execute(
-                r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,singleton)
-            VALUES ($1,587,$2,30000142,1,1)"#,
-                &[&ship, &pilot],
-            )
-            .await
-            .unwrap();
+        let pilot = i64::from(fixture.id().await);
+        let ship = i64::from(fixture.id().await);
+        fixture.store.write(|tx| {
+            tx.insert("character_", &[("characterID", StoreValue::Int(pilot)), ("characterName", StoreValue::Text(format!("Jump test {pilot}").into())),
+                ("shipID", StoreValue::Int(ship)), ("solarSystemID", StoreValue::Int(30000142))])?;
+            tx.insert("entity", &[("itemID", StoreValue::Int(ship)), ("typeID", StoreValue::Int(587)), ("ownerID", StoreValue::Int(pilot)),
+                ("locationID", StoreValue::Int(30000142)), ("quantity", StoreValue::Int(1)), ("singleton", StoreValue::Int(1))])?;
+            Ok::<_, StoreError>(())
+        }).unwrap();
         let at = Vec3::new(123.0, 456.0, 789.0);
         let mut arrival = JumpArrival {
             from: 30000142,
@@ -457,9 +455,9 @@ mod tests {
             at,
         };
         persist_jump_state(
-            &fixture.url,
-            i64::from(pilot),
-            i64::from(ship),
+            &fixture.store,
+            pilot,
+            ship,
             &arrival,
             None,
             None,
@@ -467,41 +465,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let saved = fixture
-            .db
-            .query_one(
-                r#"SELECT c."solarSystemID",e."locationID",e.x,e.y,e.z
-            FROM "character_" c JOIN entity e ON e."itemID"=c."shipID" WHERE c."characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            (saved.get::<_, i32>(0), saved.get::<_, i32>(1)),
-            (30000143, 30000143)
-        );
-        assert_eq!(
-            (
-                saved.get::<_, f64>(2),
-                saved.get::<_, f64>(3),
-                saved.get::<_, f64>(4)
-            ),
-            (123.0, 456.0, 789.0)
-        );
-        fixture
-            .db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=0 WHERE "itemID"=$1"#,
-                &[&ship],
-            )
-            .await
-            .unwrap();
+        let saved = fixture.store.read(|db| {
+            let e = db.table("entity").get_id(ship).unwrap();
+            (int_of(db, "character_", pilot, "solarSystemID"), e.int("locationID"), (e.float("x"), e.float("y"), e.float("z")))
+        });
+        assert_eq!((saved.0, saved.1), (Some(30000143), Some(30000143)));
+        assert_eq!(saved.2, (Some(123.0), Some(456.0), Some(789.0)));
+        set(&fixture.store, "entity", ship, &[("ownerID", StoreValue::Int(0))]);
         arrival.from = 30000143;
         arrival.system = 30000144;
         assert!(persist_jump_state(
-            &fixture.url,
-            i64::from(pilot),
-            i64::from(ship),
+            &fixture.store,
+            pilot,
+            ship,
             &arrival,
             None,
             None,
@@ -509,23 +485,15 @@ mod tests {
         )
         .await
         .is_err());
-        let saved = fixture
-            .db
-            .query_one(
-                r#"SELECT "solarSystemID" FROM "character_" WHERE "characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap();
         assert_eq!(
-            saved.get::<_, i32>(0),
-            30000143,
+            int(&fixture.store, "character_", pilot, "solarSystemID"),
+            Some(30000143),
             "ship write failure rolls back the pilot write"
         );
         assert!(persist_jump_state(
-            &fixture.url,
-            i64::from(pilot),
-            i64::from(ship) + 1,
+            &fixture.store,
+            pilot,
+            ship + 1,
             &arrival,
             None,
             None,
@@ -533,68 +501,35 @@ mod tests {
         )
         .await
         .is_err());
-        fixture
-            .db
-            .execute(
-                r#"DELETE FROM "character_" WHERE "characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap();
-        fixture
-            .db
-            .execute(r#"DELETE FROM entity WHERE "itemID"=$1"#, &[&ship])
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn paid_jump_failure_and_duplicate_completion_never_lose_or_repeat_payment() {
         let fixture = crate::test_support::Database::load().await;
-        let pilot = fixture.id().await;
-        let ship_id = fixture.id().await;
-        let fuel = fixture.id().await;
-        fixture
-            .db
-            .execute(
-                r#"INSERT INTO "character_" ("characterID","characterName","shipID","solarSystemID")
-            VALUES ($1,$2,$3,30000142)"#,
-                &[&pilot, &format!("Paid jump {pilot}"), &ship_id],
-            )
-            .await
-            .unwrap();
-        fixture
-            .db
-            .execute(
-                r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,singleton)
-            VALUES ($1,587,$2,30000142,1,1)"#,
-                &[&ship_id, &pilot],
-            )
-            .await
-            .unwrap();
-        fixture
-            .db
-            .execute(
-                r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity)
-            VALUES ($1,16273,$2,$3,5,8)"#,
-                &[&fuel, &pilot, &ship_id],
-            )
-            .await
-            .unwrap();
-        let profile = inflight::profile(
-            &fixture.db,
+        let pilot = i64::from(fixture.id().await);
+        let ship_id = i64::from(fixture.id().await);
+        let fuel = i64::from(fixture.id().await);
+        fixture.store.write(|tx| {
+            tx.insert("character_", &[("characterID", StoreValue::Int(pilot)), ("characterName", StoreValue::Text(format!("Paid jump {pilot}").into())),
+                ("shipID", StoreValue::Int(ship_id)), ("solarSystemID", StoreValue::Int(30000142))])?;
+            tx.insert("entity", &[("itemID", StoreValue::Int(ship_id)), ("typeID", StoreValue::Int(587)), ("ownerID", StoreValue::Int(pilot)),
+                ("locationID", StoreValue::Int(30000142)), ("quantity", StoreValue::Int(1)), ("singleton", StoreValue::Int(1))])?;
+            tx.insert("entity", &[("itemID", StoreValue::Int(fuel)), ("typeID", StoreValue::Int(16273)), ("ownerID", StoreValue::Int(pilot)),
+                ("locationID", StoreValue::Int(ship_id)), ("flag", StoreValue::Int(5)), ("quantity", StoreValue::Int(8))])?;
+            Ok::<_, StoreError>(())
+        }).unwrap();
+        let profile = fixture.store.read(|db| inflight::profile(
+            db,
             &fixture.dogma,
-            i64::from(pilot),
-            i64::from(ship_id),
+            pilot,
+            ship_id,
             &Default::default(),
             crate::combat::now_ms(),
-        )
-        .await
+        ))
         .unwrap()
         .unwrap();
         let mut ship = Ship::new(
-            i64::from(ship_id),
+            ship_id,
             1,
             profile.stats,
             profile.pilot,
@@ -615,7 +550,7 @@ mod tests {
         let jump = PreparedJump {
             at: arrival.at,
             fuel: FuelCost {
-                cargo: i64::from(ship_id),
+                cargo: ship_id,
                 type_id: 16273,
                 quantity: 3,
                 flag: Some(5),
@@ -624,82 +559,39 @@ mod tests {
             clients: vec![],
         };
         // The ship was transferred or destroyed during the jump-out delay.
-        fixture
-            .db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=0 WHERE "itemID"=$1"#,
-                &[&ship_id],
-            )
-            .await
-            .unwrap();
+        set(&fixture.store, "entity", ship_id, &[("ownerID", StoreValue::Int(0))]);
         for _ in 0..2 {
             assert!(
-                complete_paid_jump(&fixture.url, i64::from(pilot), &mut ship, &arrival, &jump, None)
+                complete_paid_jump(&fixture.store, pilot, &mut ship, &arrival, &jump, None)
                     .await
                     .is_err()
             );
             assert_eq!(ship.fight.as_ref().unwrap().vitals.capacitor, before);
         }
-        let have: i32 = fixture
-            .db
-            .query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#, &[&fuel])
-            .await
-            .unwrap()
-            .get(0);
         assert_eq!(
-            have, 8,
+            int(&fixture.store, "entity", fuel, "quantity"), Some(8),
             "failed callbacks never debit or manufacture a refund"
         );
-        fixture
-            .db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,
-                &[&ship_id, &pilot],
-            )
-            .await
-            .unwrap();
+        set(&fixture.store, "entity", ship_id, &[("ownerID", StoreValue::Int(pilot))]);
         // Fuel available at preparation was consumed during the delay.
-        fixture
-            .db
-            .execute(
-                r#"UPDATE entity SET quantity=2 WHERE "itemID"=$1"#,
-                &[&fuel],
-            )
-            .await
-            .unwrap();
+        set(&fixture.store, "entity", fuel, &[("quantity", StoreValue::Int(2))]);
         assert!(
-            complete_paid_jump(&fixture.url, i64::from(pilot), &mut ship, &arrival, &jump, None)
+            complete_paid_jump(&fixture.store, pilot, &mut ship, &arrival, &jump, None)
                 .await
                 .is_err()
         );
         assert_eq!(ship.fight.as_ref().unwrap().vitals.capacitor, before);
-        let positions = fixture
-            .db
-            .query_one(
-                r#"SELECT c."solarSystemID",e."locationID" FROM "character_" c
-            JOIN entity e ON e."itemID"=c."shipID" WHERE c."characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap();
         assert_eq!(
-            (positions.get::<_, i32>(0), positions.get::<_, i32>(1)),
-            (30000142, 30000142),
+            (int(&fixture.store, "character_", pilot, "solarSystemID"), int(&fixture.store, "entity", ship_id, "locationID")),
+            (Some(30000142), Some(30000142)),
             "fuel refusal rolls back both arrival writes"
         );
-        fixture
-            .db
-            .execute(
-                r#"UPDATE entity SET quantity=8 WHERE "itemID"=$1"#,
-                &[&fuel],
-            )
-            .await
-            .unwrap();
-        complete_paid_jump(&fixture.url, i64::from(pilot), &mut ship, &arrival, &jump, None)
+        set(&fixture.store, "entity", fuel, &[("quantity", StoreValue::Int(8))]);
+        complete_paid_jump(&fixture.store, pilot, &mut ship, &arrival, &jump, None)
             .await
             .unwrap();
         assert!(
-            complete_paid_jump(&fixture.url, i64::from(pilot), &mut ship, &arrival, &jump, None)
+            complete_paid_jump(&fixture.store, pilot, &mut ship, &arrival, &jump, None)
                 .await
                 .is_err()
         );
@@ -712,23 +604,18 @@ mod tests {
                 .at(crate::combat::now_ms()),
             900.0
         );
-        let state = fixture
-            .db
-            .query_one(
-                r#"SELECT f.quantity,a."valueFloat" FROM entity f
-            JOIN entity_attributes a ON a."itemID"=$2 AND a."attributeID"=18 WHERE f."itemID"=$1"#,
-                &[&fuel, &ship_id],
-            )
-            .await
-            .unwrap();
+        let state = fixture.store.read(|db| {
+            (int_of(db, "entity", fuel, "quantity"),
+                db.table("entity_attributes").get(&[StoreValue::Int(ship_id), StoreValue::Int(18)]).and_then(|a| a.float("valueFloat")))
+        });
         assert_eq!(
-            state.get::<_, i32>(0),
-            5,
+            state.0,
+            Some(5),
             "successful completion debits only once"
         );
         assert_eq!(
-            state.get::<_, f64>(1),
-            900.0,
+            state.1,
+            Some(900.0),
             "capacitor is saved with the arrival"
         );
         let next = JumpArrival {
@@ -738,18 +625,18 @@ mod tests {
         };
         let (a, b) = tokio::join!(
             persist_jump_state(
-                &fixture.url,
-                i64::from(pilot),
-                i64::from(ship_id),
+                &fixture.store,
+                pilot,
+                ship_id,
                 &next,
                 Some(&jump.fuel),
                 Some(800.0),
                 None
             ),
             persist_jump_state(
-                &fixture.url,
-                i64::from(pilot),
-                i64::from(ship_id),
+                &fixture.store,
+                pilot,
+                ship_id,
                 &next,
                 Some(&jump.fuel),
                 Some(800.0),
@@ -761,29 +648,7 @@ mod tests {
             b.is_ok(),
             "concurrent duplicate completions have one winner"
         );
-        let have: i32 = fixture
-            .db
-            .query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#, &[&fuel])
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(have, 2);
-        fixture
-            .db
-            .execute(
-                r#"DELETE FROM "character_" WHERE "characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .unwrap();
-        fixture
-            .db
-            .execute(
-                r#"DELETE FROM entity WHERE "itemID"=ANY($1)"#,
-                &[&vec![ship_id, fuel]],
-            )
-            .await
-            .unwrap();
+        assert_eq!(int(&fixture.store, "entity", fuel, "quantity"), Some(2));
     }
 }
 
@@ -791,7 +656,7 @@ mod tests {
 /// jump. A failed write leaves the pilot and ship at their original location.
 #[cfg(test)]
 async fn persist_jump_state(
-    db_url: &str,
+    store: &Store,
     char_id: i64,
     ship_id: i64,
     arrival: &JumpArrival,
@@ -799,84 +664,63 @@ async fn persist_jump_state(
     capacitor: Option<f64>,
     fighter: Option<&crate::combat::Fighter>,
 ) -> std::result::Result<Vec<Value>, String> {
-    persist_jump_state_guarded(db_url,char_id,ship_id,arrival,fuel,capacitor,fighter,None).await
+    persist_jump_state_guarded(store,char_id,ship_id,arrival,fuel,capacitor,fighter,None).await
 }
 
 #[cfg(test)]
 async fn persist_jump_state_guarded(
-    db_url:&str,char_id:i64,ship_id:i64,arrival:&JumpArrival,fuel:Option<&FuelCost>,
+    store:&Store,char_id:i64,ship_id:i64,arrival:&JumpArrival,fuel:Option<&FuelCost>,
     capacitor:Option<f64>,fighter:Option<&crate::combat::Fighter>,departure:Option<&Departure<'_>>,
 ) -> std::result::Result<Vec<Value>,String> {
-    let failed = |error: tokio_postgres::Error| {
+    let failed = |error: StoreError| {
         error!("saving jump: {}", crate::logging::chain(&error));
         "Your jump could not be saved. Please try again.".to_string()
     };
-    let mut db = crate::db::connect(db_url).await.map_err(failed)?;
-    let mut txn = crate::items::ItemTxn::begin(&mut db)
-        .await
-        .map_err(failed)?;
-    if !crate::svc::login::lock_character_lifecycle(txn.tx(),char_id as i32).await.map_err(failed)? {
-        return Err("Your character is no longer available for this jump.".into());
-    }
-    // The source predicates are the completion guard: a repeated callback
-    // from the previous system cannot debit fuel or capacitor a second time.
-    let pilot=txn.tx().execute(r#"UPDATE "character_" SET "solarSystemID"=$2,"constellationID"=$3,"regionID"=$4
-        WHERE "characterID"=$1 AND "shipID"=$5 AND "solarSystemID"=$6 AND COALESCE("stationID",0)=0"#,
-        &[&(char_id as i32),&(arrival.system as i32),&(arrival.constellation as i32),&(arrival.region as i32),&(ship_id as i32),&(arrival.from as i32)]).await.map_err(failed)?;
-    let ship = txn
-        .tx()
-        .execute(
-            r#"UPDATE entity SET "locationID"=$2,x=$3,y=$4,z=$5
-        WHERE "itemID"=$1 AND "ownerID"=$6 AND "locationID"=$7"#,
-            &[
-                &(ship_id as i32),
-                &(arrival.system as i32),
-                &arrival.at.x,
-                &arrival.at.y,
-                &arrival.at.z,
-                &(char_id as i32),
-                &(arrival.from as i32),
-            ],
-        )
-        .await
-        .map_err(failed)?;
-    if pilot != 1 || ship != 1 {
-        return Err("Your ship has moved or is no longer available for this jump.".into());
-    }
-    if let Some(departure)=departure {departure.lock_endpoints(txn.tx()).await?;}
-    txn.tx()
-        .execute(
-            r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-            &[&(char_id as i32), &(arrival.system as i32)],
-        )
-        .await
-        .map_err(failed)?;
-    if let Some(fuel) = fuel {
-        fuel.debit(&mut txn).await?;
-    }
-    if let Some(fighter) = fighter {
-        inflight::write_vitals(txn.tx(), ship_id, fighter, false)
-            .await
-            .map_err(failed)?;
-    }
-    if let Some(capacitor) = capacitor {
-        txn.tx()
-            .execute(
-                r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt","valueFloat")
-            VALUES ($1,18,NULL,$2) ON CONFLICT ("itemID","attributeID")
-            DO UPDATE SET "valueInt"=NULL,"valueFloat"=$2"#,
-                &[&(ship_id as i32), &capacitor],
-            )
-            .await
-            .map_err(failed)?;
-    }
-    if let Some(departure)=departure {departure.accept()?;}
-    txn.commit().await.map_err(failed)
+    store.write(|tx| -> std::result::Result<Vec<Value>, transition::Failure> {
+        let mut txn = crate::items::ItemTxn::new(tx);
+        if txn.db().table("character_").get_id(char_id).is_none() {
+            return Err("Your character is no longer available for this jump.".into());
+        }
+        // The source predicates are the completion guard: a repeated callback
+        // from the previous system cannot debit fuel or capacitor a second time.
+        let pilot=txn.db().table("character_").get_id(char_id).filter(|c|c.int("shipID")==Some(ship_id)
+            && c.int("solarSystemID")==Some(arrival.from) && c.int("stationID").unwrap_or(0)==0).map(|c|c.id);
+        let ship=txn.db().table("entity").get_id(ship_id)
+            .filter(|e|e.int("ownerID")==Some(char_id) && e.int("locationID")==Some(arrival.from)).map(|e|e.id);
+        let (Some(pilot),Some(ship))=(pilot,ship) else {
+            return Err("Your ship has moved or is no longer available for this jump.".into());
+        };
+        txn.tx().update("character_",pilot,&[("solarSystemID",StoreValue::Int(arrival.system)),
+            ("constellationID",StoreValue::Int(arrival.constellation)),("regionID",StoreValue::Int(arrival.region))]).map_err(failed)?;
+        txn.tx().update("entity",ship,&[("locationID",StoreValue::Int(arrival.system)),
+            ("x",StoreValue::Float(arrival.at.x)),("y",StoreValue::Float(arrival.at.y)),("z",StoreValue::Float(arrival.at.z))]).map_err(failed)?;
+        if let Some(departure)=departure {departure.check_endpoints(txn.db())?;}
+        update_by_id(txn.tx(),"entity",char_id,&[("locationID",StoreValue::Int(arrival.system))]).map_err(failed)?;
+        if let Some(fuel) = fuel {
+            fuel.debit(&mut txn)?;
+        }
+        if let Some(fighter) = fighter {
+            inflight::write_vitals(txn.tx(), ship_id, fighter, false).map_err(failed)?;
+        }
+        if let Some(capacitor) = capacitor {
+            txn.tx().upsert("entity_attributes",&["itemID","attributeID"],
+                &[("itemID",StoreValue::Int(ship_id)),("attributeID",StoreValue::Int(18)),("valueInt",StoreValue::Null),("valueFloat",StoreValue::Float(capacitor))],
+                &[("valueInt",StoreValue::Null),("valueFloat",StoreValue::Float(capacitor))]).map_err(failed)?;
+        }
+        if let Some(departure)=departure {departure.accept()?;}
+        Ok(txn.events())
+    }).map_err(|failure|failure.to_string())
 }
 
-fn travel_failed(error: tokio_postgres::Error) -> String {
+fn travel_failed(error: StoreError) -> String {
     error!("saving travel: {}", crate::logging::chain(&error));
     "Your ship's location could not be saved. Please try again.".into()
+}
+
+/// `UPDATE table SET .. WHERE <primary key>=id`: no row, no change.
+fn update_by_id(tx:&mut Tx<'_>,table:&str,id:i64,sets:&[(&str,StoreValue)])->std::result::Result<(),StoreError> {
+    let Some(row)=tx.table(table).get_id(id).map(|r|r.id) else {return Ok(())};
+    tx.update(table,row,sets)
 }
 
 #[cfg(test)]
@@ -890,65 +734,63 @@ fn restore_departure(world:&mut crate::world::WorldState,system:i64,ship:Ship,co
 }
 
 async fn persist_undock(
-    db_url: &str,
+    store: &Store,
     char_id: i64,
     station: i64,
     system: i64,
     ship: &Ship,
 ) -> std::result::Result<(), String> {
-    let mut db = crate::db::connect(db_url).await.map_err(travel_failed)?;
-    let tx = db.transaction().await.map_err(travel_failed)?;
-    let pilot=tx.execute(r#"UPDATE "character_" SET "stationID"=0 WHERE "characterID"=$1 AND "shipID"=$2 AND "stationID"=$3 AND "solarSystemID"=$4 AND EXISTS (SELECT 1 FROM "staStations" WHERE "stationID"=$3 AND "solarSystemID"=$4)"#,&[&(char_id as i32),&(ship.id as i32),&(station as i32),&(system as i32)]).await.map_err(travel_failed)?;
-    if crate::losses::pending::blocked_character(&tx,char_id).await.map_err(travel_failed)? {
-        return Err("Your station arrival is awaiting its final combat state. Try again shortly.".into());
-    }
-    let moved=tx.execute(r#"UPDATE entity SET "locationID"=$2,flag=0,x=$3,y=$4,z=$5 WHERE "itemID"=$1 AND "ownerID"=$6 AND "locationID"=$7 AND flag=4"#,&[&(ship.id as i32),&(system as i32),&ship.pos.x,&ship.pos.y,&ship.pos.z,&(char_id as i32),&(station as i32)]).await.map_err(travel_failed)?;
-    if moved != 1 || pilot != 1 {
-        return Err("Your active ship is no longer in that station.".into());
-    }
-    tx.execute(
-        r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-        &[&(char_id as i32), &(system as i32)],
-    )
-    .await
-    .map_err(travel_failed)?;
-    if let Some(fight) = &ship.fight {
-        inflight::write_vitals(&tx, ship.id, fight, false)
-            .await
-            .map_err(travel_failed)?;
-    }
-    tx.commit().await.map_err(travel_failed)
+    store.write(|tx| -> std::result::Result<(), transition::Failure> {
+        let in_system=tx.table("staStations").get_id(station).is_some_and(|s|s.int("solarSystemID")==Some(system));
+        let pilot=tx.table("character_").get_id(char_id).filter(|c|in_system && c.int("shipID")==Some(ship.id)
+            && c.int("stationID")==Some(station) && c.int("solarSystemID")==Some(system)).map(|c|c.id);
+        if crate::losses::pending::blocked_character(tx.db(),char_id).map_err(travel_failed)? {
+            return Err("Your station arrival is awaiting its final combat state. Try again shortly.".into());
+        }
+        let moved=tx.table("entity").get_id(ship.id).filter(|e|e.int("ownerID")==Some(char_id)
+            && e.int("locationID")==Some(station) && e.int("flag")==Some(4)).map(|e|e.id);
+        let (Some(pilot),Some(moved))=(pilot,moved) else {
+            return Err("Your active ship is no longer in that station.".into());
+        };
+        tx.update("character_",pilot,&[("stationID",StoreValue::Int(0))]).map_err(travel_failed)?;
+        tx.update("entity",moved,&[("locationID",StoreValue::Int(system)),("flag",StoreValue::Int(0)),
+            ("x",StoreValue::Float(ship.pos.x)),("y",StoreValue::Float(ship.pos.y)),("z",StoreValue::Float(ship.pos.z))]).map_err(travel_failed)?;
+        update_by_id(tx,"entity",char_id,&[("locationID",StoreValue::Int(system))]).map_err(travel_failed)?;
+        if let Some(fight) = &ship.fight {
+            inflight::write_vitals(tx, ship.id, fight, false).map_err(travel_failed)?;
+        }
+        Ok(())
+    }).map_err(|failure|failure.to_string())
 }
 
 #[cfg(test)]
 async fn persist_dock(
-    db_url: &str,
+    store: &Store,
     char_id: i64,
     from: i64,
     station: i64,
     ship: &Ship,
 ) -> std::result::Result<(i64, i64), String> {
-    let mut db = crate::db::connect(db_url).await.map_err(travel_failed)?;
-    let tx = db.transaction().await.map_err(travel_failed)?;
-    let place=tx.query_opt(r#"SELECT "constellationID","regionID" FROM "staStations" WHERE "stationID"=$1 AND "solarSystemID"=$2"#,&[&(station as i32),&(from as i32)]).await.map_err(travel_failed)?.ok_or_else(||"That station is not in this solar system.".to_string())?;
-    let pilot=tx.execute(r#"UPDATE "character_" SET "stationID"=$2,"constellationID"=$3,"regionID"=$4 WHERE "characterID"=$1 AND "shipID"=$5 AND "solarSystemID"=$6 AND COALESCE("stationID",0)=0"#,&[&(char_id as i32),&(station as i32),&place.get::<_,i32>(0),&place.get::<_,i32>(1),&(ship.id as i32),&(from as i32)]).await.map_err(travel_failed)?;
-    let moved=tx.execute(r#"UPDATE entity SET "locationID"=$2,flag=4 WHERE "itemID"=$1 AND "ownerID"=$3 AND "locationID"=$4"#,&[&(ship.id as i32),&(station as i32),&(char_id as i32),&(from as i32)]).await.map_err(travel_failed)?;
-    if moved != 1 || pilot != 1 {
-        return Err("Your ship is no longer available to dock.".into());
-    }
-    tx.execute(
-        r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-        &[&(char_id as i32), &(station as i32)],
-    )
-    .await
-    .map_err(travel_failed)?;
-    if let Some(fight) = &ship.fight {
-        inflight::write_vitals(&tx, ship.id, fight, true)
-            .await
-            .map_err(travel_failed)?;
-    }
-    tx.commit().await.map_err(travel_failed)?;
-    Ok((place.get::<_, i32>(0) as i64, place.get::<_, i32>(1) as i64))
+    store.write(|tx| -> std::result::Result<(i64, i64), transition::Failure> {
+        let place=tx.table("staStations").get_id(station).filter(|s|s.int("solarSystemID")==Some(from))
+            .map(|s|(s.int("constellationID").unwrap_or(0),s.int("regionID").unwrap_or(0)))
+            .ok_or("That station is not in this solar system.")?;
+        let pilot=tx.table("character_").get_id(char_id).filter(|c|c.int("shipID")==Some(ship.id)
+            && c.int("solarSystemID")==Some(from) && c.int("stationID").unwrap_or(0)==0).map(|c|c.id);
+        let moved=tx.table("entity").get_id(ship.id)
+            .filter(|e|e.int("ownerID")==Some(char_id) && e.int("locationID")==Some(from)).map(|e|e.id);
+        let (Some(pilot),Some(moved))=(pilot,moved) else {
+            return Err("Your ship is no longer available to dock.".into());
+        };
+        tx.update("character_",pilot,&[("stationID",StoreValue::Int(station)),
+            ("constellationID",StoreValue::Int(place.0)),("regionID",StoreValue::Int(place.1))]).map_err(travel_failed)?;
+        tx.update("entity",moved,&[("locationID",StoreValue::Int(station)),("flag",StoreValue::Int(4))]).map_err(travel_failed)?;
+        update_by_id(tx,"entity",char_id,&[("locationID",StoreValue::Int(station))]).map_err(travel_failed)?;
+        if let Some(fight) = &ship.fight {
+            inflight::write_vitals(tx, ship.id, fight, true).map_err(travel_failed)?;
+        }
+        Ok(place)
+    }).map_err(|failure|failure.to_string())
 }
 
 pub(super) fn publish_reconnect(world:&mut crate::world::WorldState,system:i64,loaded:Ship)->std::result::Result<(),&'static str> {
@@ -979,18 +821,17 @@ async fn reconnect_ship(
     system: i64,
 ) -> std::result::Result<Ship, String> {
     let saved = ctx
-        .db
-        .query_opt(
-            r#"SELECT x,y,z FROM entity WHERE "itemID"=$1 AND "ownerID"=$2 AND "locationID"=$3"#,
-            &[&(ship_id as i32), &(char_id as i32), &(system as i32)],
-        )
-        .await
-        .map_err(travel_failed)?
+        .store
+        .read(|db| {
+            db.table("entity").get_id(ship_id)
+                .filter(|e| e.int("ownerID") == Some(char_id) && e.int("locationID") == Some(system))
+                .map(|e| [e.float("x"), e.float("y"), e.float("z")].map(|v| v.unwrap_or(f64::NAN)))
+        })
         .ok_or_else(|| "Your active ship is no longer in this solar system.".to_string())?;
     let mut ship = inflight::ship_for_space(ctx, char_id, ship_id)
         .await
         .ok_or_else(|| "Your ship could not be loaded.".to_string())?;
-    ship.pos = Vec3::new(saved.get(0), saved.get(1), saved.get(2));
+    ship.pos = Vec3::new(saved[0], saved[1], saved[2]);
     if !ship.pos.x.is_finite() || !ship.pos.y.is_finite() || !ship.pos.z.is_finite() {
         return Err("Your ship's saved position is invalid.".into());
     }
@@ -1000,7 +841,7 @@ async fn reconnect_ship(
 
 #[cfg(test)]
 async fn persist_relocation(
-    db_url: &str,
+    store: &Store,
     char_id: i64,
     from_system: i64,
     from_station: Option<i64>,
@@ -1010,28 +851,27 @@ async fn persist_relocation(
     region: i64,
     ship: &Ship,
 ) -> std::result::Result<(), String> {
-    let mut db = crate::db::connect(db_url).await.map_err(travel_failed)?;
-    let tx = db.transaction().await.map_err(travel_failed)?;
     let destination = station.unwrap_or(system);
     let source = from_station.unwrap_or(from_system);
-    let flag = if station.is_some() { 4_i32 } else { 0 };
-    let pilot=tx.execute(r#"UPDATE "character_" SET "stationID"=$2,"solarSystemID"=$3,"constellationID"=$4,"regionID"=$5 WHERE "characterID"=$1 AND "shipID"=$6 AND "solarSystemID"=$7 AND COALESCE("stationID",0)=$8"#,&[&(char_id as i32),&(station.unwrap_or(0) as i32),&(system as i32),&(constellation as i32),&(region as i32),&(ship.id as i32),&(from_system as i32),&(from_station.unwrap_or(0) as i32)]).await.map_err(travel_failed)?;
-    let moved=tx.execute(r#"UPDATE entity SET "locationID"=$2,flag=$3,x=$4,y=$5,z=$6 WHERE "itemID"=$1 AND "ownerID"=$7 AND "locationID"=$8"#,&[&(ship.id as i32),&(destination as i32),&flag,&ship.pos.x,&ship.pos.y,&ship.pos.z,&(char_id as i32),&(source as i32)]).await.map_err(travel_failed)?;
-    if moved != 1 || pilot != 1 {
-        return Err("Your active ship has moved and cannot be relocated.".into());
-    }
-    tx.execute(
-        r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-        &[&(char_id as i32), &(destination as i32)],
-    )
-    .await
-    .map_err(travel_failed)?;
-    if let Some(fight) = &ship.fight {
-        inflight::write_vitals(&tx, ship.id, fight, station.is_some())
-            .await
-            .map_err(travel_failed)?;
-    }
-    tx.commit().await.map_err(travel_failed)
+    let flag = if station.is_some() { 4 } else { 0 };
+    store.write(|tx| -> std::result::Result<(), transition::Failure> {
+        let pilot=tx.table("character_").get_id(char_id).filter(|c|c.int("shipID")==Some(ship.id)
+            && c.int("solarSystemID")==Some(from_system) && c.int("stationID").unwrap_or(0)==from_station.unwrap_or(0)).map(|c|c.id);
+        let moved=tx.table("entity").get_id(ship.id)
+            .filter(|e|e.int("ownerID")==Some(char_id) && e.int("locationID")==Some(source)).map(|e|e.id);
+        let (Some(pilot),Some(moved))=(pilot,moved) else {
+            return Err("Your active ship has moved and cannot be relocated.".into());
+        };
+        tx.update("character_",pilot,&[("stationID",StoreValue::Int(station.unwrap_or(0))),("solarSystemID",StoreValue::Int(system)),
+            ("constellationID",StoreValue::Int(constellation)),("regionID",StoreValue::Int(region))]).map_err(travel_failed)?;
+        tx.update("entity",moved,&[("locationID",StoreValue::Int(destination)),("flag",StoreValue::Int(flag)),
+            ("x",StoreValue::Float(ship.pos.x)),("y",StoreValue::Float(ship.pos.y)),("z",StoreValue::Float(ship.pos.z))]).map_err(travel_failed)?;
+        update_by_id(tx,"entity",char_id,&[("locationID",StoreValue::Int(destination))]).map_err(travel_failed)?;
+        if let Some(fight) = &ship.fight {
+            inflight::write_vitals(tx, ship.id, fight, station.is_some()).map_err(travel_failed)?;
+        }
+        Ok(())
+    }).map_err(|failure|failure.to_string())
 }
 
 /// Test-only lower-level persistence harness. Production drive/portal travel
@@ -1041,7 +881,7 @@ async fn persist_relocation(
 /// original curve; fuel and all persisted arrival state roll back together.
 #[cfg(test)]
 async fn complete_paid_jump(
-    db_url: &str,
+    store: &Store,
     char_id: i64,
     ship: &mut Ship,
     arrival: &JumpArrival,
@@ -1061,7 +901,7 @@ async fn complete_paid_jump(
     }
     let capacitor = ship.fight.as_ref().map(|f| f.vitals.capacitor.at(now));
     match persist_jump_state_guarded(
-        db_url,
+        store,
         char_id,
         ship.id,
         arrival,
@@ -1120,9 +960,7 @@ impl Conn {
                 .send_error(req, custom_error("That character is not on this account."))
                 .await;
         }
-        let mut lifecycle_db = crate::db::connect(&self.server.db_url).await?;
-        let lifecycle = lifecycle_db.transaction().await?;
-        if !crate::svc::login::lock_character_lifecycle(&lifecycle, char_id as i32).await? {
+        if !self.server.store.read(|db| db.table("character_").get_id(char_id).is_some()) {
             return self
                 .send_error(req, custom_error("That character is not on this account."))
                 .await;
@@ -1139,25 +977,15 @@ impl Conn {
         }
         let before = self.session.clone();
 
-        let sql = r#"SELECT c."characterID", c."stationID", c."solarSystemID",
-                            c."constellationID", c."regionID", c."shipID",
-                            c."characterName", c."typeID"
-                       FROM "character_" c
-                      WHERE c."characterID" = $1 AND c."accountID" = $2"#;
         let user_id = self.session.user_id.unwrap_or(0);
-        let rows = match self
-            .db
-            .query(sql, &[&(char_id as i32), &(user_id as i32)])
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                error!("loading character {char_id}: {}", crate::logging::chain(&e));
-                let err = custom_error("That character could not be loaded.");
-                return self.send_error(req, err).await;
-            }
-        };
-        let Some(row) = rows.first() else {
+        let row = self.server.store.read(|db| {
+            db.table("character_").get_id(char_id).filter(|c| c.int("accountID") == Some(user_id)).map(|c| {
+                let opt = |column: &str| c.int(column);
+                (opt("stationID"), opt("solarSystemID"), opt("constellationID"), opt("regionID"), opt("shipID"),
+                    c.text("characterName").map(String::from), opt("typeID"))
+            })
+        });
+        let Some((station_id, solar_system_id, constellation_id, region_id, ship, char_name, char_type_id)) = row else {
             warn!("character {char_id} is not on account {user_id}");
             let err = custom_error("That character is not on this account.");
             return self.send_error(req, err).await;
@@ -1167,23 +995,21 @@ impl Conn {
             || crate::travel::blocked_character_in_memory(&self.server.world,char_id)
             || crate::svc::jumps::portal::blocked_character_in_memory(&self.server.world,char_id)
             || crate::conn::logout::blocked_character_in_memory(&self.server.world,char_id)
-            || crate::losses::pending::blocked_character(&*self.db,char_id).await? {
+            || self.server.store.read(|db|crate::losses::pending::blocked_character(db,char_id))? {
             return self.send_error(req,custom_error("That character's station arrival is awaiting its final combat state. Try again shortly.")).await;
         }
 
-        let opt = |i: usize| crate::svc::rows::int(row, i);
         self.session.char_id = Some(char_id);
-        self.session.char_name = crate::svc::rows::text(row, 6).unwrap_or_default();
-        self.session.char_type_id = opt(7).unwrap_or(0);
-        self.session.station_id = opt(1).filter(|id| *id > 0);
-        self.session.solar_system_id = opt(2);
-        self.session.constellation_id = opt(3);
-        self.session.region_id = opt(4);
-        self.session.solar_system_id2 = opt(2);
+        self.session.char_name = char_name.unwrap_or_default();
+        self.session.char_type_id = char_type_id.unwrap_or(0);
+        self.session.station_id = station_id.filter(|id| *id > 0);
+        self.session.solar_system_id = solar_system_id;
+        self.session.constellation_id = constellation_id;
+        self.session.region_id = region_id;
+        self.session.solar_system_id2 = solar_system_id;
         if self.session.station_id.is_some() {
             self.session.solar_system_id = None;
         }
-        let ship = opt(5);
         self.session.ship_id = match self.session.station_id {
             Some(station) => self.resolve_active_ship(char_id, station).await,
             None => ship,
@@ -1214,7 +1040,6 @@ impl Conn {
         }
 
         self.send_session_change_from(&before).await?;
-        lifecycle.commit().await?;
         info!(
             corp = ?self.session.corp_id,
             station = ?self.session.station_id,
@@ -1265,11 +1090,11 @@ impl Conn {
         ship.vel = heading * ship.stats.max_velocity;
 
         if let Some(char_id) = self.session.char_id {
-            crate::svc::pvptrade::left_station(&self.server.db_url, &self.server.world, char_id)
+            crate::svc::pvptrade::left_station(&self.server.store, &self.server.world, char_id)
                 .await;
         }
         if let Err(reason) =
-            persist_undock(&self.server.db_url, char_id, station_id, system_id, &ship).await
+            persist_undock(&self.server.store, char_id, station_id, system_id, &ship).await
         {
             return self.send_error(req, custom_error(&reason)).await;
         }
@@ -1366,9 +1191,7 @@ impl Conn {
         // A player-owned station may turn some pilots away.
         const SERVICE_DOCKING: i64 = 2_097_152;
         if let Some(char_id) = self.session.char_id {
-            if !crate::svc::outposts::may_use(&*self.db, station_id, SERVICE_DOCKING, char_id)
-                .await
-            {
+            if !self.server.store.read(|db| crate::svc::outposts::may_use(db, station_id, SERVICE_DOCKING, char_id)) {
                 return self
                     .send_error(
                         req,
@@ -1644,7 +1467,7 @@ impl Conn {
             "ship {ship_id} jumped from gate {from_gate} in {system_id} to gate {to_gate} in {}",
             jump.solar_system_id
         );
-        if let Err(error) = crate::svc::map::record_activity(&self.db, system_id, 1).await {
+        if let Err(error) = crate::svc::map::record_activity(&self.server.store, system_id, 1).await {
             warn!("recording gate jump: {}", crate::logging::chain(&error));
         }
         self.reply(req, &Value::None).await
@@ -1827,21 +1650,16 @@ impl Conn {
         let Some(ship_id) = self.session.ship_id else {
             return self.reply(req, &Value::None).await;
         };
-        let place = self
-            .db
-            .query_opt(r#"SELECT "constellationID", "regionID" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#, &[&(to as i32)])
-            .await
-            .ok()
-            .flatten();
-        let Some(place) = place else {
+        let place = self.server.store.read(|db| {
+            db.table("mapSolarSystems")
+                .get_id(to)
+                .map(|s| (s.int("constellationID").unwrap_or(0), s.int("regionID").unwrap_or(0)))
+        });
+        let Some((constellation, region)) = place else {
             return self
                 .send_error(req, custom_error("That system does not exist."))
                 .await;
         };
-        let (constellation, region) = (
-            crate::svc::rows::int(&place, 0).unwrap_or(0),
-            crate::svc::rows::int(&place, 1).unwrap_or(0),
-        );
         space::ensure_park(&self.ctx(), to).await;
         {
             let world = self.server.world.lock();
@@ -1868,7 +1686,7 @@ impl Conn {
         let session=self.session.clone();
         let client=self.client_id;
         let arrival_fx=in_fx.to_string();
-        // Own the payment/publication future: cancellation while PostgreSQL
+        // Own the payment/publication future: cancellation after the payment
         // commits must still publish its accepted arrival exactly once.
         let result=tokio::spawn(async move {
             departure::reserved::run(&server,&session,client,request,&arrival,&jump,&arrival_fx).await
@@ -1890,7 +1708,7 @@ impl Conn {
         self.session.region_id = Some(arrived.place.region);
         self.session.ship_id = Some(arrived.ship_id);
         self.send_session_change_from(&before).await?;
-        if let Err(error) = crate::svc::map::record_activity(&self.db, from, 1).await {
+        if let Err(error) = crate::svc::map::record_activity(&self.server.store, from, 1).await {
             warn!("recording drive jump: {}", crate::logging::chain(&error));
         }
         info!("ship {ship_id} jumped from {from} to {to} without a gate");
@@ -1920,7 +1738,6 @@ impl Conn {
 
     /// A session move the world decided on: the ship blew up, or the capsule did.
     pub(super) async fn forced_move(&mut self, m: Move) -> Result {
-        self.refresh_database().await?;
         if matches!(
             m,
             Move::ShipLost { .. }
@@ -2082,65 +1899,51 @@ impl Conn {
     /// Reads the character's corporation, its alliance and HQ, and the
     /// character's roles in it into the session.
     async fn load_affiliation(&mut self, char_id: i64) {
-        const SQL: &str = r#"
-            SELECT c."corporationID", co."allianceID", co."stationID",
-                   COALESCE(r."rolesAtAll", 0), COALESCE(r."rolesAtHQ", 0),
-                   COALESCE(r."rolesAtBase", 0), COALESCE(r."rolesAtOther", 0), c."corpAccountKey"
-              FROM "character_" c
-              LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
-              LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
-             WHERE c."characterID" = $1"#;
-        let row = match self.db.query_opt(SQL, &[&(char_id as i32)]).await {
-            Ok(Some(row)) => row,
-            Ok(None) => return,
-            Err(e) => {
-                error!(
-                    "loading the corporation of {char_id}: {}",
-                    crate::logging::chain(&e)
-                );
-                return;
-            }
-        };
-        let opt = |i: usize| crate::svc::rows::int(&row, i);
+        let row = self.server.store.read(|db| {
+            let c = db.table("character_").get_id(char_id)?;
+            let corp_id = c.int("corporationID");
+            let corp = corp_id.and_then(|id| db.table("corporation").get_id(id));
+            let roles = db.table("chrCorporationRoles").get_id(char_id);
+            let role = |column: &str| roles.and_then(|r| r.int(column)).unwrap_or(0);
+            Some((
+                corp_id,
+                corp.and_then(|co| co.int("allianceID")),
+                corp.and_then(|co| co.int("stationID")),
+                [role("rolesAtAll"), role("rolesAtHQ"), role("rolesAtBase"), role("rolesAtOther")],
+                c.int("corpAccountKey"),
+            ))
+        });
+        let Some((corp_id, alliance_id, hq_id, [at_all, at_hq, at_base, at_other], account_key)) = row else { return };
         let s = &mut self.session;
-        s.corp_id = opt(0);
-        s.alliance_id = opt(1).filter(|v| *v != 0);
-        s.hq_id = opt(2).filter(|v| *v != 0);
+        s.corp_id = corp_id;
+        s.alliance_id = alliance_id.filter(|v| *v != 0);
+        s.hq_id = hq_id.filter(|v| *v != 0);
         s.base_id = s.hq_id;
-        s.roles_at_all = opt(3).unwrap_or(0);
-        s.roles_at_hq = opt(4).unwrap_or(0);
-        s.roles_at_base = opt(5).unwrap_or(0);
-        s.roles_at_other = opt(6).unwrap_or(0);
-        s.corp_account_key = opt(7).and_then(|key|i32::try_from(key).ok()).filter(|key|crate::svc::wallet::can_take(s.corp_role(),*key)).or(Some(1000));
+        s.roles_at_all = at_all;
+        s.roles_at_hq = at_hq;
+        s.roles_at_base = at_base;
+        s.roles_at_other = at_other;
+        s.corp_account_key = account_key.and_then(|key|i32::try_from(key).ok()).filter(|key|crate::svc::wallet::can_take(s.corp_role(),*key)).or(Some(1000));
     }
 
     /// Pick the character's ship in `station_id` (preferring the recorded one) and
     /// store it as their active ship.
     async fn resolve_active_ship(&self, char_id: i64, station_id: i64) -> Option<i64> {
-        const SQL: &str = r#"
-            WITH candidate AS (
-                SELECT e."itemID"
-                  FROM entity e
-                  JOIN "invTypes"  t ON t."typeID"  = e."typeID"
-                  JOIN "invGroups" g ON g."groupID" = t."groupID"
-                 WHERE e."ownerID"    = $1
-                   AND e."locationID" = $2
-                   AND g."categoryID" = 6
-                   AND e."singleton"  = 1
-                 ORDER BY (e."itemID" = (SELECT c."shipID" FROM "character_" c
-                                          WHERE c."characterID" = $1)) DESC,
-                          e."itemID"
-                 LIMIT 1
-            )
-            UPDATE "character_" SET "shipID" = (SELECT "itemID" FROM candidate)
-             WHERE "characterID" = $1
-             RETURNING "shipID""#;
-        match self
-            .db
-            .query_opt(SQL, &[&(char_id as i32), &(station_id as i32)])
-            .await
-        {
-            Ok(row) => row.and_then(|r| crate::svc::rows::int(&r, 0)),
+        let resolved = self.server.store.write(|tx| {
+            let Some(pilot) = tx.table("character_").get_id(char_id) else { return Ok(None) };
+            let (row, recorded) = (pilot.id, pilot.int("shipID"));
+            let ships = crate::sde::get().types_in_category(6);
+            let candidate = tx
+                .table("entity")
+                .find(&["ownerID", "locationID"], &[StoreValue::Int(char_id), StoreValue::Int(station_id)])
+                .filter(|e| e.int("singleton") == Some(1) && e.int("typeID").is_some_and(|t| ships.contains(&(t as i32))))
+                .filter_map(|e| e.int("itemID"))
+                .min_by_key(|id| (Some(*id) != recorded, *id));
+            tx.update("character_", row, &[("shipID", candidate.map_or(StoreValue::Null, StoreValue::Int))])?;
+            Ok::<_, StoreError>(candidate)
+        });
+        match resolved {
+            Ok(ship) => ship,
             Err(e) => {
                 error!(
                     "resolving the active ship for {char_id}: {}",

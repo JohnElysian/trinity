@@ -3,7 +3,8 @@ mod beacons;
 mod bots;
 mod cloak;
 mod complexes;
-mod schema;
+mod sde;
+mod store;
 mod bulkdata;
 mod combat;
 mod concord;
@@ -27,6 +28,7 @@ mod pos;
 mod services;
 mod session;
 mod sites;
+mod startup;
 mod static_entities;
 mod space_state;
 mod svc;
@@ -81,18 +83,22 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         })?;
     info!("string table: {} entries from {}", table.len(), config.strings.display());
 
-    let client = db::connect(&config.database).await.map_err(|e| {
-        format!("cannot reach PostgreSQL at {}: {}", config.database_redacted(), logging::chain(&e))
-    })?;
-    let accounts: i64 = client
-        .query_one(r#"SELECT count(*) FROM "account""#, &[])
-        .await
-        .map(|r| r.get(0))
-        .unwrap_or(0);
-    info!("database: {} ({accounts} accounts)", config.database_redacted());
-    let ids = db::sync_accounts(&client, &config.accounts)
-        .await
-        .map_err(|e| format!("setting up the config file's accounts: {}", logging::chain(&e)))?;
+    // The static data as compiled in; what it leaves unpriced is priced from
+    // the NPC market once the store is open.
+    let tables = sde::read()?;
+    let opened = Instant::now();
+    let store = Arc::new(store::Store::open(&config.data, || match &config.import {
+        Some(dump) => {
+            info!("store: starting from the PostgreSQL dump {}", dump.display());
+            store::from_dumps(&[store::read_dump(dump)?])
+        }
+        None => startup::fresh(&tables),
+    })?);
+    let accounts = store.read(|db| db.table("account").len());
+    info!("store: {} ({accounts} accounts) open in {:.1}s", config.data.display(), opened.elapsed().as_secs_f64());
+    let sde = sde::init(tables, &store)?;
+    startup::ensure(&store, sde.tables()).map_err(|e| format!("bringing the data up to date: {e}"))?;
+    let ids = db::sync_accounts(&store, &config.accounts).map_err(|e| format!("setting up the config file's accounts: {e}"))?;
     if !ids.is_empty() {
         info!("{} account(s) from the config file", ids.len());
     }
@@ -102,25 +108,21 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         auto_create_accounts: config.auto_create_accounts,
         jump_clone_min_standing: config.jump_clone_min_standing,
     });
-    schema::ensure(&client).await.map_err(|e| format!("bringing the database's tables up to date: {}", logging::chain(&e)))?;
     // Startup-only cleanup must finish before clients can create live trades.
-    // A recovered heartbeat connection must never repeat it.
-    svc::pvptrade::recover(&client).await;
+    svc::pvptrade::recover(&store);
 
     let started = Instant::now();
-    let bulk =
-        bulkdata::BulkData::load(&client, &table, config.node_id, bulkdata::filetime_now()).await?;
+    let bulk = bulkdata::BulkData::load(&store, &table, config.node_id, bulkdata::filetime_now())?;
     report_bulk(&bulk, started);
 
-    let dogma = dogma::Catalog::load(&client).await.map_err(|e| format!("loading dogma: {}", logging::chain(&e)))?;
+    let dogma = dogma::Catalog::new();
 
     let services = svc::registry();
     info!("{} services registered", services.len());
 
     let server = Arc::new(Server {
         table,
-        db: db::Shared::new(client,config.database.clone()),
-        db_url: config.database.clone(),
+        store: Arc::clone(&store),
         node_id: config.node_id,
         bulk,
         dogma,
@@ -138,18 +140,69 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&config.bind).await?;
     info!("listening on {} as node {}", config.bind, config.node_id);
 
+    tokio::spawn(checkpoints(Arc::clone(&store)));
+
     let mut seq = 0i64;
+    let mut stop = std::pin::pin!(shutdown());
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("accept failed: {err}", err = crate::logging::chain(&e));
-                continue;
-            }
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("accept failed: {err}", err = crate::logging::chain(&e));
+                    continue;
+                }
+            },
+            () = &mut stop => break,
         };
         let _ = stream.set_nodelay(true);
         seq += 1;
         tokio::spawn(Conn::new(stream, peer, Arc::clone(&server), seq).run());
+    }
+    info!("stopping: saving the data");
+    let saving = Arc::clone(&store);
+    tokio::task::spawn_blocking(move || {
+        saving.sync();
+        saving.checkpoint()
+    })
+    .await??;
+    info!("data saved to {}", config.data.display());
+    Ok(())
+}
+
+/// How often the data is snapshotted, so a start replays little of the log.
+const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+async fn checkpoints(store: Arc<store::Store>) {
+    let mut every = tokio::time::interval(CHECKPOINT_EVERY);
+    every.tick().await;
+    loop {
+        every.tick().await;
+        let store = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || store.checkpoint()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("snapshotting the data: {e}"),
+            Err(e) => error!("snapshotting the data: {e}"),
+        }
+    }
+}
+
+/// Ctrl-C, or (in a container) SIGTERM.
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return std::future::pending().await,
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

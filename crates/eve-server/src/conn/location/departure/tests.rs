@@ -5,72 +5,92 @@ use crate::{
     ballpark::{Park, Vec3},
     beacons::{Beacon, Kind},
     session::Session,
+    store::Value as StoreValue,
     test_support::Database,
 };
+
+fn int(v: i64) -> StoreValue {
+    StoreValue::Int(v)
+}
+
+/// INSERT one fixture row.
+fn insert(db: &Database, table: &str, sets: &[(&str, StoreValue)]) {
+    db.store.write(|tx| tx.insert(table, sets).map(|_| ())).unwrap();
+}
+
+/// UPDATE the row with primary key `key`.
+fn update(db: &Database, table: &str, key: &[StoreValue], sets: &[(&str, StoreValue)]) {
+    db.store
+        .write(|tx| {
+            let row = tx.table(table).get(key).unwrap().id;
+            tx.update(table, row, sets)
+        })
+        .unwrap();
+}
 
 struct Fixture {
     db: Database,
     session: Session,
     ship: Ship,
-    fuel: i32,
+    fuel: i64,
     beacon: i64,
     member: i64,
-    corp: i32,
+    corp: i64,
 }
 impl Fixture {
     async fn server(&self)->crate::conn::Server {
-        let db=crate::db::connect(&self.db.url).await.unwrap();
-        let dogma=crate::dogma::Catalog::load(&db).await.unwrap();
-        crate::conn::Server {table:Default::default(),db:crate::db::Shared::new(db,self.db.url.clone()),db_url:self.db.url.clone(),
+        let dogma=crate::dogma::Catalog::new();
+        crate::conn::Server {table:Default::default(),store:self.db.store.clone(),
             node_id:1,bulk:crate::bulkdata::BulkData {entries:Default::default(),node_id:1},dogma,
             world:self.db.world.clone(),services:crate::svc::registry(),dump_dir:Default::default(),alliance_join_delay_secs:0,sov_claim_delay_secs:0}
     }
     async fn new() -> Self {
         let db = Database::load().await;
-        let pilot = db.id().await;
-        let hull = db.id().await;
-        let fuel = db.id().await;
-        let corp = db.id().await;
-        let beacon = db.id().await;
-        let member = db.id().await;
-        let alliance = db.id().await;
-        db.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName","allianceID") VALUES ($1,$2,$3)"#,&[&corp,&format!("Departure corp {corp}"),&alliance]).await.unwrap();
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","corporationID","shipID","solarSystemID","stationID")
-            VALUES ($1,$2,$3,$4,30000142,0)"#,&[&pilot,&format!("Departure pilot {pilot}"),&corp,&hull]).await.unwrap();
+        let pilot = i64::from(db.id().await);
+        let hull = i64::from(db.id().await);
+        let fuel = i64::from(db.id().await);
+        let corp = i64::from(db.id().await);
+        let beacon = i64::from(db.id().await);
+        let member = i64::from(db.id().await);
+        let alliance = i64::from(db.id().await);
+        insert(&db, "corporation", &[("corporationID", int(corp)), ("corporationName", StoreValue::Text(format!("Departure corp {corp}").into())),
+            ("allianceID", int(alliance))]);
+        insert(&db, "character_", &[("characterID", int(pilot)), ("characterName", StoreValue::Text(format!("Departure pilot {pilot}").into())),
+            ("corporationID", int(corp)), ("shipID", int(hull)), ("solarSystemID", int(30000142)), ("stationID", int(0))]);
         for (id, ty, location, quantity, flag, singleton) in
             [(hull, 587, 30000142, 1, 0, 1), (fuel, 16273, hull, 8, 5, 0)]
         {
-            db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,flag,singleton) VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
-                &[&id,&ty,&pilot,&location,&quantity,&flag,&singleton]).await.unwrap();
+            insert(&db, "entity", &[("itemID", int(id)), ("typeID", int(ty)), ("ownerID", int(pilot)), ("locationID", int(location)),
+                ("quantity", int(quantity)), ("flag", int(flag)), ("singleton", int(singleton))]);
         }
         let session = Session {
-            char_id: Some(pilot as i64),
-            ship_id: Some(hull as i64),
-            corp_id: Some(corp as i64),
-            alliance_id: Some(alliance as i64),
+            char_id: Some(pilot),
+            ship_id: Some(hull),
+            corp_id: Some(corp),
+            alliance_id: Some(alliance),
             solar_system_id: Some(30000142),
             ..Default::default()
         };
-        let mut ship = inflight::ship_for_space(&db.ctx(&session), pilot as i64, hull as i64)
+        let mut ship = inflight::ship_for_space(&db.ctx(&session), pilot, hull)
             .await
             .unwrap();
         ship.fight.as_mut().unwrap().vitals.capacitor =
             crate::combat::Charged::full(1000.0, 0.0, crate::combat::now_ms());
         let mut source = Park::new(30000142, vec![], destiny::tick_now());
-        source.ships.insert(hull as i64, ship.clone());
+        source.ships.insert(hull, ship.clone());
         let mut dest = Park::new(30000143, vec![], destiny::tick_now());
         dest.beacons.insert(
-            beacon as i64,
+            beacon,
             Beacon::new(
-                beacon as i64,
+                beacon,
                 21094,
-                Some(member as i64),
+                Some(member),
                 "Test field",
                 Vec3::ZERO,
                 1000.0,
                 Kind::Cyno {
-                    char_id: member as i64,
-                    ship_id: member as i64 + 1,
+                    char_id: member,
+                    ship_id: member + 1,
                 },
             ),
         );
@@ -78,15 +98,15 @@ impl Fixture {
             let mut w = db.world.lock();
             w.parks.insert(30000142, source);
             w.parks.insert(30000143, dest);
-            w.gangs.test_members(vec![pilot as i64, member as i64]);
+            w.gangs.test_members(vec![pilot, member]);
         }
         Self {
             db,
             session,
             ship,
             fuel,
-            beacon: beacon as i64,
-            member: member as i64,
+            beacon,
+            member,
             corp,
         }
     }
@@ -121,18 +141,19 @@ impl Fixture {
             clients: vec![1],
         }
     }
+    /// The pilot's system, its active ship's location and the fuel left.
+    fn saved(&self) -> (Option<i64>, Option<i64>, Option<i64>, Vec3) {
+        self.db.store.read(|db| {
+            let c = db.table("character_").get_id(self.ship.pilot.char_id).unwrap();
+            let e = db.table("entity").get_id(c.int("shipID").unwrap()).unwrap();
+            let fuel = db.table("entity").get_id(self.fuel).unwrap();
+            let at = |column: &str| e.float(column).unwrap();
+            (c.int("solarSystemID"), e.int("locationID"), fuel.int("quantity"), Vec3::new(at("x"), at("y"), at("z")))
+        })
+    }
     async fn unchanged(&self, ship: &Ship) {
-        let row=self.db.db.query_one(r#"SELECT c."solarSystemID",e."locationID",f.quantity FROM "character_" c
-            JOIN entity e ON e."itemID"=c."shipID" JOIN entity f ON f."itemID"=$2 WHERE c."characterID"=$1"#,
-            &[&(self.ship.pilot.char_id as i32),&self.fuel]).await.unwrap();
-        assert_eq!(
-            (
-                row.get::<_, i32>(0),
-                row.get::<_, i32>(1),
-                row.get::<_, i32>(2)
-            ),
-            (30000142, 30000142, 8)
-        );
+        let (system, location, fuel, _) = self.saved();
+        assert_eq!((system, location, fuel), (Some(30000142), Some(30000142), Some(8)));
         assert_eq!(
             ship.fight
                 .as_ref()
@@ -146,8 +167,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-#[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-async fn field_extinguishing_during_payment_wait_rolls_back_location_fuel_and_capacitor() {
+async fn field_extinguishing_before_payment_rolls_back_location_fuel_and_capacitor() {
     let f = Fixture::new().await;
     f.db.world.lock().maintenance.insert(
         f.ship.id,
@@ -162,47 +182,27 @@ async fn field_extinguishing_during_payment_wait_rolls_back_location_fuel_and_ca
         beacon: f.beacon,
     });
     space::remove_ship(&mut f.db.world.lock(), 30000142, f.ship.id).unwrap();
-    let blocker = crate::db::connect(&f.db.url).await.unwrap();
-    blocker.batch_execute("BEGIN").await.unwrap();
-    blocker
-        .query_one(
-            r#"SELECT 1 FROM entity WHERE "itemID"=$1 FOR UPDATE"#,
-            &[&f.fuel],
-        )
-        .await
-        .unwrap();
-    let pid = blocker
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get::<_, i32>(0);
     let mut ship = f.ship.clone();
     let arrival = f.arrival();
     let quote = f.quote();
-    let (result, ()) = tokio::join!(
-        complete_paid_jump(
-            &f.db.url,
-            ship.pilot.char_id,
-            &mut ship,
-            &arrival,
-            &quote,
-            Some(&guard)
-        ),
-        async {
-            tokio::time::timeout(Duration::from_secs(10),async {loop {
-            if f.db.db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",&[&pid]).await.unwrap().get::<_,bool>(0) {break;}
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }}).await.unwrap();
-            f.db.world
-                .lock()
-                .parks
-                .get_mut(&30000143)
-                .unwrap()
-                .beacons
-                .remove(&f.beacon);
-            blocker.batch_execute("COMMIT").await.unwrap();
-        }
-    );
+    // The field goes out after the departure was captured, before its
+    // payment is written: the live recheck in that write refuses it.
+    f.db.world
+        .lock()
+        .parks
+        .get_mut(&30000143)
+        .unwrap()
+        .beacons
+        .remove(&f.beacon);
+    let result = complete_paid_jump(
+        &f.db.store,
+        ship.pilot.char_id,
+        &mut ship,
+        &arrival,
+        &quote,
+        Some(&guard),
+    )
+    .await;
     assert!(result.unwrap_err().contains("gone out"));
     f.unchanged(&ship).await;
     restore_departure(&mut f.db.world.lock(), 30000142, ship, guard.configuration);
@@ -223,30 +223,16 @@ async fn field_extinguishing_during_payment_wait_rolls_back_location_fuel_and_ca
 }
 
 #[tokio::test]
-#[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-async fn fixed_beacon_state_and_alliance_are_locked_and_rechecked_before_payment() {
+async fn fixed_beacon_state_and_alliance_are_rechecked_before_payment() {
     let f = Fixture::new().await;
-    let ty =
-        f.db.db
-            .query_one(
-                r#"SELECT "typeID" FROM "invTypes" WHERE "groupID"=838 ORDER BY "typeID" LIMIT 1"#,
-                &[],
-            )
-            .await
-            .unwrap()
-            .get::<_, i32>(0);
-    f.db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,flag,singleton) VALUES ($1,$2,$3,30000143,1,0,1)"#,&[&(f.beacon as i32),&ty,&f.corp]).await.unwrap();
-    f.db.db
-        .execute(
-            r#"INSERT INTO "posStructures" ("itemID",state) VALUES ($1,1)"#,
-            &[&(f.beacon as i32)],
-        )
-        .await
-        .unwrap();
+    let ty = i64::from(crate::sde::get().types_in_group(838)[0]);
+    insert(&f.db, "entity", &[("itemID", int(f.beacon)), ("typeID", int(ty)), ("ownerID", int(f.corp)), ("locationID", int(30000143)),
+        ("quantity", int(1)), ("flag", int(0)), ("singleton", int(1))]);
+    insert(&f.db, "posStructures", &[("itemID", int(f.beacon)), ("state", int(1))]);
     let guard = f.capture(JumpRequest::Alliance { beacon: f.beacon });
     let mut ship = f.ship.clone();
     assert!(complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &f.arrival(),
@@ -257,22 +243,10 @@ async fn fixed_beacon_state_and_alliance_are_locked_and_rechecked_before_payment
     .unwrap_err()
     .contains("online"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"UPDATE "posStructures" SET state=4 WHERE "itemID"=$1"#,
-            &[&(f.beacon as i32)],
-        )
-        .await
-        .unwrap();
-    f.db.db
-        .execute(
-            r#"UPDATE corporation SET "allianceID"=0 WHERE "corporationID"=$1"#,
-            &[&f.corp],
-        )
-        .await
-        .unwrap();
+    update(&f.db, "posStructures", &[int(f.beacon)], &[("state", int(4))]);
+    update(&f.db, "corporation", &[int(f.corp)], &[("allianceID", int(0))]);
     assert!(complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &f.arrival(),
@@ -283,15 +257,9 @@ async fn fixed_beacon_state_and_alliance_are_locked_and_rechecked_before_payment
     .unwrap_err()
     .contains("alliance"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"UPDATE corporation SET "allianceID"=$2 WHERE "corporationID"=$1"#,
-            &[&f.corp, &(f.session.alliance_id.unwrap() as i32)],
-        )
-        .await
-        .unwrap();
+    update(&f.db, "corporation", &[int(f.corp)], &[("allianceID", int(f.session.alliance_id.unwrap()))]);
     complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &f.arrival(),
@@ -309,42 +277,13 @@ async fn fixed_beacon_state_and_alliance_are_locked_and_rechecked_before_payment
             .at(crate::combat::now_ms()),
         900.0
     );
-    let fuel =
-        f.db.db
-            .query_one(
-                r#"SELECT quantity FROM entity WHERE "itemID"=$1"#,
-                &[&f.fuel],
-            )
-            .await
-            .unwrap()
-            .get::<_, i32>(0);
-    assert_eq!(fuel, 5);
+    assert_eq!(f.saved().2, Some(5));
 }
 
-async fn wait_for_lock(db: &tokio_postgres::Client, pid: i32) {
-    tokio::time::timeout(Duration::from_secs(15),async {loop {
-        db.query_one("SELECT pg_stat_clear_snapshot()",&[]).await.unwrap();
-        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",&[&pid]).await.unwrap().get::<_,bool>(0) {break;}
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }}).await.expect("departure reaches the held endpoint or payment lock");
-}
-
-async fn arrived(f: &Fixture, ship: &Ship, capacitor: f64) {
-    let row=f.db.db.query_one(r#"SELECT c."solarSystemID",e."locationID",e.x,e.y,e.z,f.quantity
-        FROM "character_" c JOIN entity e ON e."itemID"=c."shipID" JOIN entity f ON f."itemID"=$2 WHERE c."characterID"=$1"#,
-        &[&(f.ship.pilot.char_id as i32),&f.fuel]).await.unwrap();
-    assert_eq!(
-        (
-            row.get::<_, i32>(0),
-            row.get::<_, i32>(1),
-            row.get::<_, i32>(5)
-        ),
-        (30000143, 30000143, 5)
-    );
-    assert_eq!(
-        Vec3::new(row.get(2), row.get(3), row.get(4)),
-        f.arrival().at
-    );
+fn arrived(f: &Fixture, ship: &Ship, capacitor: f64) {
+    let (system, location, fuel, at) = f.saved();
+    assert_eq!((system, location, fuel), (Some(30000143), Some(30000143), Some(5)));
+    assert_eq!(at, f.arrival().at);
     assert_eq!(
         ship.fight
             .as_ref()
@@ -357,36 +296,34 @@ async fn arrived(f: &Fixture, ship: &Ship, capacitor: f64) {
 }
 
 #[tokio::test]
-#[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn portal_departure_rechecks_generator_harmonics_and_live_bridge_before_committing_payment() {
     let f = Fixture::new().await;
-    let host = f.db.id().await;
-    let hull = f.db.id().await;
-    let generator = f.db.id().await;
-    f.db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","corporationID","shipID","solarSystemID","stationID")
-        VALUES ($1,$2,$3,$4,30000142,0)"#,&[&host,&format!("Portal host {host}"),&f.corp,&hull]).await.unwrap();
+    let host = i64::from(f.db.id().await);
+    let hull = i64::from(f.db.id().await);
+    let generator = i64::from(f.db.id().await);
+    insert(&f.db, "character_", &[("characterID", int(host)), ("characterName", StoreValue::Text(format!("Portal host {host}").into())),
+        ("corporationID", int(f.corp)), ("shipID", int(hull)), ("solarSystemID", int(30000142)), ("stationID", int(0))]);
     for (id, ty, location, flag) in [(hull, 22428, 30000142, 0), (generator, 28652, hull, 27)] {
-        f.db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,$2,$3,$4,$5,1,1)"#,
-            &[&id,&ty,&host,&location,&flag]).await.unwrap();
+        insert(&f.db, "entity", &[("itemID", int(id)), ("typeID", int(ty)), ("ownerID", int(host)), ("locationID", int(location)),
+            ("flag", int(flag)), ("quantity", int(1)), ("singleton", int(1))]);
     }
-    f.db.db.execute(r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt") VALUES ($1,2,1),($2,1253,2)"#,
-        &[&generator,&(f.ship.id as i32)]).await.unwrap();
-    f.db.db.execute(r#"UPDATE entity SET "ownerID"=$2,"locationID"=$3 WHERE "itemID"=$1"#,
-        &[&f.fuel,&host,&hull]).await.unwrap();
+    insert(&f.db, "entity_attributes", &[("itemID", int(generator)), ("attributeID", int(2)), ("valueInt", int(1))]);
+    insert(&f.db, "entity_attributes", &[("itemID", int(f.ship.id)), ("attributeID", int(1253)), ("valueInt", int(2))]);
+    update(&f.db, "entity", &[int(f.fuel)], &[("ownerID", int(host)), ("locationID", int(hull))]);
     let host_session = Session {
-        char_id: Some(host as i64),
-        ship_id: Some(hull as i64),
+        char_id: Some(host),
+        ship_id: Some(hull),
         ..f.session.clone()
     };
     let mut host_ship =
-        inflight::ship_for_space(&f.db.ctx(&host_session), host as i64, hull as i64)
+        inflight::ship_for_space(&f.db.ctx(&host_session), host, hull)
             .await
             .unwrap();
     host_ship.pos = f.ship.pos;
     let bridge = Bridge {
         generation: 0, started_ms: 0,
-        titan_pilot: host as i64,
-        generator_id: generator as i64,
+        titan_pilot: host,
+        generator_id: generator,
         system: 30000142,
         to_system: 30000143,
         beacon: f.beacon,
@@ -401,68 +338,33 @@ async fn portal_departure_rechecks_generator_harmonics_and_live_bridge_before_co
             .get_mut(&30000142)
             .unwrap()
             .ships
-            .insert(hull as i64, host_ship);
-        w.bridges.insert(hull as i64, bridge.clone());
+            .insert(hull, host_ship);
+        w.bridges.insert(hull, bridge.clone());
         w.gangs=Default::default();
         w.gangs
-            .test_members(vec![f.ship.pilot.char_id, host as i64, f.member]);
+            .test_members(vec![f.ship.pilot.char_id, host, f.member]);
     }
     let guard = f.capture(JumpRequest::Portal {
-        pilot: host as i64,
-        ship: hull as i64,
+        pilot: host,
+        ship: hull,
         alliance: false,
     });
-    let blocker = crate::db::connect(&f.db.url).await.unwrap();
-    let pid = blocker
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get::<_, i32>(0);
-    blocker.batch_execute("BEGIN").await.unwrap();
-    blocker
-        .execute(
-            r#"UPDATE entity_attributes SET "valueInt"=0 WHERE "itemID"=$1 AND "attributeID"=2"#,
-            &[&generator],
-        )
-        .await
-        .unwrap();
+    let generator_online = |online: i64| update(&f.db, "entity_attributes", &[int(generator), int(2)], &[("valueInt", int(online))]);
+    let harmonics = |level: i64| update(&f.db, "entity_attributes", &[int(f.ship.id), int(1253)], &[("valueInt", int(level))]);
+    // The generator goes offline after the departure was captured.
+    generator_online(0);
     let mut ship = f.ship.clone();
     let arrival = f.arrival();
     let mut quote = f.quote();
-    quote.fuel.cargo = hull as i64;
+    quote.fuel.cargo = hull;
     quote.capacitor = 0.0;
-    let (result, ()) = tokio::join!(
-        complete_paid_jump(
-            &f.db.url,
-            ship.pilot.char_id,
-            &mut ship,
-            &arrival,
-            &quote,
-            Some(&guard)
-        ),
-        async {
-            wait_for_lock(&blocker, pid).await;
-            blocker.batch_execute("COMMIT").await.unwrap();
-        }
-    );
+    let result = complete_paid_jump(&f.db.store, ship.pilot.char_id, &mut ship, &arrival, &quote, Some(&guard)).await;
     assert!(result.unwrap_err().contains("online"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"UPDATE entity_attributes SET "valueInt"=1 WHERE "itemID"=$1 AND "attributeID"=2"#,
-            &[&generator],
-        )
-        .await
-        .unwrap();
-    f.db.db
-        .execute(
-            r#"UPDATE entity_attributes SET "valueInt"=0 WHERE "itemID"=$1 AND "attributeID"=1253"#,
-            &[&(ship.id as i32)],
-        )
-        .await
-        .unwrap();
+    generator_online(1);
+    harmonics(0);
     assert!(complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &arrival,
@@ -473,41 +375,15 @@ async fn portal_departure_rechecks_generator_harmonics_and_live_bridge_before_co
     .unwrap_err()
     .contains("harmonics"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"UPDATE entity_attributes SET "valueInt"=2 WHERE "itemID"=$1 AND "attributeID"=1253"#,
-            &[&(ship.id as i32)],
-        )
-        .await
-        .unwrap();
-    blocker.batch_execute("BEGIN").await.unwrap();
-    blocker
-        .query_one(
-            r#"SELECT 1 FROM entity WHERE "itemID"=$1 FOR UPDATE"#,
-            &[&f.fuel],
-        )
-        .await
-        .unwrap();
-    let (result, ()) = tokio::join!(
-        complete_paid_jump(
-            &f.db.url,
-            ship.pilot.char_id,
-            &mut ship,
-            &arrival,
-            &quote,
-            Some(&guard)
-        ),
-        async {
-            wait_for_lock(&blocker, pid).await;
-            f.db.world.lock().bridges.remove(&(hull as i64));
-            blocker.batch_execute("COMMIT").await.unwrap();
-        }
-    );
+    harmonics(2);
+    // The bridge closes after the departure was captured.
+    f.db.world.lock().bridges.remove(&hull);
+    let result = complete_paid_jump(&f.db.store, ship.pilot.char_id, &mut ship, &arrival, &quote, Some(&guard)).await;
     assert!(result.unwrap_err().contains("portal changed"));
     f.unchanged(&ship).await;
-    f.db.world.lock().bridges.insert(hull as i64, bridge);
+    f.db.world.lock().bridges.insert(hull, bridge);
     complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &arrival,
@@ -516,54 +392,32 @@ async fn portal_departure_rechecks_generator_harmonics_and_live_bridge_before_co
     )
     .await
     .unwrap();
-    arrived(&f, &ship, 1000.0).await;
+    arrived(&f, &ship, 1000.0);
 }
 
 #[tokio::test]
-#[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn array_departure_rechecks_remote_ownership_state_and_link_before_committing_payment() {
     let f = Fixture::new().await;
-    let local = f.db.id().await;
-    let remote = f.db.id().await;
-    let stranger = f.db.id().await;
-    let ty =
-        f.db.db
-            .query_one(
-                r#"SELECT "typeID" FROM "invTypes" WHERE "groupID"=707 ORDER BY "typeID" LIMIT 1"#,
-                &[],
-            )
-            .await
-            .unwrap()
-            .get::<_, i32>(0);
-    f.db.db
-        .execute(
-            r#"INSERT INTO corporation ("corporationID","corporationName") VALUES ($1,$2)"#,
-            &[&stranger, &format!("Unrelated array owner {stranger}")],
-        )
-        .await
-        .unwrap();
+    let local = i64::from(f.db.id().await);
+    let remote = i64::from(f.db.id().await);
+    let stranger = i64::from(f.db.id().await);
+    let ty = i64::from(crate::sde::get().types_in_group(707)[0]);
+    insert(&f.db, "corporation", &[("corporationID", int(stranger)),
+        ("corporationName", StoreValue::Text(format!("Unrelated array owner {stranger}").into()))]);
     for (id, system) in [(local, 30000142), (remote, 30000143)] {
-        f.db.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton,x,y,z) VALUES ($1,$2,$3,$4,0,1,1,$5,$6,$7)"#,
-            &[&id,&ty,&f.corp,&system,&f.ship.pos.x,&f.ship.pos.y,&f.ship.pos.z]).await.unwrap();
-        f.db.db
-            .execute(
-                r#"INSERT INTO "posStructures" ("itemID",state) VALUES ($1,4)"#,
-                &[&id],
-            )
-            .await
-            .unwrap();
+        insert(&f.db, "entity", &[("itemID", int(id)), ("typeID", int(ty)), ("ownerID", int(f.corp)), ("locationID", int(system)),
+            ("flag", int(0)), ("quantity", int(1)), ("singleton", int(1)),
+            ("x", StoreValue::Float(f.ship.pos.x)), ("y", StoreValue::Float(f.ship.pos.y)), ("z", StoreValue::Float(f.ship.pos.z))]);
+        insert(&f.db, "posStructures", &[("itemID", int(id)), ("state", int(4))]);
     }
-    f.db.db
-        .execute(
-            r#"INSERT INTO "jumpBridgeLinks" ("sourceID","destinationID") VALUES ($1,$2),($2,$1)"#,
-            &[&local, &remote],
-        )
-        .await
-        .unwrap();
-    f.db.db.execute(r#"UPDATE entity SET "ownerID"=$2,"locationID"=$3,flag=0 WHERE "itemID"=$1"#,
-        &[&f.fuel,&f.corp,&local]).await.unwrap();
+    let link = || {
+        insert(&f.db, "jumpBridgeLinks", &[("sourceID", int(local)), ("destinationID", int(remote))]);
+    };
+    link();
+    insert(&f.db, "jumpBridgeLinks", &[("sourceID", int(remote)), ("destinationID", int(local))]);
+    update(&f.db, "entity", &[int(f.fuel)], &[("ownerID", int(f.corp)), ("locationID", int(local)), ("flag", int(0))]);
     for system in [30000142, 30000143] {
-        let structures = crate::pos::load(&f.db.db, system).await.unwrap();
+        let structures = f.db.store.read(|db| crate::pos::load(db, system)).unwrap();
         let mut w = f.db.world.lock();
         let park = w.parks.get_mut(&system).unwrap();
         for structure in structures {
@@ -571,61 +425,24 @@ async fn array_departure_rechecks_remote_ownership_state_and_link_before_committ
         }
     }
     let guard = f.capture(JumpRequest::Structure {
-        local: local as i64,
-        remote: remote as i64,
+        local,
+        remote,
     });
-    let blocker = crate::db::connect(&f.db.url).await.unwrap();
-    let pid = blocker
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get::<_, i32>(0);
-    blocker.batch_execute("BEGIN").await.unwrap();
-    blocker
-        .execute(
-            r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,
-            &[&remote, &stranger],
-        )
-        .await
-        .unwrap();
+    // The remote array changes hands after the departure was captured.
+    update(&f.db, "entity", &[int(remote)], &[("ownerID", int(stranger))]);
     let mut ship = f.ship.clone();
     let arrival = f.arrival();
     let mut quote = f.quote();
-    quote.fuel.cargo = local as i64;
+    quote.fuel.cargo = local;
     quote.fuel.flag = None;
     quote.capacitor = 0.0;
-    let (result, ()) = tokio::join!(
-        complete_paid_jump(
-            &f.db.url,
-            ship.pilot.char_id,
-            &mut ship,
-            &arrival,
-            &quote,
-            Some(&guard)
-        ),
-        async {
-            wait_for_lock(&blocker, pid).await;
-            blocker.batch_execute("COMMIT").await.unwrap();
-        }
-    );
+    let result = complete_paid_jump(&f.db.store, ship.pilot.char_id, &mut ship, &arrival, &quote, Some(&guard)).await;
     assert!(result.unwrap_err().contains("same corporation"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,
-            &[&remote, &f.corp],
-        )
-        .await
-        .unwrap();
-    f.db.db
-        .execute(
-            r#"UPDATE "posStructures" SET state=1 WHERE "itemID"=$1"#,
-            &[&remote],
-        )
-        .await
-        .unwrap();
+    update(&f.db, "entity", &[int(remote)], &[("ownerID", int(f.corp))]);
+    update(&f.db, "posStructures", &[int(remote)], &[("state", int(1))]);
     assert!(complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &arrival,
@@ -636,22 +453,10 @@ async fn array_departure_rechecks_remote_ownership_state_and_link_before_committ
     .unwrap_err()
     .contains("online"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"UPDATE "posStructures" SET state=4 WHERE "itemID"=$1"#,
-            &[&remote],
-        )
-        .await
-        .unwrap();
-    f.db.db
-        .execute(
-            r#"DELETE FROM "jumpBridgeLinks" WHERE "sourceID"=$1"#,
-            &[&local],
-        )
-        .await
-        .unwrap();
+    update(&f.db, "posStructures", &[int(remote)], &[("state", int(4))]);
+    f.db.store.write(|tx| tx.delete_where("jumpBridgeLinks", &["sourceID"], &[int(local)])).unwrap();
     assert!(complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &arrival,
@@ -662,15 +467,9 @@ async fn array_departure_rechecks_remote_ownership_state_and_link_before_committ
     .unwrap_err()
     .contains("link"));
     f.unchanged(&ship).await;
-    f.db.db
-        .execute(
-            r#"INSERT INTO "jumpBridgeLinks" ("sourceID","destinationID") VALUES ($1,$2)"#,
-            &[&local, &remote],
-        )
-        .await
-        .unwrap();
+    link();
     complete_paid_jump(
-        &f.db.url,
+        &f.db.store,
         ship.pilot.char_id,
         &mut ship,
         &arrival,
@@ -679,5 +478,5 @@ async fn array_departure_rechecks_remote_ownership_state_and_link_before_committ
     )
     .await
     .unwrap();
-    arrived(&f, &ship, 1000.0).await;
+    arrived(&f, &ship, 1000.0);
 }

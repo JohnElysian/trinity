@@ -1,73 +1,113 @@
-//! Materialize identities added by the Trinity SDE after the older entity dump.
-//! Existing items/characters are preserved, including player station ownership.
-use tokio_postgres::Client;
+//! Identities the Trinity data adds over the older item dump: an item for
+//! every solar system and station, and a character for every agent. Rows
+//! already there are kept as they are, player station ownership included.
 
-pub async fn ensure(db: &Client) -> Result<(), tokio_postgres::Error> {
+use crate::store::{StoreError, Tx, Value};
+
+pub fn ensure(tx: &mut Tx) -> Result<(), StoreError> {
     // Inventory lookups use entity, while the ballpark uses mapDenormalize.
     // Without these rows new systems/stations exist on the map but have no item.
+    let systems: Vec<Vec<(&str, Value)>> = tx
+        .table("mapSolarSystems")
+        .rows()
+        .map(|s| {
+            vec![
+                ("itemID", s.value("solarSystemID").clone()),
+                ("itemName", s.value("solarSystemName").clone()),
+                ("typeID", Value::Int(5)),
+                ("ownerID", Value::Int(1)),
+                ("locationID", Value::Int(0)),
+                ("singleton", Value::Int(1)),
+                ("quantity", Value::Int(1)),
+                ("x", s.value("x").clone()),
+                ("y", s.value("y").clone()),
+                ("z", s.value("z").clone()),
+            ]
+        })
+        .collect();
+    let stations: Vec<Vec<(&str, Value)>> = tx
+        .table("staStations")
+        .rows()
+        .map(|s| {
+            vec![
+                ("itemID", s.value("stationID").clone()),
+                ("itemName", s.value("stationName").clone()),
+                ("typeID", s.value("stationTypeID").clone()),
+                ("ownerID", s.value("corporationID").clone()),
+                ("locationID", s.value("solarSystemID").clone()),
+                ("singleton", Value::Int(1)),
+                ("quantity", Value::Int(1)),
+                ("x", s.value("x").clone()),
+                ("y", s.value("y").clone()),
+                ("z", s.value("z").clone()),
+            ]
+        })
+        .collect();
     for table in ["entityStatic", "entity"] {
-        db.execute(
-            &format!(
-                r#"INSERT INTO "{table}"
-            ("itemID","itemName","typeID","ownerID","locationID",singleton,quantity,x,y,z)
-            SELECT s."solarSystemID",s."solarSystemName",5,1,0,1,1,s.x,s.y,s.z
-            FROM "mapSolarSystems" s WHERE NOT EXISTS
-                (SELECT 1 FROM "{table}" e WHERE e."itemID"=s."solarSystemID")
-            ON CONFLICT DO NOTHING"#
-            ),
-            &[],
-        )
-        .await?;
-        db.execute(&format!(r#"INSERT INTO "{table}"
-            ("itemID","itemName","typeID","ownerID","locationID",singleton,quantity,x,y,z)
-            SELECT s."stationID",s."stationName",s."stationTypeID",s."corporationID",s."solarSystemID",1,1,s.x,s.y,s.z
-            FROM "staStations" s WHERE NOT EXISTS
-                (SELECT 1 FROM "{table}" e WHERE e."itemID"=s."stationID")
-            ON CONFLICT DO NOTHING"#), &[]).await?;
+        for row in systems.iter().chain(&stations) {
+            if tx.table(table).get(std::slice::from_ref(&row[0].1)).is_none() {
+                tx.insert_or_ignore(table, row)?;
+            }
+        }
     }
     // The export supplies names/types/affiliations and bloodlines, but no NPC
     // portrait appearance. Do not overwrite older character records with defaults.
+    let bloodlines = crate::sde::table("chrBloodlines");
+    let mut agents: Vec<Vec<(&str, Value)>> = Vec::new();
+    for a in crate::sde::table("agtAgents").rows() {
+        let Some(agent) = a.int("agentID") else { continue };
+        let Some(owner) = tx.table("eveStaticOwners").get_id(agent) else { continue };
+        let type_id = owner.value("typeID").clone();
+        let bloodline = type_id
+            .int()
+            .and_then(|t| crate::sde::table("bloodlineTypes").get("typeID", t))
+            .and_then(|bt| bt.int("bloodlineID"))
+            .and_then(|b| bloodlines.get("bloodlineID", b));
+        let station = a.int("stationID").and_then(|s| tx.table("staStations").get_id(s));
+        let place = |c: &str| station.and_then(|s| s.int(c)).unwrap_or(0);
+        agents.push(vec![
+            ("characterID", Value::Int(agent)),
+            ("characterName", owner.value("ownerName").clone()),
+            ("corporationID", Value::Int(a.int("corporationID").unwrap_or(0))),
+            ("typeID", type_id),
+            ("bloodlineID", Value::Int(bloodline.and_then(|b| b.int("bloodlineID")).unwrap_or(0))),
+            ("raceID", Value::Int(bloodline.and_then(|b| b.int("raceID")).unwrap_or(0))),
+            ("stationID", Value::Int(a.int("stationID").unwrap_or(0))),
+            ("solarSystemID", Value::Int(place("solarSystemID"))),
+            ("constellationID", Value::Int(place("constellationID"))),
+            ("regionID", Value::Int(place("regionID"))),
+        ]);
+    }
     for table in ["characterStatic", "character_"] {
-        db.execute(&format!(r#"INSERT INTO "{table}"
-            ("characterID","characterName","corporationID","typeID","bloodlineID","raceID",
-             "stationID","solarSystemID","constellationID","regionID")
-            SELECT a."agentID",o."ownerName",COALESCE(a."corporationID",0),o."typeID",
-                COALESCE(b."bloodlineID",0),COALESCE(b."raceID",0),COALESCE(a."stationID",0),
-                COALESCE(s."solarSystemID",0),COALESCE(s."constellationID",0),COALESCE(s."regionID",0)
-            FROM "agtAgents" a JOIN "eveStaticOwners" o ON o."ownerID"=a."agentID"
-            LEFT JOIN "bloodlineTypes" bt ON bt."typeID"=o."typeID"
-            LEFT JOIN "chrBloodlines" b ON b."bloodlineID"=bt."bloodlineID"
-            LEFT JOIN "staStations" s ON s."stationID"=a."stationID"
-            WHERE NOT EXISTS (SELECT 1 FROM "{table}" c WHERE c."characterID"=a."agentID")
-            ON CONFLICT DO NOTHING"#), &[]).await?;
+        for row in &agents {
+            if tx.table(table).get(std::slice::from_ref(&row[0].1)).is_none() {
+                tx.insert_or_ignore(table, row)?;
+            }
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
-    async fn trinity_identities_are_present_and_existing_items_are_preserved() {
-        let fixture = crate::test_support::Database::load().await;
-        let db = &fixture.db;
-        for query in [
-            r#"SELECT count(*) FROM "staStations" s LEFT JOIN entity e ON e."itemID"=s."stationID" WHERE e."itemID" IS NULL"#,
-            r#"SELECT count(*) FROM "mapSolarSystems" s LEFT JOIN entity e ON e."itemID"=s."solarSystemID" WHERE e."itemID" IS NULL"#,
-            r#"SELECT count(*) FROM "agtAgents" a JOIN "eveStaticOwners" o ON o."ownerID"=a."agentID" LEFT JOIN "character_" c ON c."characterID"=a."agentID" WHERE c."characterID" IS NULL"#,
-        ] {
-            assert_eq!(db.query_one(query, &[]).await.unwrap().get::<_, i64>(0), 0);
-        }
-        let before = db
-            .query_one(r#"SELECT count(*),sum("ownerID") FROM entity"#, &[])
-            .await
-            .unwrap();
-        super::ensure(db).await.unwrap();
-        let after = db
-            .query_one(r#"SELECT count(*),sum("ownerID") FROM entity"#, &[])
-            .await
-            .unwrap();
-        assert_eq!(before.get::<_, i64>(0), after.get::<_, i64>(0));
-        assert_eq!(before.get::<_, i64>(1), after.get::<_, i64>(1));
+    #[test]
+    fn every_system_station_and_agent_has_its_identity_and_items_are_kept() {
+        let store = crate::test_support::store();
+        store.read(|db| {
+            let entity = db.table("entity");
+            assert!(db.table("staStations").rows().all(|s| entity.get(std::slice::from_ref(s.value("stationID"))).is_some()));
+            assert!(db.table("mapSolarSystems").rows().all(|s| entity.get(std::slice::from_ref(s.value("solarSystemID"))).is_some()));
+            let characters = db.table("character_");
+            for a in crate::sde::table("agtAgents").rows() {
+                let id = a.int("agentID").unwrap();
+                if db.table("eveStaticOwners").get_id(id).is_some() {
+                    assert!(characters.get_id(id).is_some(), "agent {id}");
+                }
+            }
+        });
+        let before = store.read(|db| (db.table("entity").len(), db.table("entity").rows().filter_map(|r| r.int("ownerID")).sum::<i64>()));
+        store.write(super::ensure).unwrap();
+        let after = store.read(|db| (db.table("entity").len(), db.table("entity").rows().filter_map(|r| r.int("ownerID")).sum::<i64>()));
+        assert_eq!(before, after);
     }
 }

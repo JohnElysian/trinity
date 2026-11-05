@@ -41,27 +41,43 @@ fn old_motion_checkpoints_default_to_no_saved_cloak() {
 }
 
 async fn ship(f: &Database) -> (Session, Ship) {
-    let pilot = f.id().await;
-    let id = f.id().await;
-    let system = 30000142i32;
-    f.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","solarSystemID","stationID") VALUES ($1,$2,$3,$4,0)"#,
-        &[&pilot,&format!("Durable warp {pilot}"),&id,&system]).await.unwrap();
-    f.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",flag,quantity,singleton) VALUES ($1,587,$2,$3,0,1,1)"#,
-        &[&id,&pilot,&system]).await.unwrap();
+    let pilot = i64::from(f.id().await);
+    let id = i64::from(f.id().await);
+    let system = 30000142;
+    f.store.write(|tx| {
+        tx.insert("character_", &[("characterID", Value::Int(pilot)), ("characterName", Value::Text(format!("Durable warp {pilot}").into())),
+            ("shipID", Value::Int(id)), ("solarSystemID", Value::Int(system)), ("stationID", Value::Int(0))])?;
+        tx.insert("entity", &[("itemID", Value::Int(id)), ("typeID", Value::Int(587)), ("ownerID", Value::Int(pilot)), ("locationID", Value::Int(system)),
+            ("flag", Value::Int(0)), ("quantity", Value::Int(1)), ("singleton", Value::Int(1))])?;
+        Ok::<_, StoreError>(())
+    }).unwrap();
     let session = Session {
-        char_id: Some(pilot as i64),
-        ship_id: Some(id as i64),
-        solar_system_id: Some(system as i64),
+        char_id: Some(pilot),
+        ship_id: Some(id),
+        solar_system_id: Some(system),
         ..Default::default()
     };
-    let ship = inflight::ship_for_space(&f.ctx(&session), pilot as i64, id as i64)
+    let ship = inflight::ship_for_space(&f.ctx(&session), pilot, id)
         .await
         .unwrap();
     (session, ship)
 }
 
+fn place(f: &Database, id: i64, at: Vec3) {
+    f.store.write(|tx| {
+        let row = tx.table("entity").get_id(id).unwrap().id;
+        tx.update("entity", row, &[("x", Value::Float(at.x)), ("y", Value::Float(at.y)), ("z", Value::Float(at.z))])
+    }).unwrap();
+}
+
+fn stored_position(f: &Database, id: i64) -> Vec3 {
+    f.store.read(|db| {
+        let e = db.table("entity").get_id(id).unwrap();
+        Vec3::new(e.float("x").unwrap(), e.float("y").unwrap(), e.float("z").unwrap())
+    })
+}
+
 #[tokio::test]
-#[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn paid_warp_restores_after_restart_and_relocation_invalidates_trajectory() {
     let f = Database::load().await;
     let (session, mut original) = ship(&f).await;
@@ -92,9 +108,8 @@ async fn paid_warp_restores_after_restart_and_relocation_invalidates_trajectory(
         .capacitor
         .at(combat::now_ms());
     assert!(paid < 100.0 && paid > 0.0);
-    let mut writer = crate::db::connect(&f.url).await.unwrap();
     assert!(
-        save_detached(&mut writer, system, &live.ships[&id], live.tick)
+        save_detached(&f.store, system, &live.ships[&id], live.tick)
             .await
             .unwrap()
     );
@@ -126,12 +141,7 @@ async fn paid_warp_restores_after_restart_and_relocation_invalidates_trajectory(
 
     // A same-system relocation also invalidates the old native curve.
     let arrival = Vec3::new(4321.0, 5678.0, 9012.0);
-    f.db.execute(
-        r#"UPDATE entity SET x=$2,y=$3,z=$4 WHERE "itemID"=$1"#,
-        &[&(id as i32), &arrival.x, &arrival.y, &arrival.z],
-    )
-    .await
-    .unwrap();
+    place(&f, id, arrival);
     let mut moved = inflight::ship_for_space(&f.ctx(&session), pilot, id)
         .await
         .unwrap();
@@ -142,29 +152,25 @@ async fn paid_warp_restores_after_restart_and_relocation_invalidates_trajectory(
     let marker = Vec3::new(91.0, 92.0, 93.0);
     moved.arrive(marker);
     assert!(
-        save_detached(&mut writer, system, &moved, destiny::tick_now())
+        save_detached(&f.store, system, &moved, destiny::tick_now())
             .await
             .unwrap()
     );
-    f.db.batch_execute(&format!(r#"ALTER TABLE "shipSpaceMotion" ADD CONSTRAINT motion_test_{id} CHECK ("itemID"<>{id} OR "savedAt"<0) NOT VALID"#)).await.unwrap();
     moved.arrive(Vec3::new(600.0, 700.0, 800.0));
-    let failed = save_detached(&mut writer, system, &moved, destiny::tick_now()).await;
-    f.db.batch_execute(&format!(
-        r#"ALTER TABLE "shipSpaceMotion" DROP CONSTRAINT motion_test_{id}"#
-    ))
-    .await
-    .unwrap();
+    let failed: Result<(), StoreError> = f.store.write(|tx| {
+        assert!(write(tx, system, &moved, destiny::tick_now())?);
+        Err(StoreError { code: crate::store::CHECK_VIOLATION, message: "the checkpoint's write fails after its updates".into() })
+    });
     assert!(failed.is_err());
-    let row=f.db.query_one(r#"SELECT e.x,m.state FROM entity e JOIN "shipSpaceMotion" m ON m."itemID"=e."itemID" WHERE e."itemID"=$1"#,&[&(id as i32)]).await.unwrap();
-    assert_eq!(row.get::<_, f64>(0), marker.x);
-    let saved: Motion = serde_json::from_str(&row.get::<_, String>(1)).unwrap();
+    assert_eq!(stored_position(&f, id).x, marker.x);
+    let state = f.store.read(|db| db.table("shipSpaceMotion").get_id(id).unwrap().text("state").unwrap().to_string());
+    let saved: Motion = serde_json::from_str(&state).unwrap();
     assert!(moved.restore_motion(&saved, destiny::tick_now()));
     assert_eq!(moved.pos, marker);
 }
 
 #[tokio::test]
-#[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-async fn queued_checkpoint_uses_fresh_world_state_after_inventory_lock() {
+async fn checkpoint_saves_the_world_state_current_when_it_runs() {
     let f = Database::load().await;
     let (session, original) = ship(&f).await;
     let system = session.solar_system_id.unwrap();
@@ -174,57 +180,20 @@ async fn queued_checkpoint_uses_fresh_world_state_after_inventory_lock() {
     let mut park = Park::new(system, vec![], destiny::tick_now());
     park.ships.insert(id, original);
     f.world.lock().parks.insert(system, park);
-    let mut locking = crate::db::connect(&f.url).await.unwrap();
-    let tx = locking.transaction().await.unwrap();
-    tx.query_one(
-        r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 FOR UPDATE"#,
-        &[&(pilot as i32)],
-    )
-    .await
-    .unwrap();
-    let mut waiting = crate::db::connect(&f.url).await.unwrap();
-    let pid: i32 = waiting
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
+    // A move committed before the checkpoint runs is what it saves.
+    let arrival = Vec3::new(1234.0, 5678.0, 9012.0);
+    place(&f, id, arrival);
+    f.world
+        .lock()
+        .parks
+        .get_mut(&system)
         .unwrap()
-        .get(0);
-    let run = checkpoint_one(&f.world, &mut waiting, system, id, pilot, client);
-    let move_then_unlock = async {
-        tokio::time::timeout(std::time::Duration::from_secs(10),async {
-            loop {
-                if f.db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')",&[&pid]).await.unwrap().get::<_,bool>(0) {break;}
-                tokio::task::yield_now().await;
-            }
-        }).await.expect("checkpoint queued behind character lock");
-        let arrival = Vec3::new(1234.0, 5678.0, 9012.0);
-        tx.execute(
-            r#"UPDATE entity SET x=$2,y=$3,z=$4 WHERE "itemID"=$1"#,
-            &[&(id as i32), &arrival.x, &arrival.y, &arrival.z],
-        )
-        .await
-        .unwrap();
-        f.world
-            .lock()
-            .parks
-            .get_mut(&system)
-            .unwrap()
-            .ships
-            .get_mut(&id)
-            .unwrap()
-            .arrive(arrival);
-        tx.commit().await.unwrap();
-        arrival
-    };
-    let (saved, arrival) = tokio::join!(run, move_then_unlock);
-    assert!(saved.unwrap());
-    let row =
-        f.db.query_one(
-            r#"SELECT x,y,z FROM entity WHERE "itemID"=$1"#,
-            &[&(id as i32)],
-        )
-        .await
-        .unwrap();
-    assert_eq!(Vec3::new(row.get(0), row.get(1), row.get(2)), arrival);
+        .ships
+        .get_mut(&id)
+        .unwrap()
+        .arrive(arrival);
+    assert!(checkpoint_one(&f.world, &f.store, system, id, pilot, client).await.unwrap());
+    assert_eq!(stored_position(&f, id), arrival);
     // An identity reservation excludes snapshots during cockpit transfer.
     f.world
         .lock()
@@ -236,11 +205,11 @@ async fn queued_checkpoint_uses_fresh_world_state_after_inventory_lock() {
         .unwrap()
         .identity_reserved = true;
     assert!(
-        !checkpoint_one(&f.world, &mut waiting, system, id, pilot, client)
+        !checkpoint_one(&f.world, &f.store, system, id, pilot, client)
             .await
             .unwrap()
     );
-    // A queued old client cannot overwrite a different connection's hull.
+    // An old client cannot overwrite a different connection's hull.
     let mut world = f.world.lock();
     let live = world
         .parks
@@ -253,7 +222,7 @@ async fn queued_checkpoint_uses_fresh_world_state_after_inventory_lock() {
     live.client_id += 1;
     drop(world);
     assert!(
-        !checkpoint_one(&f.world, &mut waiting, system, id, pilot, client)
+        !checkpoint_one(&f.world, &f.store, system, id, pilot, client)
             .await
             .unwrap()
     );

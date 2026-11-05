@@ -7,9 +7,9 @@
 //! taking from it its Hangar Take role; directors may do anything.
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 
 use crate::services::Ctx;
+use crate::store::{self, Db, StoreError};
 use crate::session::CORP_ROLE_DIRECTOR;
 
 pub const FLAG_HANGAR: i64 = 4;
@@ -35,9 +35,9 @@ pub fn flags() -> impl Iterator<Item = i64> {
 }
 
 /// The corporation and station of an office, if `id` is one.
-pub async fn office(db: &impl GenericClient, id: i64) -> Option<(i64, i64)> {
-    let r = db.query_opt(r#"SELECT "corporationID", "stationID" FROM "crpOffices" WHERE "itemID" = $1"#, &[&(id as i32)]).await.ok().flatten()?;
-    Some((r.get::<_, i32>(0) as i64, r.get::<_, i32>(1) as i64))
+pub fn office(db: &Db, id: i64) -> Option<(i64, i64)> {
+    let r = db.table("crpOffices").find_one(&["itemID"], &[store::Value::Int(id)])?;
+    Some((r.int("corporationID")?, r.int("stationID")?))
 }
 
 /// Whether the caller is a member of the office's corporation, docked there.
@@ -73,8 +73,8 @@ pub(crate) fn may_query_at(ctx: &Ctx<'_>, flag: i64, station: Option<i64>) -> bo
 }
 
 /// The flags of an office the caller may look into.
-pub fn visible_flags(ctx: &Ctx<'_>) -> Vec<i32> {
-    flags().filter(|f| may_query(ctx, *f)).map(|f| f as i32).collect()
+pub fn visible_flags(ctx: &Ctx<'_>) -> Vec<i64> {
+    flags().filter(|f| may_query(ctx, *f)).collect()
 }
 
 /// corpRegistry.UpdateDivisionNames(d1, ..., d7): directors name the divisions.
@@ -84,22 +84,24 @@ pub async fn update_division_names(ctx: &Ctx<'_>, args: &[Value]) -> Result<Valu
         return Err("Only directors may rename the divisions.".into());
     }
     let names: Vec<Option<String>> = (0..7).map(|i| args.get(i).and_then(|v| v.as_string()).map(|s| s.chars().take(50).collect())).collect();
-    let old = ctx
-        .query_one(r#"SELECT "division1","division2","division3","division4","division5","division6","division7" FROM "corporation" WHERE "corporationID" = $1"#, &[&(corp as i32)])
-        .await;
-    let ok = ctx
-        .execute(
-            r#"UPDATE "corporation" SET "division1" = COALESCE($2, "division1"), "division2" = COALESCE($3, "division2"), "division3" = COALESCE($4, "division3"),
-                      "division4" = COALESCE($5, "division4"), "division5" = COALESCE($6, "division5"), "division6" = COALESCE($7, "division6"),
-                      "division7" = COALESCE($8, "division7") WHERE "corporationID" = $1"#,
-            &[&(corp as i32), &names[0], &names[1], &names[2], &names[3], &names[4], &names[5], &names[6]],
-        )
-        .await;
-    if !ok {
-        return Err("The division names could not be saved.".into());
-    }
     let header = ["division1", "division2", "division3", "division4", "division5", "division6", "division7"];
-    let before: Vec<Value> = (0..7).map(|i| Value::text(old.as_ref().and_then(|r| crate::svc::rows::text(r, i)).unwrap_or_default())).collect();
+    let saved = ctx.store.write(|tx| -> Result<_, StoreError> {
+        let Some(row) = tx.table("corporation").get_id(corp) else { return Ok(None) };
+        let (id, old) = (row.id, header.map(|c| row.text(c).unwrap_or_default().to_string()));
+        // A name left out keeps the division's name.
+        let sets: Vec<(&str, store::Value)> =
+            header.iter().zip(&names).filter_map(|(c, n)| n.as_deref().map(|n| (*c, store::Value::Text(n.into())))).collect();
+        tx.update("corporation", id, &sets)?;
+        Ok(Some(old))
+    });
+    let old = match saved {
+        Ok(old) => old,
+        Err(e) => {
+            tracing::error!("statement failed: {e}");
+            return Err("The division names could not be saved.".into());
+        }
+    };
+    let before: Vec<Value> = (0..7).map(|i| Value::text(old.as_ref().map(|o| o[i].clone()).unwrap_or_default())).collect();
     let after: Vec<Value> = (0..7).map(|i| names[i].clone().map(Value::text).unwrap_or_else(|| before[i].clone())).collect();
     let change = crate::svc::rows::change(&header, Some(&before), Some(&after));
     let w = ctx.world.lock();
@@ -118,18 +120,28 @@ pub async fn update_corporation(ctx: &Ctx<'_>, args: &[Value]) -> Result<Value, 
     let description = args.first().and_then(|v| v.as_string()).unwrap_or_default();
     let url = args.get(1).and_then(|v| v.as_string()).unwrap_or_default();
     let tax = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
-    let old = ctx.query_one(r#"SELECT "description", "url", "taxRate" FROM "corporation" WHERE "corporationID" = $1"#, &[&(corp as i32)]).await;
-    if !ctx
-        .execute(r#"UPDATE "corporation" SET "description" = $2, "url" = $3, "taxRate" = $4 WHERE "corporationID" = $1"#, &[&(corp as i32), &description, &url, &tax])
-        .await
-    {
-        return Err("The corporation's details could not be saved.".into());
-    }
+    let saved = ctx.store.write(|tx| -> Result<_, StoreError> {
+        let Some(row) = tx.table("corporation").get_id(corp) else { return Ok(None) };
+        let (id, old) = (row.id, (row.text("description").unwrap_or_default().to_string(), row.text("url").unwrap_or_default().to_string(), row.float("taxRate")));
+        tx.update(
+            "corporation",
+            id,
+            &[("description", store::Value::Text(description.as_str().into())), ("url", store::Value::Text(url.as_str().into())), ("taxRate", store::Value::Float(tax))],
+        )?;
+        Ok(Some(old))
+    });
+    let old = match saved {
+        Ok(old) => old,
+        Err(e) => {
+            tracing::error!("statement failed: {e}");
+            return Err("The corporation's details could not be saved.".into());
+        }
+    };
     let header = ["description", "url", "taxRate"];
     let before = vec![
-        Value::text(old.as_ref().and_then(|r| crate::svc::rows::text(r, 0)).unwrap_or_default()),
-        Value::text(old.as_ref().and_then(|r| crate::svc::rows::text(r, 1)).unwrap_or_default()),
-        Value::Double(old.as_ref().and_then(|r| crate::svc::rows::float(r, 2)).unwrap_or(0.0)),
+        Value::text(old.as_ref().map(|o| o.0.clone()).unwrap_or_default()),
+        Value::text(old.as_ref().map(|o| o.1.clone()).unwrap_or_default()),
+        Value::Double(old.as_ref().and_then(|o| o.2).unwrap_or(0.0)),
     ];
     let after = vec![Value::text(description), Value::text(url), Value::Double(tax)];
     let change = crate::svc::rows::change(&header, Some(&before), Some(&after));

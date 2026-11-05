@@ -10,7 +10,6 @@
 use std::collections::{BTreeSet, HashSet};
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::{debug, error, info};
 
 use crate::ballpark::{Pilot, Ship, ShipStats};
@@ -18,6 +17,7 @@ use crate::combat::{self, attr, Action, Active, Ammo, Charged, Fighter, Gun, Loc
 use crate::dogma::{category, Catalog, Loadout, State};
 use crate::fight;
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Row, StoreError, Tx};
 use crate::svc::space::{self, entry};
 
 mod activation;
@@ -89,47 +89,36 @@ pub struct Profile {
 /// `active` modules applied. Its hit points come from what is stored on the
 /// ship: armour and structure damage, and the shield and capacitor as they
 /// were when it was last in space (full if never).
-pub async fn profile(
-    db: &impl GenericClient,
+pub fn profile(
+    db: &Db,
     catalog: &Catalog,
     char_id: i64,
     ship_id: i64,
     active: &BTreeSet<i64>,
     now: i64,
-) -> Result<Option<Profile>, tokio_postgres::Error> {
+) -> Result<Option<Profile>, StoreError> {
     let running: HashSet<i64> = active.iter().copied().collect();
-    let loadout = Loadout::load(db, catalog, char_id, Some(ship_id), &running).await?;
+    let loadout = Loadout::load(db, catalog, char_id, Some(ship_id), &running)?;
     let (Some(ship), character) = (loadout.ship(), loadout.character()) else { return Ok(None) };
-    let Some(r) = db
-        .query_opt(
-            r#"SELECT e."typeID", t."groupID", COALESCE(NULLIF(e."itemName", ''), t."typeName", ''),
-                      COALESCE(t."radius", 0), COALESCE(t."mass", 0),
-                      c."corporationID", co."allianceID",
-                      COALESCE(c."securityRating", 0), COALESCE(c."bounty", 0)
-                 FROM entity e
-                 JOIN "invTypes" t ON t."typeID" = e."typeID"
-                 LEFT JOIN "character_" c ON c."characterID" = $2
-                 LEFT JOIN corporation co ON co."corporationID" = c."corporationID"
-                WHERE e."itemID" = $1"#,
-            &[&(ship_id as i32), &(char_id as i32)],
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
+    let Some(hull) = db.table("entity").get_id(ship_id) else { return Ok(None) };
+    let pilot_row = db.table("character_").get_id(char_id);
+    let corporation = pilot_row.and_then(|c| c.int("corporationID")).and_then(|c| db.table("corporation").get_id(c));
+    // A hull of a type the static data does not know has no profile, as
+    // joining on it found none.
+    let type_id = hull.int("typeID").unwrap_or(0);
+    let Some(t) = crate::sde::table("invTypes").get("typeID", type_id) else { return Ok(None) };
     let stored: Vec<(i32, f64)> = db
-        .query(
-            r#"SELECT "attributeID", coalesce("valueFloat", "valueInt"::float8) FROM entity_attributes
-                WHERE "itemID" = $1 AND "attributeID" = ANY($2)"#,
-            &[&(ship_id as i32), &vec![attr::SHIELD_CHARGE, attr::CHARGE]],
-        )
-        .await?
-        .iter()
-        .filter_map(|r| Some((r.get(0), r.get::<_, Option<f64>>(1)?)))
+        .table("entity_attributes")
+        .find(&["itemID"], &[store::Value::Int(ship_id)])
+        .filter_map(|a| {
+            let id = a.int("attributeID")? as i32;
+            [attr::SHIELD_CHARGE, attr::CHARGE].contains(&id).then_some(())?;
+            Some((id, stored_value(&a)?))
+        })
         .collect();
 
     let v = |a: i32| loadout.value(ship, a);
-    let mut mass = r.get::<_, f64>(4);
+    let mut mass = t.float("mass").unwrap_or(0.0);
     let mut max_velocity = v(attr::MAX_VELOCITY);
     let mut signature = v(attr::SIGNATURE_RADIUS);
     // Afterburners and microwarpdrives: thrust over mass, as 2.10 hard-coded it.
@@ -145,17 +134,20 @@ pub async fn profile(
         }
         signature *= 1.0 + loadout.value(i, attr::SIGNATURE_RADIUS_BONUS) / 100.0;
     }
-    let mut stats = ShipStats::new(r.get::<_, f64>(3), mass, v(attr::AGILITY), max_velocity, v(600));
+    let mut stats = ShipStats::new(t.float("radius").unwrap_or(0.0), mass, v(attr::AGILITY), max_velocity, v(600));
     stats.warp_capacitor_need = v(crate::warp_energy::WARP_CAPACITOR_NEED);
     let pilot = Pilot {
-        type_id: r.get::<_, i32>(0) as i64,
-        group_id: r.get::<_, i32>(1) as i64,
-        name: r.get(2),
+        type_id,
+        group_id: t.int("groupID").unwrap_or_default(),
+        name: hull
+            .text("itemName")
+            .filter(|n| !n.is_empty())
+            .map_or_else(|| t.text("typeName").unwrap_or_default().to_string(), str::to_string),
         char_id,
-        corp_id: r.get::<_, Option<i32>>(5).map_or(0, i64::from),
-        alliance_id: r.get::<_, Option<i32>>(6).map(i64::from).filter(|a| *a != 0),
-        security: r.get(7),
-        bounty: r.get(8),
+        corp_id: pilot_row.and_then(|c| c.int("corporationID")).unwrap_or(0),
+        alliance_id: corporation.and_then(|c| c.int("allianceID")).filter(|a| *a != 0),
+        security: pilot_row.and_then(|c| c.float("securityRating")).unwrap_or(0.0),
+        bounty: pilot_row.and_then(|c| c.float("bounty")).unwrap_or(0.0),
     };
 
     let mut shield = Charged::full(v(attr::SHIELD_CAPACITY), v(attr::SHIELD_RECHARGE_RATE), now);
@@ -192,56 +184,68 @@ pub async fn profile(
     Ok(Some(Profile { stats, pilot, fighter }))
 }
 
+/// A stored attribute's value (`coalesce("valueFloat", "valueInt"::float8)`).
+fn stored_value(a: &Row) -> Option<f64> {
+    a.float("valueFloat").or_else(|| a.int("valueInt").map(|v| v as f64))
+}
+
 /// A ship entering space: its profile, made into a park ship.
 pub async fn ship_for_space(ctx: &Ctx<'_>, char_id: i64, ship_id: i64) -> Option<Ship> {
     let now = combat::now_ms();
-    match profile(ctx.db, ctx.dogma, char_id, ship_id, &BTreeSet::new(), now).await {
-        Ok(Some(p)) => {
-            let position = match ctx.db.query_opt(r#"SELECT x,y,z FROM entity WHERE "itemID"=$1 AND "ownerID"=$2"#, &[&(ship_id as i32),&(char_id as i32)]).await {
-                Ok(Some(row)) => crate::ballpark::Vec3::new(row.get(0),row.get(1),row.get(2)),
-                Ok(None) => return None,
-                Err(e) => { error!("loading ship {ship_id} position: {}",crate::logging::chain(&e)); return None; }
-            };
-            let mut ship = Ship::new(ship_id, ctx.client_id, p.stats, p.pilot, position, Default::default());
-            ship.fight = Some(p.fighter);
-            match crate::cloak::durability::load_history(ctx.db,char_id,ship_id,now).await {
-                Ok(history)=>ship.fight.as_mut().unwrap().cloak_history=history,
-                Err(error)=>{error!("loading ship {ship_id} cooldowns: {}",crate::logging::chain(&error));return None;}
+    let (p, position, history) = ctx.store.read(|db| {
+        let p = match profile(db, ctx.dogma, char_id, ship_id, &BTreeSet::new(), now) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => {
+                error!("loading ship {ship_id}: {}", crate::logging::chain(&e));
+                return None;
             }
-            Some(ship)
+        };
+        let row = db.table("entity").get_id(ship_id).filter(|e| e.int("ownerID") == Some(char_id))?;
+        let position = crate::ballpark::Vec3::new(row.float("x").unwrap_or(0.0), row.float("y").unwrap_or(0.0), row.float("z").unwrap_or(0.0));
+        match crate::cloak::durability::load_history(db, char_id, ship_id, now) {
+            Ok(history) => Some((p, position, history)),
+            Err(error) => {
+                error!("loading ship {ship_id} cooldowns: {}", crate::logging::chain(&error));
+                None
+            }
         }
-        Ok(None) => None,
-        Err(e) => {
-            error!("loading ship {ship_id}: {}", crate::logging::chain(&e));
-            None
-        }
-    }
+    })?;
+    let mut ship = Ship::new(ship_id, ctx.client_id, p.stats, p.pilot, position, Default::default());
+    ship.fight = Some(p.fighter);
+    ship.fight.as_mut().unwrap().cloak_history = history;
+    Some(ship)
 }
 
 /// Restore a saved continuous cloak only while the same fitted, online item
 /// still supports its original effect. No activation charge or FX is replayed;
 /// native SetState and ItemGetInfo carry the restored state to the client.
-pub async fn restore_cloak(ctx:&Ctx<'_>,ship:&mut Ship,mut saved:crate::cloak::SavedState)->Result<(),tokio_postgres::Error> {
+pub async fn restore_cloak(ctx:&Ctx<'_>,ship:&mut Ship,mut saved:crate::cloak::SavedState)->Result<(),StoreError> {
     saved.history.prune(combat::now_ms());
     if !saved.history.module_ready.is_empty() {
-        let fitted:HashSet<i64>=ctx.db.query(r#"SELECT "itemID" FROM entity WHERE "ownerID"=$1 AND "locationID"=$2 AND flag BETWEEN 11 AND 35 AND singleton<>0 AND quantity>0"#,
-            &[&(ship.pilot.char_id as i32),&(ship.id as i32)]).await?.iter().map(|row|i64::from(row.get::<_,i32>(0))).collect();
+        let fitted:HashSet<i64>=ctx.store.read(|db| db.table("entity").find(&["ownerID","locationID"],&[store::Value::Int(ship.pilot.char_id),store::Value::Int(ship.id)])
+            .filter(|e| e.int("flag").is_some_and(|f| (11..=35).contains(&f)) && e.int("singleton")!=Some(0) && e.int("quantity").is_some_and(|q| q>0))
+            .filter_map(|e| e.int("itemID")).collect());
         saved.history.module_ready.retain(|id,_|fitted.contains(id));
     }
     if let Some(fight)=&mut ship.fight {fight.cloak_history.merge(saved.history,combat::now_ms());}
     let Some(saved)=saved.active else{return Ok(());};
     if saved.module_id<=0 || saved.module_id>i32::MAX as i64 || saved.type_id<=0 || saved.type_id>i32::MAX as i64
         || saved.started_ms<0 || saved.started_ms>combat::now_ms() {return Ok(());}
-    let fitted=ctx.db.query_opt(r#"SELECT e."typeID" FROM entity e JOIN entity_attributes a ON a."itemID"=e."itemID" AND a."attributeID"=2
-        WHERE e."itemID"=$1 AND e."ownerID"=$2 AND e."locationID"=$3 AND e.flag BETWEEN 11 AND 35
-        AND e.singleton<>0 AND e.quantity>0 AND COALESCE(a."valueFloat",a."valueInt"::float8,0)<>0"#,
-        &[&(saved.module_id as i32),&(ship.pilot.char_id as i32),&(ship.id as i32)]).await?;
-    if fitted.is_none_or(|row|i64::from(row.get::<_,i32>(0))!=saved.type_id) {return Ok(());}
+    // The module, still fitted and online.
+    let fitted=ctx.store.read(|db| {
+        let e=db.table("entity").get_id(saved.module_id)?;
+        let fitted=e.int("ownerID")==Some(ship.pilot.char_id) && e.int("locationID")==Some(ship.id)
+            && e.int("flag").is_some_and(|f| (11..=35).contains(&f)) && e.int("singleton")!=Some(0) && e.int("quantity").is_some_and(|q| q>0);
+        let attribute=db.table("entity_attributes").get(&[store::Value::Int(saved.module_id),store::Value::Int(2)])?;
+        (fitted && stored_value(&attribute).unwrap_or(0.0)!=0.0).then(|| e.int("typeID")).flatten()
+    });
+    if fitted!=Some(saved.type_id) {return Ok(());}
     let name=match saved.effect_id {effect::CLOAKING=>"cloaking",effect::CLOAKING_WARP_SAFE=>"cloakingWarpSafe",_=>return Ok(())};
     let Some(effect)=effect_by_name(ctx,name).await else{return Ok(());};
     if effect.id!=saved.effect_id || (ship.in_warp() && !effect.warp_safe) {return Ok(());}
     let planned={
-        let loadout=Loadout::load(ctx.db,ctx.dogma,ship.pilot.char_id,Some(ship.id),&HashSet::new()).await?;
+        let loadout=ctx.store.read(|db| Loadout::load(db,ctx.dogma,ship.pilot.char_id,Some(ship.id),&HashSet::new()))?;
         plan(&loadout,saved.module_id,&effect,None,0)
     };
     let Ok(planned)=planned else{return Ok(());};
@@ -249,7 +253,7 @@ pub async fn restore_cloak(ctx:&Ctx<'_>,ship:&mut Ship,mut saved:crate::cloak::S
     if !module.continuous() || !matches!(module.action,Action::Cloak {..}) {return Ok(());}
     module.started_ms=saved.started_ms;module.next_ms=i64::MAX;
     let active=BTreeSet::from([module.module_id]);
-    let Some(updated)=profile(ctx.db,ctx.dogma,ship.pilot.char_id,ship.id,&active,combat::now_ms()).await? else{return Ok(());};
+    let Some(updated)=ctx.store.read(|db| profile(db,ctx.dogma,ship.pilot.char_id,ship.id,&active,combat::now_ms()))? else{return Ok(());};
     apply_profile(ship,updated,combat::now_ms());
     if let Some(fight)=&mut ship.fight {fight.modules.push(module);ship.cloaked=true;}
     Ok(())
@@ -284,11 +288,11 @@ pub fn apply_profile(ship: &mut Ship, p: Profile, now: i64) {
 /// Stores what a ship leaving space has left: damage always; the shield and
 /// capacitor only while it stays out there (docked, they refill).
 /// Fallible form for callers that commit vitals with a location transition.
-pub async fn write_vitals(db: &impl GenericClient, ship_id: i64, fighter: &Fighter, docked: bool) -> Result<(), tokio_postgres::Error> {
-    write_vitals_at(db,ship_id,fighter,docked,combat::now_ms()).await
+pub fn write_vitals(tx: &mut Tx<'_>, ship_id: i64, fighter: &Fighter, docked: bool) -> Result<(), StoreError> {
+    write_vitals_at(tx,ship_id,fighter,docked,combat::now_ms())
 }
 
-pub(crate) async fn write_vitals_at(db: &impl GenericClient, ship_id: i64, fighter: &Fighter, docked: bool, now: i64) -> Result<(), tokio_postgres::Error> {
+pub(crate) fn write_vitals_at(tx: &mut Tx<'_>, ship_id: i64, fighter: &Fighter, docked: bool, now: i64) -> Result<(), StoreError> {
     let v = &fighter.vitals;
     let mut set = vec![(attr::ARMOR_DAMAGE, v.armor_damage), (attr::DAMAGE, v.hull_damage)];
     let mut clear = Vec::new();
@@ -297,24 +301,22 @@ pub(crate) async fn write_vitals_at(db: &impl GenericClient, ship_id: i64, fight
     } else {
         set.extend([(attr::SHIELD_CHARGE, v.shield.at(now)), (attr::CHARGE, v.capacitor.at(now))]);
     }
+    let key = |a: i32| [store::Value::Int(ship_id), store::Value::Int(i64::from(a))];
     for (a, value) in set {
-        let result = if value <= 0.0 && matches!(a, attr::ARMOR_DAMAGE | attr::DAMAGE) {
-            db.execute(r#"DELETE FROM entity_attributes WHERE "itemID" = $1 AND "attributeID" = $2"#, &[&(ship_id as i32), &a]).await
+        if value <= 0.0 && matches!(a, attr::ARMOR_DAMAGE | attr::DAMAGE) {
+            tx.delete_where("entity_attributes", &["itemID", "attributeID"], &key(a))?;
         } else {
-            db.execute(
-                r#"INSERT INTO entity_attributes ("itemID","attributeID","valueInt","valueFloat")
-                   VALUES ($1, $2, NULL, $3)
-                   ON CONFLICT ("itemID","attributeID") DO UPDATE SET "valueInt" = NULL, "valueFloat" = $3"#,
-                &[&(ship_id as i32), &a, &value],
-            )
-            .await
-        };
-        result?;
+            let [item, attribute] = key(a);
+            tx.upsert(
+                "entity_attributes",
+                &["itemID", "attributeID"],
+                &[("itemID", item), ("attributeID", attribute), ("valueInt", store::Value::Null), ("valueFloat", store::Value::Float(value))],
+                &[("valueInt", store::Value::Null), ("valueFloat", store::Value::Float(value))],
+            )?;
+        }
     }
-    if !clear.is_empty() {
-        db
-            .execute(r#"DELETE FROM entity_attributes WHERE "itemID" = $1 AND "attributeID" = ANY($2)"#, &[&(ship_id as i32), &clear])
-            .await?;
+    for a in clear {
+        tx.delete_where("entity_attributes", &["itemID", "attributeID"], &key(a))?;
     }
     Ok(())
 }
@@ -322,8 +324,8 @@ pub(crate) async fn write_vitals_at(db: &impl GenericClient, ship_id: i64, fight
 /// Save only the still-current ship in its still-current system. A delayed
 /// checkpoint must never overwrite a completed jump, dock, boarding or loss.
 #[cfg(test)]
-pub async fn save_space_state(db: &mut tokio_postgres::Client, system: i64, ship: &Ship) -> Result<bool, tokio_postgres::Error> {
-    crate::space_state::save_detached(db,system,ship,crate::destiny::tick_now()).await
+pub async fn save_space_state(store: &crate::store::Store, system: i64, ship: &Ship) -> Result<bool, StoreError> {
+    crate::space_state::save_detached(store,system,ship,crate::destiny::tick_now()).await
 }
 
 #[cfg(test)]
@@ -331,17 +333,26 @@ mod persistence_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn space_state_preserves_position_and_charges_without_overwriting_later_travel() {
         let fixture = crate::test_support::Database::load().await;
-        let pilot = fixture.id().await;
-        let ship_id = fixture.id().await;
-        let system = 30000142i32;
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName","shipID","solarSystemID","stationID") VALUES ($1,$2,$3,$4,0)"#,
-            &[&pilot,&format!("Space save {pilot}"),&ship_id,&system]).await.unwrap();
-        fixture.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,singleton) VALUES ($1,587,$2,$3,1,1)"#,&[&ship_id,&pilot,&system]).await.unwrap();
-        let session = crate::session::Session { char_id:Some(pilot as i64), ship_id:Some(ship_id as i64), solar_system_id:Some(system as i64), ..Default::default() };
-        let mut ship = ship_for_space(&fixture.ctx(&session),pilot as i64,ship_id as i64).await.unwrap();
+        let pilot = i64::from(fixture.id().await);
+        let ship_id = i64::from(fixture.id().await);
+        let system = 30000142i64;
+        let set_location = |system: i64, station: i64| {
+            fixture.store.write(|tx| {
+                let row = tx.table("character_").get_id(pilot).unwrap().id;
+                tx.update("character_", row, &[("solarSystemID", store::Value::Int(system)), ("stationID", store::Value::Int(station))])
+            }).unwrap();
+        };
+        fixture.store.write(|tx| -> Result<(), StoreError> {
+            tx.insert("character_", &[("characterID", store::Value::Int(pilot)), ("characterName", store::Value::Text(format!("Space save {pilot}").into())),
+                ("shipID", store::Value::Int(ship_id)), ("solarSystemID", store::Value::Int(system)), ("stationID", store::Value::Int(0))])?;
+            tx.insert("entity", &[("itemID", store::Value::Int(ship_id)), ("typeID", store::Value::Int(587)), ("ownerID", store::Value::Int(pilot)),
+                ("locationID", store::Value::Int(system)), ("quantity", store::Value::Int(1)), ("singleton", store::Value::Int(1))])?;
+            Ok(())
+        }).unwrap();
+        let session = crate::session::Session { char_id:Some(pilot), ship_id:Some(ship_id), solar_system_id:Some(system), ..Default::default() };
+        let mut ship = ship_for_space(&fixture.ctx(&session),pilot,ship_id).await.unwrap();
         ship.pos = crate::ballpark::Vec3::new(12.0,34.0,56.0);
         let now = combat::now_ms();
         let vitals = &mut ship.fight.as_mut().unwrap().vitals;
@@ -351,22 +362,23 @@ mod persistence_tests {
         vitals.shield.set(now,25.0);
         vitals.capacitor = Charged::full(1000.0,0.0,now);
         vitals.capacitor.set(now,15.0);
-        let mut db = crate::db::connect(&fixture.url).await.unwrap();
-        assert!(save_space_state(&mut db,system as i64,&ship).await.unwrap());
-        let restored = ship_for_space(&fixture.ctx(&session),pilot as i64,ship_id as i64).await.unwrap();
+        assert!(save_space_state(&fixture.store,system,&ship).await.unwrap());
+        let restored = ship_for_space(&fixture.ctx(&session),pilot,ship_id).await.unwrap();
         assert_eq!(restored.pos,ship.pos);
         assert_eq!(restored.fight.as_ref().unwrap().vitals.armor_damage,7.0);
         assert_eq!(restored.fight.as_ref().unwrap().vitals.hull_damage,3.0);
-        let charges = fixture.db.query(r#"SELECT "attributeID","valueFloat" FROM entity_attributes WHERE "itemID"=$1 AND "attributeID"=ANY($2) ORDER BY "attributeID""#,&[&ship_id,&vec![attr::CHARGE,attr::SHIELD_CHARGE]]).await.unwrap();
+        let charges: Vec<(i64, Option<f64>)> = fixture.store.read(|db| db.table("entity_attributes").find(&["itemID"],&[store::Value::Int(ship_id)])
+            .filter(|r| [attr::CHARGE,attr::SHIELD_CHARGE].map(i64::from).contains(&r.int("attributeID").unwrap()))
+            .map(|r| (r.int("attributeID").unwrap(), r.float("valueFloat"))).collect());
         assert_eq!(charges.len(),2);
-        assert!(charges.iter().any(|r|r.get::<_,i32>(0)==attr::CHARGE && r.get::<_,f64>(1)==15.0));
-        assert!(charges.iter().any(|r|r.get::<_,i32>(0)==attr::SHIELD_CHARGE && r.get::<_,f64>(1)==25.0));
-        fixture.db.execute(r#"UPDATE "character_" SET "solarSystemID"=$2 WHERE "characterID"=$1"#,&[&pilot,&(system+1)]).await.unwrap();
+        assert!(charges.contains(&(i64::from(attr::CHARGE),Some(15.0))));
+        assert!(charges.contains(&(i64::from(attr::SHIELD_CHARGE),Some(25.0))));
+        set_location(system+1,0);
         ship.pos = crate::ballpark::Vec3::ZERO;
-        assert!(!save_space_state(&mut db,system as i64,&ship).await.unwrap());
-        assert_eq!(ship_for_space(&fixture.ctx(&session),pilot as i64,ship_id as i64).await.unwrap().pos,restored.pos);
-        fixture.db.execute(r#"UPDATE "character_" SET "solarSystemID"=$2,"stationID"=60000001 WHERE "characterID"=$1"#,&[&pilot,&system]).await.unwrap();
-        assert!(!save_space_state(&mut db,system as i64,&ship).await.unwrap());
+        assert!(!save_space_state(&fixture.store,system,&ship).await.unwrap());
+        assert_eq!(ship_for_space(&fixture.ctx(&session),pilot,ship_id).await.unwrap().pos,restored.pos);
+        set_location(system,60000001);
+        assert!(!save_space_state(&fixture.store,system,&ship).await.unwrap());
     }
 }
 
@@ -521,23 +533,23 @@ struct EffectRow {
     falloff_attr: Option<i32>,
 }
 
-async fn effect_by_name(ctx: &Ctx<'_>, name: &str) -> Option<EffectRow> {
-    let sql = r#"SELECT "effectID", "effectName", COALESCE("effectCategory", 0)::int2, COALESCE(guid, ''),
-                        COALESCE("isOffensive", 0)::int, "durationAttributeID", "dischargeAttributeID",
-                        "rangeAttributeID", "falloffAttributeID", COALESCE("isWarpSafe", 0)::int
-                   FROM "dgmEffects" WHERE "effectName" = $1"#;
-    let r = ctx.query_one(sql, &[&name]).await?;
+/// The first effect of that name, in the static data's order (one name is
+/// used twice). The static data is in memory; the context stays for the
+/// callers written against the query this once was.
+async fn effect_by_name(_ctx: &Ctx<'_>, name: &str) -> Option<EffectRow> {
+    let r = crate::sde::table("dgmEffects").rows().find(|r| r.text("effectName") == Some(name))?;
+    let attribute = |c: &str| r.int(c).map(|v| v as i32);
     Some(EffectRow {
-        id: r.get::<_, i32>(0) as i64,
-        name: r.get(1),
-        category: r.get(2),
-        guid: r.get(3),
-        offensive: r.get::<_, i32>(4) != 0,
-        duration_attr: r.get::<_, Option<i32>>(5),
-        discharge_attr: r.get::<_, Option<i32>>(6),
-        range_attr: r.get::<_, Option<i32>>(7),
-        falloff_attr: r.get::<_, Option<i32>>(8),
-        warp_safe: r.get::<_, i32>(9) != 0,
+        id: r.int("effectID").unwrap_or_default(),
+        name: name.to_string(),
+        category: r.int("effectCategory").unwrap_or(0) as i16,
+        guid: r.text("guid").unwrap_or_default().to_string(),
+        offensive: r.int("isOffensive").unwrap_or(0) != 0,
+        duration_attr: attribute("durationAttributeID"),
+        discharge_attr: attribute("dischargeAttributeID"),
+        range_attr: attribute("rangeAttributeID"),
+        falloff_attr: attribute("falloffAttributeID"),
+        warp_safe: r.int("isWarpSafe").unwrap_or(0) != 0,
     })
 }
 
@@ -581,7 +593,7 @@ async fn activate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
             None => return Outcome::custom("Your ship is not in space."),
         }
     };
-    let loadout = match Loadout::load(ctx.db, ctx.dogma, char_id, Some(ship_id), &running).await {
+    let loadout = match ctx.store.read(|db| Loadout::load(db, ctx.dogma, char_id, Some(ship_id), &running)) {
         Ok(l) => l,
         Err(e) => {
             error!("activating {item_id}: {}", crate::logging::chain(&e));
@@ -628,7 +640,7 @@ async fn activate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         _ => {}
     }
     if refits {
-        refit(ctx.db, ctx.dogma, ctx.world, ctx.client_id, char_id, ship_id, system).await;
+        ctx.store.read(|db| refit(db, ctx.dogma, ctx.world, ctx.client_id, char_id, ship_id, system));
     }
     Outcome::Value(Value::None)
 }
@@ -914,11 +926,7 @@ const DOOMSDAY_RANGE: f64 = 250_000.0;
 
 /// Checks that some modules need before they start, and the fuel they burn.
 async fn special_start(ctx: &Ctx<'_>, system: i64, ship_id: i64, plan: Plan) -> Result<Plan, String> {
-    let security = ctx
-        .query_one(r#"SELECT "security" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#, &[&(system as i32)])
-        .await
-        .and_then(|r| r.get::<_, Option<f64>>(0))
-        .unwrap_or(0.0);
+    let security = ctx.store.read(|db| db.table("mapSolarSystems").get_id(system).and_then(|r| r.float("security"))).unwrap_or(0.0);
     match plan.module.action {
         Action::Cyno => crate::svc::jumps::may_light_cyno(security)?,
         Action::Portal => return Err("Open a jump portal from the gang menu: Bridge to member.".into()),
@@ -932,19 +940,16 @@ async fn special_start(ctx: &Ctx<'_>, system: i64, ship_id: i64, plan: Plan) -> 
 /// The rest of a module's cycle: its name, its charges left, built-in damage.
 async fn finish(ctx: &Ctx<'_>, plan: Plan) -> Result<Active, String> {
     let mut module = plan.module;
-    module.name = type_name(ctx, module.type_id).await;
+    module.name = type_name(module.type_id);
     if let Some((item_id, type_id, per_cycle)) = plan.burns {
-        let quantity = ctx
-            .query_one(r#"SELECT "quantity" FROM entity WHERE "itemID" = $1"#, &[&(item_id as i32)])
-            .await
-            .map_or(0, |r| r.get::<_, i32>(0) as i64);
+        let quantity = ctx.store.read(|db| db.table("entity").get_id(item_id).and_then(|r| r.int("quantity"))).unwrap_or(0);
         if quantity < per_cycle {
             return Err("That module is out of charges.".into());
         }
         module.ammo = Some(Ammo { item_id, type_id, quantity, per_cycle });
     }
     if let (Some((type_id, multiplier)), Action::Turret { damage, .. }) = (plan.built_in, &mut module.action) {
-        *damage = type_damage(ctx, type_id).await.map(|d| d * multiplier);
+        *damage = type_damage(type_id).map(|d| d * multiplier);
     }
     Ok(module)
 }
@@ -954,25 +959,16 @@ fn multiplier_or_one(v: f64) -> f64 {
     if v > 0.0 { v } else { 1.0 }
 }
 
-async fn type_name(ctx: &Ctx<'_>, type_id: i64) -> String {
-    ctx.query_one(r#"SELECT COALESCE("typeName", '') FROM "invTypes" WHERE "typeID" = $1"#, &[&(type_id as i32)])
-        .await
-        .map_or_else(|| format!("type {type_id}"), |r| r.get(0))
+fn type_name(type_id: i64) -> String {
+    crate::sde::get().type_(type_id).map_or_else(|| format!("type {type_id}"), |t| t.name.to_string())
 }
 
 /// A charge type's damage, for a weapon with built-in ammunition.
-async fn type_damage(ctx: &Ctx<'_>, type_id: i64) -> combat::Damage {
-    let rows = ctx
-        .query(
-            r#"SELECT "attributeID", coalesce("valueFloat", "valueInt"::float8) FROM "dgmTypeAttributes"
-                WHERE "typeID" = $1 AND "attributeID" = ANY($2)"#,
-            &[&(type_id as i32), &attr::DAMAGE_TYPES.to_vec()],
-        )
-        .await;
+fn type_damage(type_id: i64) -> combat::Damage {
     let mut damage = [0.0; 4];
-    for r in &rows {
-        if let (Some(at), Some(value)) = (attr::DAMAGE_TYPES.iter().position(|a| *a == r.get::<_, i32>(0)), r.get::<_, Option<f64>>(1)) {
-            damage[at] = value;
+    for (a, value) in crate::sde::get().type_attributes(type_id) {
+        if let Some(at) = attr::DAMAGE_TYPES.iter().position(|d| d == a) {
+            damage[at] = *value;
         }
     }
     damage
@@ -997,7 +993,7 @@ async fn deactivate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         }
         continuous};
         if continuous {
-            refit(ctx.db,ctx.dogma,ctx.world,ctx.client_id,pilot,ship_id,system).await;
+            ctx.store.read(|db| refit(db,ctx.dogma,ctx.world,ctx.client_id,pilot,ship_id,system));
             return Outcome::Value(Value::None);
         }
     }
@@ -1018,13 +1014,13 @@ async fn deactivate(ctx: &Ctx<'_>, call: &Call) -> Outcome {
 /// numbers into the park, and tells the pilot what changed.
 /// A fleet booster or command chain changed. Rebuild the same loadout with the
 /// old external bonuses to send attribute deltas, then update the live fighter.
-pub async fn fleet_refit(
-    db: &tokio_postgres::Client,
+pub fn fleet_refit(
+    db: &Db,
     catalog: &Catalog,
     world: &crate::world::World,
     char_id: i64,
     previous: &std::collections::BTreeMap<i32, f64>,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<(), StoreError> {
     let ship = {
         let w = world.lock();
         w.parks.iter().find_map(|(system, park)| park.ships.values().find(|s| s.pilot.char_id == char_id && s.is_player())
@@ -1032,11 +1028,11 @@ pub async fn fleet_refit(
     };
     let Some((system, ship_id, client_id, active)) = ship else { return Ok(()) };
     let active_hash = active.iter().copied().collect();
-    let mut before = Loadout::load(db, catalog, char_id, Some(ship_id), &active_hash).await?;
+    let mut before = Loadout::load(db, catalog, char_id, Some(ship_id), &active_hash)?;
     let after = before.snapshot();
     before.apply_fleet_bonuses(previous);
     let before = before.snapshot();
-    let Some(profile) = profile(db, catalog, char_id, ship_id, &active, combat::now_ms()).await? else { return Ok(()) };
+    let Some(profile) = profile(db, catalog, char_id, ship_id, &active, combat::now_ms())? else { return Ok(()) };
     let mut w = world.lock();
     let Some(park) = w.parks.get_mut(&system) else { return Ok(()) };
     let tick = park.tick;
@@ -1062,8 +1058,8 @@ pub async fn fleet_refit(
     Ok(())
 }
 
-pub async fn refit(
-    db: &tokio_postgres::Client,
+pub fn refit(
+    db: &Db,
     catalog: &Catalog,
     world: &crate::world::World,
     client_id: i64,
@@ -1081,13 +1077,12 @@ pub async fn refit(
         return;
     }
     let as_hash = |s: &BTreeSet<i64>| s.iter().copied().collect::<HashSet<i64>>();
-    let result = async {
-        let before = Loadout::load(db, catalog, char_id, Some(ship_id), &as_hash(&before_set)).await?.snapshot();
-        let after = Loadout::load(db, catalog, char_id, Some(ship_id), &as_hash(&now_set)).await?.snapshot();
-        let p = profile(db, catalog, char_id, ship_id, &now_set, combat::now_ms()).await?;
-        Ok::<_, tokio_postgres::Error>((before, after, p))
-    }
-    .await;
+    let result = (|| {
+        let before = Loadout::load(db, catalog, char_id, Some(ship_id), &as_hash(&before_set))?.snapshot();
+        let after = Loadout::load(db, catalog, char_id, Some(ship_id), &as_hash(&now_set))?.snapshot();
+        let p = profile(db, catalog, char_id, ship_id, &now_set, combat::now_ms())?;
+        Ok::<_, StoreError>((before, after, p))
+    })();
     let (before, after, p) = match result {
         Ok((b, a, Some(p))) => (b, a, p),
         Ok(_) => return,

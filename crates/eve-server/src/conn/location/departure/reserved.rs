@@ -1,5 +1,5 @@
 //! A refused paid jump must leave the live fight intact. Reserve identity and
-//! capacitor while SQL waits, and detach only after accepted payment commits.
+//! capacitor while the payment is written, and detach only after it commits.
 use super::*;
 use crate::{combat::{self,Charged},items::ItemTxn,services::Ctx};
 
@@ -7,7 +7,7 @@ use crate::{combat::{self,Charged},items::ItemTxn,services::Ctx};
 pub(super) enum Mobility { Jump, Dock, Admin }
 
 #[derive(Clone,Copy,PartialEq)]
-pub(super) enum CommitState {Prepared,Uncertain,Accepted}
+pub(super) enum CommitState {Prepared,Accepted}
 
 pub(super) struct Reservation {
     world:World,
@@ -19,7 +19,6 @@ pub(super) struct Reservation {
     before:Charged,
     reserved:Charged,
     pub(super) commit_state:CommitState,
-    pub(super) receipt:Option<crate::travel::Marker>,
     mobility:Mobility,
 }
 
@@ -44,7 +43,7 @@ impl Reservation {
         }
         let reserved=fighter.vitals.capacitor;
         ship.identity_reserved=true;
-        Ok(Self {world:ctx.world.clone(),system,ship:id,pilot,client:ctx.client_id,cost,before,reserved,commit_state:CommitState::Prepared,receipt:None,mobility})
+        Ok(Self {world:ctx.world.clone(),system,ship:id,pilot,client:ctx.client_id,cost,before,reserved,commit_state:CommitState::Prepared,mobility})
     }
     pub(super) fn current<'a>(&self,w:&'a WorldState,alive:bool)->std::result::Result<&'a Ship,String> {
         let ship=w.parks.get(&self.system).and_then(|p|p.ships.get(&self.ship))
@@ -62,10 +61,6 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        // An interrupted COMMIT is neither a refusal nor a capacitor refund.
-        // Production owns this future through fresh-lock outcome resolution.
-        if self.commit_state==CommitState::Uncertain {return;}
-        if let Some(marker)=self.receipt {crate::travel::clear_uncertain(&self.world,&marker);}
         let mut w=self.world.lock();
         let Some(ship)=w.parks.get_mut(&self.system).and_then(|p|p.ships.get_mut(&self.ship))
             .filter(|s|s.pilot.char_id==self.pilot && s.client_id==self.client && s.identity_reserved) else {return;};
@@ -85,89 +80,76 @@ impl Drop for Reservation {
     }
 }
 
-/// Production calls this inside an owned task. Its publication must finish even
-/// if the connection stops awaiting a COMMIT result. Tests may cancel it before
-/// COMMIT to exercise transaction rollback and the reservation's RAII release.
+/// Production calls this inside an owned task: its publication must finish
+/// even if the connection stops awaiting the result.
 pub(in crate::conn::location) async fn run(server:&crate::conn::Server,session:&crate::session::Session,client:i64,request:JumpRequest,arrival:&JumpArrival,jump:&PreparedJump,in_fx:&str)->std::result::Result<super::transition::Arrived,super::transition::Failure> {
     use super::transition::Failure;
-    let lease=server.db.lease().await.map_err(|e|Failure::Refused(format!("The travel database is unavailable: {e}")))?;
-    let ctx=&Ctx {bulk:&server.bulk,dogma:&server.dogma,session,db:&lease,db_url:&server.db_url,node_id:server.node_id,world:&server.world,client_id:client};
+    let ctx=&Ctx {bulk:&server.bulk,dogma:&server.dogma,session,store:&server.store,node_id:server.node_id,world:&server.world,client_id:client};
     let pilot=ctx.session.char_id.ok_or("You are not in space.")?;
     let ship=ctx.session.ship_id.ok_or("You have no active ship.")?;
     if !jump.capacitor.is_finite() || jump.capacitor<0.0 {return Err("The jump capacitor cost is invalid.".into());}
-    let mut db=crate::db::connect(ctx.db_url).await.map_err(travel_failed)?;
-    let mut txn=ItemTxn::begin(&mut db).await.map_err(travel_failed)?;
-    if !crate::svc::login::lock_character_lifecycle(txn.tx(),pilot as i32).await.map_err(travel_failed)? {
-        return Err("Your character is no longer available.".into());
-    }
-    let current=txn.tx().query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "shipID"=$2
-        AND "solarSystemID"=$3 AND COALESCE("stationID",0)=0 FOR UPDATE"#,
-        &[&(pilot as i32),&(ship as i32),&(arrival.from as i32)]).await.map_err(travel_failed)?;
-    if current.is_none() {return Err("Your ship or location changed before departure.".into());}
-    if crate::losses::pending::blocked_character(txn.tx(),pilot).await.map_err(travel_failed)?
-        || crate::travel::blocked_character_in_memory(ctx.world,pilot)
-        || crate::svc::jumps::portal::blocked_character_in_memory(ctx.world,pilot) {return Err("Your earlier travel, portal activation or hull loss is still pending.".into());}
-    let hull=txn.item(ship).await.map_err(travel_failed)?.ok_or("Your ship no longer exists.")?;
-    if hull.owner_id!=pilot || hull.location_id!=arrival.from || hull.flag!=0 || hull.quantity!=1 || !hull.singleton || hull.category_id!=6 {
-        return Err("Your active ship is no longer available here.".into());
-    }
-    let (departure,mut reservation)={
-        let mut w=ctx.world.lock();
-        if !w.parks.contains_key(&arrival.system) {return Err("The destination system is not ready.".into());}
-        let park=w.parks.get_mut(&arrival.from).ok_or("Your ship is no longer in space.")?;
-        park.advance(destiny::tick_now());
-        let departure=Departure::capture(ctx,&w,request,arrival.system)?;
-        let reservation=Reservation::reserve(ctx,&mut w,arrival.from,Mobility::Jump,jump.capacitor)?;
-        (departure,reservation)
-    };
-    departure.lock_endpoints(txn.tx()).await?;
-    txn.tx().execute(r#"UPDATE "character_" SET "solarSystemID"=$2,"constellationID"=$3,"regionID"=$4 WHERE "characterID"=$1"#,
-        &[&(pilot as i32),&(arrival.system as i32),&(arrival.constellation as i32),&(arrival.region as i32)]).await.map_err(travel_failed)?;
-    txn.tx().execute(r#"UPDATE entity SET "locationID"=$2,x=$3,y=$4,z=$5 WHERE "itemID"=$1"#,
-        &[&(ship as i32),&(arrival.system as i32),&arrival.at.x,&arrival.at.y,&arrival.at.z]).await.map_err(travel_failed)?;
-    txn.tx().execute(r#"UPDATE entity SET "locationID"=$2 WHERE "itemID"=$1"#,
-        &[&(pilot as i32),&(arrival.system as i32)]).await.map_err(travel_failed)?;
-    jump.fuel.debit(&mut txn).await?;
-    // Prepare the inactive modifier profile while SQL custody is held, so
-    // accepted publication needs no await with the hull outside either park.
-    let profile=inflight::profile(txn.tx(),ctx.dogma,pilot,ship,&Default::default(),combat::now_ms())
-        .await.map_err(travel_failed)?.ok_or("Your ship's arrival profile could not be read.")?;
-    let snapshot={
-        let w=ctx.world.lock();
-        reservation.current(&w,true)?.clone()
-    };
-    inflight::write_vitals(txn.tx(),ship,snapshot.fight.as_ref().unwrap(),false).await.map_err(travel_failed)?;
-    crate::cloak::durability::save_history(txn.tx(),&snapshot,combat::now_ms()).await.map_err(travel_failed)?;
-    let source=super::completion::source(txn.tx(),arrival.from,None,snapshot.pos).await?;
-    let destination=crate::travel::Place {system:arrival.system,station:None,constellation:arrival.constellation,region:arrival.region,at:arrival.at};
-    let marker=crate::travel::begin(txn.tx(),pilot,ship,source,destination).await.map_err(travel_failed)?;
-    let events=txn.prepare_events().await.map_err(travel_failed)?;
-    {
-        let w=ctx.world.lock();
-        reservation.current(&w,true)?;
-        departure.live(&w)?;
-    } // Accepted departure: later combat remains on the live hull through COMMIT.
-    crate::travel::track_uncertain(ctx.world,&marker)?;
-    reservation.receipt=Some(marker);reservation.commit_state=CommitState::Uncertain;
-    if let Err(error)=txn.commit_prepared().await {
-        tracing::warn!(ship,"jump COMMIT reply failed: {}",crate::logging::chain(&error));
-        let (fresh,outcome)=super::completion::resolve_space(ctx.db_url,&marker).await;db=fresh;
-        match outcome {
-            crate::travel::Resolution::RolledBack=>{reservation.commit_state=CommitState::Prepared;return Err("The jump transaction rolled back; no payment was committed.".into());}
-            crate::travel::Resolution::Finalized=>{reservation.commit_state=CommitState::Accepted;return Err(Failure::Pending("This jump already completed; reconnect to its current result.".into()));}
-            crate::travel::Resolution::Accepted=>{},
-            crate::travel::Resolution::Unknown=>unreachable!("resolver retains unknown outcomes"),
+    let (mut reservation,profile,marker,events)=server.store.write(|tx| -> std::result::Result<_,Failure> {
+        let mut txn=ItemTxn::new(tx);
+        let Some(character)=txn.db().table("character_").get_id(pilot) else {
+            return Err("Your character is no longer available.".into());
+        };
+        if character.int("shipID")!=Some(ship) || character.int("solarSystemID")!=Some(arrival.from) || character.int("stationID").unwrap_or(0)!=0 {
+            return Err("Your ship or location changed before departure.".into());
         }
-    }
+        if crate::losses::pending::blocked_character(txn.db(),pilot).map_err(travel_failed)?
+            || crate::travel::blocked_character_in_memory(ctx.world,pilot)
+            || crate::svc::jumps::portal::blocked_character_in_memory(ctx.world,pilot) {return Err("Your earlier travel, portal activation or hull loss is still pending.".into());}
+        let hull=txn.item(ship).map_err(travel_failed)?.ok_or("Your ship no longer exists.")?;
+        if hull.owner_id!=pilot || hull.location_id!=arrival.from || hull.flag!=0 || hull.quantity!=1 || !hull.singleton || hull.category_id!=6 {
+            return Err("Your active ship is no longer available here.".into());
+        }
+        let (departure,reservation)={
+            let mut w=ctx.world.lock();
+            if !w.parks.contains_key(&arrival.system) {return Err("The destination system is not ready.".into());}
+            let park=w.parks.get_mut(&arrival.from).ok_or("Your ship is no longer in space.")?;
+            park.advance(destiny::tick_now());
+            let departure=Departure::capture(ctx,&w,request,arrival.system)?;
+            let reservation=Reservation::reserve(ctx,&mut w,arrival.from,Mobility::Jump,jump.capacitor)?;
+            (departure,reservation)
+        };
+        departure.check_endpoints(txn.db())?;
+        let row=txn.db().table("character_").get_id(pilot).map(|c|c.id).ok_or_else(unsaved)?;
+        txn.tx().update("character_",row,&[("solarSystemID",StoreValue::Int(arrival.system)),
+            ("constellationID",StoreValue::Int(arrival.constellation)),("regionID",StoreValue::Int(arrival.region))]).map_err(travel_failed)?;
+        update_by_id(txn.tx(),"entity",ship,&[("locationID",StoreValue::Int(arrival.system)),
+            ("x",StoreValue::Float(arrival.at.x)),("y",StoreValue::Float(arrival.at.y)),("z",StoreValue::Float(arrival.at.z))]).map_err(travel_failed)?;
+        update_by_id(txn.tx(),"entity",pilot,&[("locationID",StoreValue::Int(arrival.system))]).map_err(travel_failed)?;
+        jump.fuel.debit(&mut txn)?;
+        // Prepare the inactive modifier profile in the same write, so accepted
+        // publication needs no await with the hull outside either park.
+        let profile=inflight::profile(txn.db(),ctx.dogma,pilot,ship,&Default::default(),combat::now_ms())
+            .map_err(travel_failed)?.ok_or("Your ship's arrival profile could not be read.")?;
+        let snapshot={
+            let w=ctx.world.lock();
+            reservation.current(&w,true)?.clone()
+        };
+        inflight::write_vitals(txn.tx(),ship,snapshot.fight.as_ref().unwrap(),false).map_err(travel_failed)?;
+        crate::cloak::durability::save_history(txn.tx(),&snapshot,combat::now_ms()).map_err(travel_failed)?;
+        let source=super::completion::source(txn.db(),arrival.from,None,snapshot.pos)?;
+        let destination=crate::travel::Place {system:arrival.system,station:None,constellation:arrival.constellation,region:arrival.region,at:arrival.at};
+        let marker=crate::travel::begin(txn.tx(),pilot,ship,source,destination).map_err(travel_failed)?;
+        let events=txn.events();
+        {
+            let w=ctx.world.lock();
+            reservation.current(&w,true)?;
+            departure.live(&w)?;
+        } // Accepted departure: later combat remains on the live hull until it commits.
+        Ok((reservation,profile,marker,events))
+    })?;
     reservation.commit_state=CommitState::Accepted;
     let live={
         let mut w=ctx.world.lock();
         // Identity reservations defer removal, warp entry and death processing.
-        // The live object, including damage during COMMIT, is the one moved.
+        // The live object, including damage taken meanwhile, is the one moved.
         reservation.current(&w,false).map_err(Failure::Pending)?;
         space::remove_ship(&mut w,arrival.from,ship).ok_or_else(||Failure::Pending("Your committed jump lost its source ship.".into()))?
     };
-    let arrived=super::completion::finish_space(server,&mut db,marker,live,profile,None).await?;
+    let arrived=super::completion::finish_space(server,marker,live,profile,None).await?;
     reservation.system=arrived.place.system;
     {let w=ctx.world.lock();
         for event in events {w.notify(&jump.clients,"OnItemChange",event);}

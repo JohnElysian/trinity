@@ -23,6 +23,7 @@
 //!   range and the ore in each).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use eve_marshal::Value;
@@ -31,7 +32,8 @@ use tracing::info;
 use crate::ballpark::{Park, Vec3};
 use crate::beacons::{self, Beacon, Kind};
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{float, int, rowset};
+use crate::store::{self, Store, StoreError};
+use crate::svc::rows::rowset;
 
 const AU: f64 = 149_597_870_700.0;
 const GROUP_SCANNER_PROBE: i64 = 479;
@@ -53,7 +55,7 @@ const ATTR_SURVEY_RANGE: i32 = 197;
 const EFFECT_SYSTEM_SCAN: i64 = 1150;
 /// How long an analysis takes.
 const ANALYSIS_MS: i64 = 10_000;
-const FLAG_CARGO: i32 = 5;
+const FLAG_CARGO: i64 = 5;
 
 /// A pilot's probe out in space.
 #[derive(Debug, Clone)]
@@ -192,12 +194,14 @@ fn give(ctx: &Ctx<'_>, me: i64, to: i64, probe: i64) -> Result<(), String> {
 
 /// The launcher fitted to a ship, for the analysis's effect.
 async fn launcher(ctx: &Ctx<'_>, ship_id: i64) -> Option<i64> {
-    ctx.query_one(
-        r#"SELECT e."itemID" FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID" WHERE e."locationID" = $1 AND t."groupID" = $2 AND e."flag" BETWEEN 11 AND 34 LIMIT 1"#,
-        &[&(ship_id as i32), &(GROUP_PROBE_LAUNCHER as i32)],
-    )
-    .await
-    .and_then(|r| int(&r, 0))
+    let launchers = crate::sde::get().types_in_group(GROUP_PROBE_LAUNCHER);
+    ctx.store.read(|db| {
+        db.table("entity")
+            .find(&["locationID"], &[store::Value::Int(ship_id)])
+            .filter(|e| e.int("typeID").is_some_and(|t| launchers.contains(&(t as i32))))
+            .find(|e| e.int("flag").is_some_and(|f| (11..=34).contains(&f)))
+            .and_then(|e| e.int("itemID"))
+    })
 }
 
 fn scan_event(char_id: i64, ship_id: i64, module: i64, start: bool, started: i64, now: i64) -> Value {
@@ -237,11 +241,7 @@ async fn combine(ctx: &Ctx<'_>, me: i64, ids: Option<&Value>, group: i64) -> Res
         return Err(format!("This analysis takes {need} probes of the same type."));
     }
     let module = launcher(ctx, ship_id).await.ok_or("You have no probe launcher fitted.")?;
-    let category_ship = ctx
-        .query_one(r#"SELECT "categoryID" FROM "invGroups" WHERE "groupID" = $1"#, &[&(group as i32)])
-        .await
-        .and_then(|r| int(&r, 0))
-        == Some(CATEGORY_SHIP);
+    let category_ship = crate::sde::get().group(group).map(|g| g.category_id as i64) == Some(CATEGORY_SHIP);
     let found = {
         let w = ctx.world.lock();
         match w.parks.get(&system) {
@@ -312,16 +312,12 @@ pub async fn may_scan(_ctx: &Ctx<'_>, _ship_id: i64) -> Result<(), String> {
 /// their cycle.
 pub async fn scan_started(ctx: &Ctx<'_>, system: i64, ship_id: i64, module: i64, duration_ms: i64) {
     let Some(me) = ctx.session.char_id else { return };
-    let Some(row) = ctx
-        .query_one(
-            r#"SELECT t."groupID", e."flag" FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID" WHERE e."itemID" = $1"#,
-            &[&(module as i32)],
-        )
-        .await
-    else {
+    let Some((type_id, flag)) = ctx.store.read(|db| db.table("entity").get_id(module).map(|e| (e.int("typeID"), e.int("flag")))) else {
         return;
     };
-    let (group, flag) = (int(&row, 0).unwrap_or(0), int(&row, 1).unwrap_or(0));
+    // A module of a type the data does not know is no scanner.
+    let Some(module_type) = type_id.and_then(|t| crate::sde::get().type_(t)) else { return };
+    let (group, flag) = (module_type.group_id as i64, flag.unwrap_or(0));
     match group {
         GROUP_PROBE_LAUNCHER => launch_probe(ctx, me, system, ship_id, flag).await,
         GROUP_SHIP_SCANNER | GROUP_CARGO_SCANNER | GROUP_SURVEY_SCANNER => {
@@ -329,13 +325,11 @@ pub async fn scan_started(ctx: &Ctx<'_>, system: i64, ship_id: i64, module: i64,
                 let w = ctx.world.lock();
                 w.parks.get(&system).and_then(|p| p.ships.get(&ship_id)).and_then(|s| s.fight.as_ref()).and_then(|f| f.module(module)).and_then(|m| m.target)
             };
-            let (world, db_url, client) = (ctx.world.clone(), ctx.db_url.to_string(), ctx.client_id);
+            let (world, store, client) = (ctx.world.clone(), Arc::clone(ctx.store), ctx.client_id);
             let range = survey_range(ctx, me, ship_id, module).await;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(duration_ms.max(1) as u64)).await;
-                if let Err(e) = report(&world, &db_url, client, system, ship_id, group, target, range).await {
-                    tracing::error!("scan results: {}", crate::logging::chain(&e));
-                }
+                report(&world, &store, client, system, ship_id, group, target, range);
             });
         }
         _ => {}
@@ -344,18 +338,18 @@ pub async fn scan_started(ctx: &Ctx<'_>, system: i64, ship_id: i64, module: i64,
 
 async fn survey_range(ctx: &Ctx<'_>, me: i64, ship_id: i64, module: i64) -> f64 {
     let active = std::collections::HashSet::new();
-    let Ok(l) = crate::dogma::Loadout::load(ctx.db, ctx.dogma, me, Some(ship_id), &active).await else { return 15_000.0 };
+    let Ok(l) = ctx.store.read(|db| crate::dogma::Loadout::load(db, ctx.dogma, me, Some(ship_id), &active)) else { return 15_000.0 };
     l.find(module).map_or(15_000.0, |i| l.value(i, ATTR_SURVEY_RANGE).max(1_000.0))
 }
 
 /// A scanner's cycle ended: what it saw.
 #[allow(clippy::too_many_arguments)]
-async fn report(world: &crate::world::World, db_url: &str, client: i64, system: i64, ship_id: i64, group: i64, target: Option<i64>, range: f64) -> Result<(), tokio_postgres::Error> {
+fn report(world: &crate::world::World, store: &Store, client: i64, system: i64, ship_id: i64, group: i64, target: Option<i64>, range: f64) {
     match group {
         GROUP_SURVEY_SCANNER => {
             let w = world.lock();
-            let Some(park) = w.parks.get(&system) else { return Ok(()) };
-            let Some(me) = park.ships.get(&ship_id).map(|s| s.pos) else { return Ok(()) };
+            let Some(park) = w.parks.get(&system) else { return };
+            let Some(me) = park.ships.get(&ship_id).map(|s| s.pos) else { return };
             let rocks: Vec<Value> = park
                 .rocks
                 .values()
@@ -365,7 +359,7 @@ async fn report(world: &crate::world::World, db_url: &str, client: i64, system: 
             w.notify(&[client], "OnSurveyScanComplete", Value::Tuple(vec![Value::List(rocks)]));
         }
         GROUP_SHIP_SCANNER | GROUP_CARGO_SCANNER => {
-            let Some(target) = target else { return Ok(()) };
+            let Some(target) = target else { return };
             let (bot_loot, cap) = {
                 let w = world.lock();
                 let s = w.parks.get(&system).and_then(|p| p.ships.get(&target));
@@ -377,15 +371,28 @@ async fn report(world: &crate::world::World, db_url: &str, client: i64, system: 
             };
             let items: Vec<(i64, i64)> = match bot_loot {
                 Some(loot) => loot,
-                None => {
-                    let db = crate::db::connect(db_url).await?;
-                    let sql = if group == GROUP_CARGO_SCANNER {
-                        r#"SELECT "typeID", sum("quantity")::bigint FROM entity WHERE "locationID" = $1 AND "flag" = $2 GROUP BY 1"#
-                    } else {
-                        r#"SELECT "typeID", count(*)::bigint FROM entity WHERE "locationID" = $1 AND "flag" BETWEEN 11 AND 34 AND $2 >= 0 GROUP BY 1"#
-                    };
-                    db.query(sql, &[&(target as i32), &FLAG_CARGO]).await?.iter().map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0))).collect()
-                }
+                // What is in its hold (each type's total), or fitted (how
+                // many of each type), in the order each type first appears.
+                None => store.read(|db| {
+                    let mut items: Vec<(i64, i64)> = Vec::new();
+                    for e in db.table("entity").find(&["locationID"], &[store::Value::Int(target)]) {
+                        let flag = e.int("flag").unwrap_or(0);
+                        let (wanted, n) = if group == GROUP_CARGO_SCANNER {
+                            (flag == FLAG_CARGO, e.int("quantity").unwrap_or(0))
+                        } else {
+                            ((11..=34).contains(&flag), 1)
+                        };
+                        if !wanted {
+                            continue;
+                        }
+                        let type_id = e.int("typeID").unwrap_or(0);
+                        match items.iter_mut().find(|(t, _)| *t == type_id) {
+                            Some((_, total)) => *total += n,
+                            None => items.push((type_id, n)),
+                        }
+                    }
+                    items
+                }),
             };
             let list = Value::List(items.iter().map(|(t, n)| Value::Tuple(vec![Value::Int(*t), Value::Int(*n)])).collect());
             let w = world.lock();
@@ -397,31 +404,22 @@ async fn report(world: &crate::world::World, db_url: &str, client: i64, system: 
         }
         _ => {}
     }
-    Ok(())
 }
 
 /// A probe out of the launcher (the charge was used by the cycle).
 async fn launch_probe(ctx: &Ctx<'_>, me: i64, system: i64, ship_id: i64, flag: i64) {
-    let Some(row) = ctx
-        .query_one(
-            r#"SELECT e."typeID", t."groupID" FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                WHERE e."locationID" = $1 AND e."flag" = $2 AND t."groupID" IN ($3, $4) LIMIT 1"#,
-            &[&(ship_id as i32), &(flag as i32), &(GROUP_SCANNER_PROBE as i32), &(GROUP_SURVEY_PROBE as i32)],
-        )
-        .await
-    else {
+    let sde = crate::sde::get();
+    let probes: Vec<i32> = [GROUP_SCANNER_PROBE, GROUP_SURVEY_PROBE].iter().flat_map(|g| sde.types_in_group(*g)).copied().collect();
+    let loaded = ctx.store.read(|db| {
+        db.table("entity")
+            .find(&["locationID", "flag"], &[store::Value::Int(ship_id), store::Value::Int(flag)])
+            .find_map(|e| e.int("typeID").filter(|t| probes.contains(&(*t as i32))))
+    });
+    let Some(type_id) = loaded else {
         return;
     };
-    let (type_id, group) = (int(&row, 0).unwrap_or(0), int(&row, 1).unwrap_or(0));
-    let attrs: HashMap<i32, f64> = ctx
-        .query(
-            r#"SELECT "attributeID", COALESCE("valueFloat", "valueInt")::float8 FROM "dgmTypeAttributes" WHERE "typeID" = $1"#,
-            &[&(type_id as i32)],
-        )
-        .await
-        .iter()
-        .filter_map(|r| Some((int(r, 0)? as i32, float(r, 1)?)))
-        .collect();
+    let group = sde.type_(type_id).map_or(0, |t| t.group_id as i64);
+    let attrs: HashMap<i32, f64> = sde.type_attributes(type_id).iter().copied().collect();
     let a = |id: i32| attrs.get(&id).copied().unwrap_or(0.0);
     let now = crate::combat::now_ms();
     let lifetime = a(ATTR_LIFETIME).max(60_000.0) as i64;
@@ -449,10 +447,10 @@ async fn launch_probe(ctx: &Ctx<'_>, me: i64, system: i64, ship_id: i64, flag: i
     }
     info!("{me} launched probe {id} (type {type_id}) in {system}, {} AU, for {} s", probe.range, lifetime / 1_000);
     if group == GROUP_SURVEY_PROBE {
-        let (world, db_url, client) = (ctx.world.clone(), ctx.db_url.to_string(), ctx.client_id);
+        let (world, store, client) = (ctx.world.clone(), Arc::clone(ctx.store), ctx.client_id);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(lifetime as u64)).await;
-            if let Err(e) = survey_moons(&world, &db_url, client, me, system, pos, probe.range * AU).await {
+            if let Err(e) = survey_moons(&world, &store, client, me, system, pos, probe.range * AU) {
                 tracing::error!("moon survey: {}", crate::logging::chain(&e));
             }
         });
@@ -461,30 +459,31 @@ async fn launch_probe(ctx: &Ctx<'_>, me: i64, system: i64, ship_id: i64, flag: i
 
 /// A survey probe's flight is over: every moon within its range, and what
 /// each holds.
-async fn survey_moons(world: &crate::world::World, db_url: &str, client: i64, me: i64, system: i64, at: Vec3, range: f64) -> Result<(), tokio_postgres::Error> {
-    let db = crate::db::connect(db_url).await?;
-    let security: f64 = db
-        .query_opt(r#"SELECT COALESCE("security", 0)::float8 FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#, &[&(system as i32)])
-        .await?
-        .map_or(0.0, |r| r.get(0));
-    let moons = db
-        .query(r#"SELECT "itemID", "x", "y", "z" FROM "mapDenormalize" WHERE "solarSystemID" = $1 AND "groupID" = 8"#, &[&(system as i32)])
-        .await?;
-    let materials = crate::svc::moonmining::materials(&db).await;
+fn survey_moons(world: &crate::world::World, store: &Store, client: i64, me: i64, system: i64, at: Vec3, range: f64) -> Result<(), StoreError> {
+    // The system's security, and each of its moons with where it is.
+    let (security, moons) = store.read(|db| {
+        let security = db.table("mapSolarSystems").get_id(system).map_or(0.0, |s| s.float("security").unwrap_or(0.0));
+        let moons: Vec<(i64, Vec3)> = db
+            .table("mapDenormalize")
+            .find(&["solarSystemID"], &[store::Value::Int(system)])
+            .filter(|m| m.int("groupID") == Some(8))
+            .map(|m| (m.int("itemID").unwrap_or(0), Vec3::new(m.float("x").unwrap_or(0.0), m.float("y").unwrap_or(0.0), m.float("z").unwrap_or(0.0))))
+            .collect();
+        (security, moons)
+    });
+    let materials = crate::svc::moonmining::materials();
     let now = crate::bulkdata::filetime_now();
     let mut surveyed = Vec::new();
-    for m in moons {
-        let pos = Vec3::new(float(&m, 1).unwrap_or(0.0), float(&m, 2).unwrap_or(0.0), float(&m, 3).unwrap_or(0.0));
+    for (moon, pos) in moons {
         if (pos - at).len() > range {
             continue;
         }
-        let moon = int(&m, 0).unwrap_or(0);
         let held = crate::svc::moonmining::moon_materials(moon, security, materials);
         let products: Vec<Value> = held
             .iter()
             .map(|(t, q)| key_val(vec![("celestialID", Value::Int(moon)), ("typeID", Value::Int(*t)), ("quantity", Value::Int(*q * 100))]))
             .collect();
-        surveyed.push(moon as i32);
+        surveyed.push(moon);
         if products.is_empty() {
             continue;
         }
@@ -492,12 +491,17 @@ async fn survey_moons(world: &crate::world::World, db_url: &str, client: i64, me
         w.notify(&[client], "OnMoonScanComplete", Value::Tuple(vec![Value::List(products)]));
     }
     if !surveyed.is_empty() {
-        db.execute(
-            r#"INSERT INTO "moonScans" ("charID","moonID","scannedAt") SELECT $1, u, $3 FROM unnest($2::int[]) u
-               ON CONFLICT ("charID","moonID") DO UPDATE SET "scannedAt" = EXCLUDED."scannedAt""#,
-            &[&(me as i32), &surveyed, &now],
-        )
-        .await?;
+        store.write(|tx| {
+            for moon in &surveyed {
+                tx.upsert(
+                    "moonScans",
+                    &["charID", "moonID"],
+                    &[("charID", store::Value::Int(me)), ("moonID", store::Value::Int(*moon)), ("scannedAt", store::Value::Int(now))],
+                    &[("scannedAt", store::Value::Int(now))],
+                )?;
+            }
+            Ok::<_, StoreError>(())
+        })?;
     }
     info!("{me}'s survey probe in {system} surveyed {} moon(s)", surveyed.len());
     Ok(())

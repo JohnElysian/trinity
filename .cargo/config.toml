@@ -1,0 +1,6 @@
+# Each database test gets its own copy of a fresh world; tables are shared
+# until a test writes to one, and a test that writes market orders copies
+# that 1.6-million-row table. Four at a time keeps the suite well within a
+# 16 GB machine.
+[env]
+RUST_TEST_THREADS = "4"

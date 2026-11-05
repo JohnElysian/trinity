@@ -1,4 +1,5 @@
 use super::*;
+use super::super::fixture::{self, exists, int, kills};
 use crate::{session::Session,test_support::Database,world::{Presence,Push}};
 
 #[test]
@@ -16,164 +17,132 @@ fn stale_finalization_guard_cannot_release_a_newer_attempt() {
 struct Fixture {server:Server,ship:Ship,marker:Marker,cargo:i64}
 impl Fixture {
     async fn new()->Self {
-        let f=Database::load().await;let pilot=f.id().await;let hull=f.id().await;let cargo=f.id().await;
-        let row=f.db.query_one(r#"SELECT "stationID","solarSystemID","constellationID","regionID" FROM "staStations" WHERE "stationID"=60014659"#,&[]).await.unwrap();
-        let (station,system,constellation,region)=(row.get::<_,i32>(0),row.get::<_,i32>(1),row.get::<_,i32>(2),row.get::<_,i32>(3));
-        f.db.execute(r#"INSERT INTO "character_"("characterID","characterName","corporationID","shipID","stationID","solarSystemID","constellationID","regionID",balance)
-            VALUES($1,$2,1000167,$3,$4,$5,$6,$7,1000)"#,&[&pilot,&format!("Pending arrival {pilot}"),&hull,&station,&system,&constellation,&region]).await.unwrap();
-        f.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton,x,y,z) VALUES
-            ($1,587,$2,$3,4,1,1,0,0,0),($2,1373,$2,$3,57,1,1,0,0,0),($4,34,$2,$1,5,7,0,0,0,0)"#,&[&hull,&pilot,&station,&cargo]).await.unwrap();
-        let session=Session {char_id:Some(pilot as i64),ship_id:Some(hull as i64),station_id:Some(station as i64),solar_system_id2:Some(system as i64),..Default::default()};
-        let mut ship=inflight::ship_for_space(&f.ctx(&session),pilot as i64,hull as i64).await.unwrap();
-        ship.pos=Vec3::new(111.0,222.0,333.0);ship.fight.as_mut().unwrap().vitals.hull_damage=17.0;
-        let server=Server {table:Default::default(),db:crate::db::Shared::new(f.db,f.url.clone()),db_url:f.url,node_id:1,bulk:f.bulk,dogma:f.dogma,world:f.world,
-            services:crate::svc::registry(),dump_dir:Default::default(),alliance_join_delay_secs:0,sov_claim_delay_secs:0};
-        let mut db=crate::db::connect(&server.db_url).await.unwrap();let tx=db.transaction().await.unwrap();
-        let marker=begin(&tx,pilot as i64,hull as i64,station as i64,system as i64).await.unwrap();tx.commit().await.unwrap();
-        Self {server,ship,marker,cargo:cargo as i64}
+        let server=fixture::server(Database::load().await);
+        let (ship,marker,cargo)=docked_pilot(&server).await;
+        Self {server,ship,marker,cargo}
     }
-    async fn blocked(&self) {
-        assert!(blocked(&*self.server.db.snapshot(),self.ship.id).await.unwrap());
-        assert!(blocked_character(&*self.server.db.snapshot(),self.ship.pilot.char_id).await.unwrap());
+    fn store(&self)->&Store {&self.server.store}
+    fn pilot(&self)->i64 {self.ship.pilot.char_id}
+    fn blocked(&self) {
+        assert!(self.store().read(|db| blocked(db,self.ship.id)).unwrap());
+        assert!(self.store().read(|db| blocked_character(db,self.pilot())).unwrap());
     }
-    async fn cleanup(&self) {
-        let pilot=self.ship.pilot.char_id as i32;
-        self.server.db.snapshot().execute(r#"DELETE FROM "killLogParticipants" WHERE "killID" IN(SELECT "killID" FROM "killLog" WHERE "victimCharID"=$1)"#,&[&pilot]).await.unwrap();
-        self.server.db.snapshot().execute(r#"DELETE FROM "killLog" WHERE "victimCharID"=$1"#,&[&pilot]).await.unwrap();
-        self.server.db.snapshot().execute(r#"DELETE FROM "insuranceContracts" WHERE "ownerID"=$1"#,&[&pilot]).await.unwrap();
-        self.server.db.snapshot().execute(r#"DELETE FROM entity_attributes WHERE "itemID" IN(SELECT "itemID" FROM entity WHERE "ownerID"=$1)"#,&[&pilot]).await.unwrap();
-        self.server.db.snapshot().execute(r#"DELETE FROM entity WHERE "ownerID"=$1"#,&[&pilot]).await.unwrap();
-        self.server.db.snapshot().execute(r#"DELETE FROM "character_" WHERE "characterID"=$1"#,&[&pilot]).await.unwrap();
+    /// The loss recorded with the arrival's marker.
+    fn recorded(&self)->Option<String> {
+        self.store().read(|db| db.table("pendingStationArrivals").get_id(self.ship.id).and_then(|p| p.text("loss").map(str::to_string)))
     }
 }
 
+/// A pilot just docked at the fixture station in a fresh hull with cargo,
+/// its arrival marked: the ship as last seen in space, the marker, the cargo.
+async fn docked_pilot(server:&Server)->(Ship,Marker,i64) {
+    let store=&*server.store;
+    let (pilot,hull,cargo)=(fixture::id(store),fixture::id(store),fixture::id(store));
+    let (station,system,constellation,region)=fixture::station(store);
+    store.write(|tx| {
+        fixture::character(tx,pilot,"Pending arrival",1000167,(hull,station,system,constellation,region),1000.0)?;
+        fixture::item(tx,(hull,587,pilot,station,4,1),true,(0.0,0.0,0.0))?;
+        fixture::item(tx,(pilot,1373,pilot,station,57,1),true,(0.0,0.0,0.0))?;
+        fixture::item(tx,(cargo,34,pilot,hull,5,7),false,(0.0,0.0,0.0))
+    }).unwrap();
+    let session=Session {char_id:Some(pilot),ship_id:Some(hull),station_id:Some(station),solar_system_id2:Some(system),..Default::default()};
+    let ctx=crate::services::Ctx {bulk:&server.bulk,dogma:&server.dogma,session:&session,store:&server.store,node_id:1,world:&server.world,client_id:1};
+    let mut ship=inflight::ship_for_space(&ctx,pilot,hull).await.unwrap();
+    ship.pos=Vec3::new(111.0,222.0,333.0);ship.fight.as_mut().unwrap().vitals.hull_damage=17.0;
+    let marker=store.write(|tx| begin(tx,pilot,hull,station,system)).unwrap();
+    (ship,marker,cargo)
+}
+
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn quarantined_station_page_does_not_starve_later_confirmed_arrivals() {
-    let bad=Fixture::new().await;
-    let mut db=crate::db::connect(&bad.server.db_url).await.unwrap();
-    db.execute(r#"WITH hulls AS (
-        INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-        SELECT nextval('dyn_id_seq')::integer,587,$1,$2,4,1,1 FROM generate_series(1,64) RETURNING "itemID"
-        ) INSERT INTO "pendingStationArrivals"("shipID","characterID","stationID","sourceSystemID","shipTypeID","createdAt",loss)
-        SELECT "itemID",$1,$2,$3,587,0,'corrupt earlier arrival' FROM hulls"#,
-        &[&(bad.ship.pilot.char_id as i32),&(bad.marker.station as i32),&(bad.marker.source as i32)]).await.unwrap();
-    let mut good=Fixture::new().await;
-    good.ship.fight.as_mut().unwrap().vitals.hull_damage=good.ship.fight.as_ref().unwrap().vitals.hull_max;
-    let loss=Loss::of(&good.ship,good.marker.source,false);
+    let bad=Fixture::new().await;let store=bad.store();
+    store.write(|tx| {
+        for _ in 0..64 {
+            let hull=tx.nextval("dyn_id_seq")?;
+            fixture::item(tx,(hull,587,bad.pilot(),bad.marker.station,4,1),true,(0.0,0.0,0.0))?;
+            tx.insert("pendingStationArrivals",&[("shipID",int(hull)),("characterID",int(bad.pilot())),("stationID",int(bad.marker.station)),
+                ("sourceSystemID",int(bad.marker.source)),("shipTypeID",int(587)),("createdAt",int(0)),("loss",store::Value::Text("corrupt earlier arrival".into()))])?;
+        }
+        Ok::<_,StoreError>(())
+    }).unwrap();
+    let (mut good,marker,_)=docked_pilot(&bad.server).await;
+    good.fight.as_mut().unwrap().vitals.hull_damage=good.fight.as_ref().unwrap().vitals.hull_max;
+    let loss=Loss::of(&good,marker.source,false);
     let raw=serde_json::to_string(&StoredLoss::from(&loss)).unwrap();
-    db.execute(r#"UPDATE "pendingStationArrivals" SET loss=$2 WHERE "shipID"=$1"#,
-        &[&(good.ship.id as i32),&raw]).await.unwrap();
-    retry(&good.server,&mut db).await;
-    assert!(blocked(&db,good.ship.id).await.unwrap());
-    retry(&good.server,&mut db).await;
-    assert!(!blocked(&db,good.ship.id).await.unwrap(),"valid arrival beyond corrupt first page must settle");
-    assert_eq!(db.query_one(r#"SELECT count(*) FROM "killLog" WHERE "victimItemID"=$1"#,
-        &[&(good.ship.id as i32)]).await.unwrap().get::<_,i64>(0),1);
-    assert_eq!(db.query_one(r#"SELECT count(*) FROM "pendingStationArrivals" p JOIN entity e ON e."itemID"=p."shipID"
-        WHERE p."characterID"=$1 AND p.loss IS NOT NULL"#,
-        &[&(bad.ship.pilot.char_id as i32)]).await.unwrap().get::<_,i64>(0),64);
-    retry(&good.server,&mut db).await;
-    assert_eq!(good.server.world.lock().pending_station_arrival_cursor,0);
-    bad.cleanup().await;good.cleanup().await;
+    fixture::set(store,"pendingStationArrivals",good.id,&[("loss",store::Value::Text(raw.into()))]);
+    let good_blocked=|| store.read(|db| blocked(db,good.id)).unwrap();
+    retry(&bad.server,store).await;
+    assert!(good_blocked());
+    retry(&bad.server,store).await;
+    assert!(!good_blocked(),"valid arrival beyond corrupt first page must settle");
+    assert_eq!(kills(store,good.id),1);
+    let quarantined=store.read(|db| db.table("pendingStationArrivals").find(&["characterID"],&[int(bad.pilot())])
+        .filter(|p| p.text("loss").is_some()).filter_map(|p| p.int("shipID")).filter(|ship| db.table("entity").get_id(*ship).is_some()).count());
+    assert_eq!(quarantined,64);
+    retry(&bad.server,store).await;
+    assert_eq!(bad.server.world.lock().pending_station_arrival_cursor,0);
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn failed_healthy_arrival_flush_keeps_marker_and_retries_latest_damage_without_a_live_park() {
-    let f=Fixture::new().await;let mut db=crate::db::connect(&f.server.db_url).await.unwrap();
+    let f=Fixture::new().await;let store=f.store();
     let mut rx={let mut world=f.server.world.lock();let rx=world.connect(1);world.set_presence(1,Some(Presence {
-        char_id:f.ship.pilot.char_id,corp_id:1000167,solar_system_id:f.marker.source,docked:false,station_id:None,role:0}));rx};
-    let name=format!("reject_pending_vitals_{}",f.ship.id);
-    f.server.db.snapshot().batch_execute(&format!(r#"CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-        IF NEW."itemID"={} THEN RAISE EXCEPTION 'forced final snapshot failure'; END IF; RETURN NEW; END $$;
-        CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON entity_attributes FOR EACH ROW EXECUTE FUNCTION {name}();"#,f.ship.id)).await.unwrap();
-    let result=finish(&f.server,&mut db,f.marker,f.ship.clone()).await;
-    f.server.db.snapshot().batch_execute(&format!("DROP TRIGGER {name} ON entity_attributes; DROP FUNCTION {name}();")).await.unwrap();
-    assert!(result.is_err());f.blocked().await;
+        char_id:f.pilot(),corp_id:1000167,solar_system_id:f.marker.source,docked:false,station_id:None,role:0}));rx};
+    // The pilot is not where the marker left them for now, so the final
+    // snapshot cannot be saved.
+    fixture::set(store,"character_",f.pilot(),&[("stationID",int(0))]);
+    let result=finish(&f.server,store,f.marker,f.ship.clone()).await;
+    fixture::set(store,"character_",f.pilot(),&[("stationID",int(f.marker.station))]);
+    assert!(result.is_err());f.blocked();
     assert_eq!(f.server.world.lock().pending_station_arrivals.len(),1);
     assert!(f.server.world.lock().parks.is_empty());
-    assert!(f.server.db.snapshot().query_one(r#"SELECT loss IS NULL FROM "pendingStationArrivals" WHERE "shipID"=$1"#,&[&(f.ship.id as i32)]).await.unwrap().get::<_,bool>(0));
-    retry(&f.server,&mut db).await;
-    assert!(!blocked_character(&*f.server.db.snapshot(),f.ship.pilot.char_id).await.unwrap());
+    assert!(f.recorded().is_none());
+    retry(&f.server,store).await;
+    assert!(!store.read(|db| blocked_character(db,f.pilot())).unwrap());
     assert!(f.server.world.lock().pending_station_arrivals.is_empty());
-    let damage=f.server.db.snapshot().query_one(r#"SELECT COALESCE("valueFloat","valueInt"::float8) FROM entity_attributes WHERE "itemID"=$1 AND "attributeID"=3"#,&[&(f.ship.id as i32)]).await.unwrap().get::<_,f64>(0);
-    assert_eq!(damage,17.0);
-    while let Ok(event)=rx.try_recv(){assert!(!matches!(event,Push::Move(_)),"background completion cannot redirect a newer session; failed transition connections close and reconnect from the database");}
+    let damage=|column:&str| store.read(|db| db.table("entity_attributes").get(&[int(f.ship.id),int(3)]).and_then(|a| a.float(column)));
+    assert_eq!(damage("valueFloat").or_else(|| damage("valueInt")),Some(17.0));
+    while let Ok(event)=rx.try_recv(){assert!(!matches!(event,Push::Move(_)),"background completion cannot redirect a newer session; failed transition connections close and reconnect from the store");}
     // Replaying the same final snapshot cannot overwrite later station repair.
-    f.server.db.snapshot().execute(r#"UPDATE entity_attributes SET "valueFloat"=0 WHERE "itemID"=$1 AND "attributeID"=3"#,&[&(f.ship.id as i32)]).await.unwrap();
-    finish(&f.server,&mut db,f.marker,f.ship.clone()).await.unwrap();
-    assert_eq!(f.server.db.snapshot().query_one(r#"SELECT "valueFloat" FROM entity_attributes WHERE "itemID"=$1 AND "attributeID"=3"#,&[&(f.ship.id as i32)]).await.unwrap().get::<_,f64>(0),0.0);
-    f.cleanup().await;
+    store.write(|tx| {
+        let row=tx.table("entity_attributes").get(&[int(f.ship.id),int(3)]).unwrap().id;
+        tx.update("entity_attributes",row,&[("valueFloat",store::Value::Float(0.0))])
+    }).unwrap();
+    finish(&f.server,store,f.marker,f.ship.clone()).await.unwrap();
+    assert_eq!(damage("valueFloat"),Some(0.0));
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn durable_lethal_arrival_recovers_after_restart_and_settles_insurance_and_loss_once() {
     let mut f=Fixture::new().await;f.ship.fight.as_mut().unwrap().vitals.hull_damage=f.ship.fight.as_ref().unwrap().vitals.hull_max;
+    let store=f.server.store.clone();
     let now=crate::bulkdata::filetime_now();
-    f.server.db.snapshot().execute(r#"INSERT INTO "insuranceContracts"("contractID","shipID","ownerID","startDate","endDate",fraction,amount,payout,"isCorp")
-        VALUES($1,$1,$2,$3,$4,0.5,100,500,0)"#,&[&(f.ship.id as i32),&(f.ship.pilot.char_id as i32),&(now-1),&(now+600_000_000)]).await.unwrap();
-    let mut db=crate::db::connect(&f.server.db_url).await.unwrap();let name=format!("reject_pending_loss_{}",f.ship.id);
-    f.server.db.snapshot().batch_execute(&format!(r#"CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-        IF NEW."victimItemID"={} THEN RAISE EXCEPTION 'forced pending settlement failure'; END IF; RETURN NEW; END $$;
-        CREATE TRIGGER {name} BEFORE INSERT ON "killLog" FOR EACH ROW EXECUTE FUNCTION {name}();"#,f.ship.id)).await.unwrap();
-    let result=finish(&f.server,&mut db,f.marker,f.ship.clone()).await;
-    f.server.db.snapshot().batch_execute(&format!(r#"DROP TRIGGER {name} ON "killLog"; DROP FUNCTION {name}();"#)).await.unwrap();
-    assert!(result.is_err());f.blocked().await;
-    let raw:String=f.server.db.snapshot().query_one(r#"SELECT loss FROM "pendingStationArrivals" WHERE "shipID"=$1"#,&[&(f.ship.id as i32)]).await.unwrap().get(0);
-    assert!(decode(&raw,f.marker).is_some());
-    assert!(f.server.db.snapshot().query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(f.cargo as i32)]).await.unwrap().is_some());
+    store.write(|tx| fixture::insure(tx,f.ship.id,f.ship.id,f.pilot(),now-1,now+600_000_000)).unwrap();
+    fixture::refuse_next_kill(&store);
+    let result=finish(&f.server,&store,f.marker,f.ship.clone()).await;
+    assert!(result.is_err());f.blocked();
+    assert!(decode(&f.recorded().unwrap(),f.marker).is_some());
+    assert!(exists(&store,f.cargo));
     f.server.world=Default::default(); // No detached Ship or notification identity survives restart.
-    retry(&f.server,&mut db).await;
-    assert!(!blocked_character(&*f.server.db.snapshot(),f.ship.pilot.char_id).await.unwrap());
-    let row=f.server.db.snapshot().query_one(r#"SELECT "shipID",balance FROM "character_" WHERE "characterID"=$1"#,&[&(f.ship.pilot.char_id as i32)]).await.unwrap();
-    let capsule=i64::from(row.get::<_,i32>(0));assert_ne!(capsule,f.ship.id);assert_eq!(row.get::<_,f64>(1),1500.0);
-    retry(&f.server,&mut db).await;
-    let repeated=finish(&f.server,&mut db,f.marker,f.ship.clone()).await.unwrap();assert_eq!(repeated.ship_id,capsule);
-    assert_eq!(f.server.db.snapshot().query_one(r#"SELECT COUNT(*) FROM "killLog" WHERE "victimItemID"=$1"#,&[&(f.ship.id as i32)]).await.unwrap().get::<_,i64>(0),1);
-    assert_eq!(f.server.db.snapshot().query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&(f.ship.pilot.char_id as i32)]).await.unwrap().get::<_,f64>(0),1500.0);
-    f.cleanup().await;
+    retry(&f.server,&store).await;
+    assert!(!store.read(|db| blocked_character(db,f.pilot())).unwrap());
+    let capsule=fixture::character_int(&store,f.pilot(),"shipID").unwrap();
+    assert_ne!(capsule,f.ship.id);assert_eq!(fixture::character_float(&store,f.pilot(),"balance"),Some(1500.0));
+    retry(&f.server,&store).await;
+    let repeated=finish(&f.server,&store,f.marker,f.ship.clone()).await.unwrap();assert_eq!(repeated.ship_id,capsule);
+    assert_eq!(kills(&store,f.ship.id),1);
+    assert_eq!(fixture::character_float(&store,f.pilot(),"balance"),Some(1500.0));
 }
 
 #[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
 async fn marker_without_a_final_snapshot_and_corrupt_loss_stay_quarantined_without_invented_outcomes() {
-    let f=Fixture::new().await;let mut db=crate::db::connect(&f.server.db_url).await.unwrap();
-    retry(&f.server,&mut db).await;f.blocked().await;
+    let f=Fixture::new().await;let store=f.store();
+    retry(&f.server,store).await;f.blocked();
     assert!(f.server.world.lock().pending_station_arrivals.is_empty());
-    f.server.db.snapshot().execute(r#"UPDATE "pendingStationArrivals" SET loss='{}' WHERE "shipID"=$1"#,&[&(f.ship.id as i32)]).await.unwrap();
-    retry(&f.server,&mut db).await;f.blocked().await;
-    assert_eq!(f.server.db.snapshot().query_one(r#"SELECT "shipID" FROM "character_" WHERE "characterID"=$1"#,&[&(f.ship.pilot.char_id as i32)]).await.unwrap().get::<_,i32>(0),f.ship.id as i32);
-    assert!(f.server.db.snapshot().query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&(f.cargo as i32)]).await.unwrap().is_some());
-    assert_eq!(f.server.db.snapshot().query_one(r#"SELECT count(*) FROM "killLog" WHERE "victimItemID"=$1"#,&[&(f.ship.id as i32)]).await.unwrap().get::<_,i64>(0),0);
-    assert!(f.server.db.snapshot().query_opt(r#"SELECT 1 FROM entity_attributes WHERE "itemID"=$1 AND "attributeID"=3"#,&[&(f.ship.id as i32)]).await.unwrap().is_none(),"no guessed heal or death is persisted");
-    f.cleanup().await;
-}
-
-#[tokio::test]
-#[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
-async fn cancelled_finalization_releases_its_busy_claim_and_heartbeat_can_retry() {
-    let f=Fixture::new().await;
-    let blocker=crate::db::connect(&f.server.db_url).await.unwrap();blocker.batch_execute("BEGIN").await.unwrap();
-    blocker.query_one(r#"SELECT 1 FROM entity WHERE "itemID"=$1 FOR UPDATE"#,&[&(f.ship.id as i32)]).await.unwrap();
-    let pid:i32=blocker.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-    let mut db=crate::db::connect(&f.server.db_url).await.unwrap();
-    let mut future=Box::pin(finish(&f.server,&mut db,f.marker,f.ship.clone()));
-    tokio::select! {
-        result=&mut future=>panic!("finalization passed a held hull lock: {result:?}"),
-        waited=tokio::time::timeout(std::time::Duration::from_secs(10),async {loop {
-            if f.server.db.snapshot().query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",&[&pid]).await.unwrap().get::<_,bool>(0) {break;}
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }})=>{waited.expect("finalization reaches the held hull lock");}
-    }
-    assert!(f.server.world.lock().pending_station_arrivals[&f.ship.id].busy);
-    drop(future);
-    assert!(!f.server.world.lock().pending_station_arrivals[&f.ship.id].busy);
-    f.blocked().await;
-    blocker.batch_execute("COMMIT").await.unwrap();
-    retry(&f.server,&mut db).await;
-    assert!(!blocked(&*f.server.db.snapshot(),f.ship.id).await.unwrap());
-    assert!(f.server.world.lock().pending_station_arrivals.is_empty());
-    f.cleanup().await;
+    fixture::set(store,"pendingStationArrivals",f.ship.id,&[("loss",store::Value::Text("{}".into()))]);
+    retry(&f.server,store).await;f.blocked();
+    assert_eq!(fixture::character_int(store,f.pilot(),"shipID"),Some(f.ship.id));
+    assert!(exists(store,f.cargo));
+    assert_eq!(kills(store,f.ship.id),0);
+    assert!(store.read(|db| db.table("entity_attributes").get(&[int(f.ship.id),int(3)]).is_none()),"no guessed heal or death is persisted");
 }

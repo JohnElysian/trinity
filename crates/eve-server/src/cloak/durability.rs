@@ -5,119 +5,125 @@
 //! Keeping an already observed deadline is this server's continuity policy;
 //! this is not a new original dogma attribute or a reconstructed timer formula.
 use super::History;
+use crate::store::{Db, Row, StoreError, Tx, Value};
 use crate::{ballpark::Ship, items::Item};
-use tokio_postgres::{Client, GenericClient, Transaction};
 
 #[cfg(test)]
 mod tests;
 
-pub async fn ensure(db:&Client)->Result<(),tokio_postgres::Error> {
-    db.batch_execute(r#"
-        CREATE TABLE IF NOT EXISTS "cloakCooldowns" (
-            "itemID" integer PRIMARY KEY REFERENCES entity("itemID") ON DELETE CASCADE,
-            "shipID" integer NOT NULL REFERENCES entity("itemID") ON DELETE CASCADE,
-            "ownerID" integer NOT NULL, "typeID" integer NOT NULL, "shipTypeID" integer NOT NULL,
-            "targetingAt" bigint NOT NULL DEFAULT 0, "readyAt" bigint NOT NULL DEFAULT 0);
-        CREATE INDEX IF NOT EXISTS "cloakCooldowns_ship" ON "cloakCooldowns" ("shipID");
-        CREATE OR REPLACE FUNCTION invalidate_cloak_cooldowns() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-            IF OLD."ownerID" IS DISTINCT FROM NEW."ownerID"
-                OR OLD."typeID" IS DISTINCT FROM NEW."typeID"
-                OR OLD.singleton IS DISTINCT FROM NEW.singleton
-                OR OLD.quantity IS DISTINCT FROM NEW.quantity THEN
-                DELETE FROM "cloakCooldowns" WHERE "itemID"=OLD."itemID" OR "shipID"=OLD."itemID";
-            ELSIF OLD."locationID" IS DISTINCT FROM NEW."locationID"
-                OR (OLD.flag IS DISTINCT FROM NEW.flag AND COALESCE(NEW.flag,0) NOT BETWEEN 11 AND 35) THEN
-                -- A hull may dock, undock or be stored with its fittings. Only
-                -- a fitted module leaving its hull invalidates this binding.
-                DELETE FROM "cloakCooldowns" WHERE "itemID"=OLD."itemID" AND "shipID"<>OLD."itemID";
-            END IF;
-            RETURN NEW;
-        END $$;
-        CREATE OR REPLACE TRIGGER invalidate_cloak_cooldowns
-            BEFORE UPDATE OF "ownerID","typeID",singleton,quantity,"locationID",flag ON entity
-            FOR EACH ROW EXECUTE FUNCTION invalidate_cloak_cooldowns();
-    "#).await
+/// The `cloakCooldowns` table and the entity trigger that drops a binding
+/// whose custody changed are part of the store's schema.
+pub fn ensure(_tx:&mut Tx<'_>)->Result<(),StoreError> {
+    Ok(())
 }
 
-/// The caller normally already holds the character and hull custody locks.
-/// Check them again and lock fitted modules before writing their deadlines.
-/// Only observed timestamps are saved; repeated saves never restart a timer.
-pub async fn save_history(tx:&Transaction<'_>,ship:&Ship,now:i64)->Result<(),tokio_postgres::Error> {
+fn of(types:&[i32],ty:Option<i64>)->bool {
+    ty.is_some_and(|ty|types.iter().any(|t|i64::from(*t)==ty))
+}
+
+/// One assembled, unstacked item (`quantity=1 AND singleton<>0`).
+fn assembled(e:&Row)->bool {
+    e.int("quantity")==Some(1) && e.int("singleton").is_some_and(|s|s!=0)
+}
+
+fn fitted(e:&Row)->bool {
+    e.int("flag").is_some_and(|f|(11..=35).contains(&f))
+}
+
+/// Recheck the character's hull and fitted modules before writing their
+/// deadlines. Only observed timestamps are saved; repeated saves never
+/// restart a timer.
+pub fn save_history(tx:&mut Tx<'_>,ship:&Ship,now:i64)->Result<(),StoreError> {
     let Some(fighter)=&ship.fight else{return Ok(());};
     let mut history=fighter.cloak_history.clone();history.prune(now);
-    let owner=ship.pilot.char_id as i32;
-    let hull=ship.id as i32;
-    let ty=ship.pilot.type_id as i32;
-    if tx.query_opt(r#"SELECT 1 FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "invGroups" g ON g."groupID"=t."groupID"
-        WHERE e."itemID"=$1 AND e."ownerID"=$2 AND e."typeID"=$3
-        AND e.quantity=1 AND e.singleton<>0 AND g."categoryID"=6 FOR UPDATE OF e"#,
-        &[&hull,&owner,&ty]).await?.is_none() {return Ok(());}
-    tx.execute(r#"DELETE FROM "cloakCooldowns" WHERE "shipID"=$1 AND "targetingAt"<=$2 AND "readyAt"<=$2"#,
-        &[&hull,&now]).await?;
+    let owner=ship.pilot.char_id;
+    let hull=ship.id;
+    let ty=ship.pilot.type_id;
+    let sde=crate::sde::get();
+    let entity=tx.table("entity");
+    let hull_held=entity.get_id(hull).is_some_and(|e|e.int("ownerID")==Some(owner) && e.int("typeID")==Some(ty)
+        && assembled(&e) && of(sde.types_in_category(6),e.int("typeID")));
+    if !hull_held {return Ok(());}
+    let expired:Vec<_>=tx.table("cloakCooldowns").find(&["shipID"],&[Value::Int(hull)])
+        .filter(|c|c.int("targetingAt").is_some_and(|t|t<=now) && c.int("readyAt").is_some_and(|r|r<=now))
+        .map(|c|c.id).collect();
+    for id in expired {tx.delete("cloakCooldowns",id)?;}
     if history.targeting_at>now {
-        save(tx,hull,hull,owner,ty,ty,history.targeting_at,0).await?;
+        save(tx,hull,hull,owner,ty,ty,history.targeting_at,0)?;
     }
-    let ids:Vec<i32>=history.module_ready.keys().take(25).map(|id|*id as i32).collect();
-    if ids.is_empty() {return Ok(());}
-    let rows=tx.query(r#"SELECT e."itemID",e."typeID" FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-        WHERE e."itemID"=ANY($1) AND e."ownerID"=$2 AND e."locationID"=$3
-        AND e.quantity=1 AND e.singleton<>0 AND e.flag BETWEEN 11 AND 35 AND t."groupID"=330
-        ORDER BY e."itemID" FOR UPDATE OF e"#,&[&ids,&owner,&hull]).await?;
-    for row in rows {
-        let id:i32=row.get(0);let module_type:i32=row.get(1);
-        save(tx,id,hull,owner,module_type,ty,0,history.module_ready[&i64::from(id)]).await?;
+    // The deadlines are keyed by item, so these come in itemID order.
+    let entity=tx.table("entity");
+    let modules:Vec<(i64,i64)>=history.module_ready.keys().take(25)
+        .filter_map(|id|entity.get_id(*id))
+        .filter(|e|e.int("ownerID")==Some(owner) && e.int("locationID")==Some(hull) && assembled(e) && fitted(e)
+            && of(sde.types_in_group(330),e.int("typeID")))
+        .filter_map(|e|Some((e.int("itemID")?,e.int("typeID")?))).collect();
+    for (id,module_type) in modules {
+        save(tx,id,hull,owner,module_type,ty,0,history.module_ready[&id])?;
     }
     Ok(())
 }
 
-async fn save(tx:&Transaction<'_>,item:i32,ship:i32,owner:i32,ty:i32,ship_type:i32,targeting:i64,ready:i64)->Result<(),tokio_postgres::Error> {
+/// Write one deadline. A row still bound to the same hull, owner and types
+/// keeps the later of its stored deadline (when that is a plausible time)
+/// and the new one; any other binding is replaced.
+#[allow(clippy::too_many_arguments)]
+fn save(tx:&mut Tx<'_>,item:i64,ship:i64,owner:i64,ty:i64,ship_type:i64,targeting:i64,ready:i64)->Result<(),StoreError> {
     let latest=(i64::MAX/10_000)-11_644_473_600_000;
-    tx.execute(r#"INSERT INTO "cloakCooldowns" ("itemID","shipID","ownerID","typeID","shipTypeID","targetingAt","readyAt")
-        VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT ("itemID") DO UPDATE SET
-        "shipID"=$2,"ownerID"=$3,"typeID"=$4,"shipTypeID"=$5,
-        "targetingAt"=CASE WHEN "cloakCooldowns"."shipID"=$2 AND "cloakCooldowns"."ownerID"=$3
-            AND "cloakCooldowns"."typeID"=$4 AND "cloakCooldowns"."shipTypeID"=$5
-            THEN GREATEST(CASE WHEN "cloakCooldowns"."targetingAt" BETWEEN 0 AND $8 THEN "cloakCooldowns"."targetingAt" ELSE 0 END,$6) ELSE $6 END,
-        "readyAt"=CASE WHEN "cloakCooldowns"."shipID"=$2 AND "cloakCooldowns"."ownerID"=$3
-            AND "cloakCooldowns"."typeID"=$4 AND "cloakCooldowns"."shipTypeID"=$5
-            THEN GREATEST(CASE WHEN "cloakCooldowns"."readyAt" BETWEEN 0 AND $8 THEN "cloakCooldowns"."readyAt" ELSE 0 END,$7) ELSE $7 END"#,
-        &[&item,&ship,&owner,&ty,&ship_type,&targeting,&ready,&latest]).await?;
-    Ok(())
+    let kept=|stored:Option<i64>,new:i64|stored.filter(|v|(0..=latest).contains(v)).unwrap_or(0).max(new);
+    let existing=tx.table("cloakCooldowns").get_id(item).map(|c|{
+        let same=c.int("shipID")==Some(ship) && c.int("ownerID")==Some(owner) && c.int("typeID")==Some(ty) && c.int("shipTypeID")==Some(ship_type);
+        let targeting=if same {kept(c.int("targetingAt"),targeting)} else {targeting};
+        let ready=if same {kept(c.int("readyAt"),ready)} else {ready};
+        (c.id,targeting,ready)
+    });
+    match existing {
+        Some((row,targeting,ready))=>tx.update("cloakCooldowns",row,&[
+            ("shipID",Value::Int(ship)),("ownerID",Value::Int(owner)),("typeID",Value::Int(ty)),("shipTypeID",Value::Int(ship_type)),
+            ("targetingAt",Value::Int(targeting)),("readyAt",Value::Int(ready))]),
+        None=>tx.insert("cloakCooldowns",&[
+            ("itemID",Value::Int(item)),("shipID",Value::Int(ship)),("ownerID",Value::Int(owner)),("typeID",Value::Int(ty)),
+            ("shipTypeID",Value::Int(ship_type)),("targetingAt",Value::Int(targeting)),("readyAt",Value::Int(ready))]).map(|_|()),
+    }
 }
 
 /// Reads deadlines only. It cannot restore active effects or native movement.
 /// Each row must still describe the same assembled hull and fitted module.
-pub async fn load_history(db:&impl GenericClient,owner:i64,ship:i64,now:i64)->Result<History,tokio_postgres::Error> {
-    let rows=db.query(r#"SELECT c."itemID",c."targetingAt",c."readyAt" FROM "cloakCooldowns" c
-        JOIN entity h ON h."itemID"=c."shipID" AND h."ownerID"=c."ownerID" AND h."typeID"=c."shipTypeID"
-        JOIN "invTypes" ht ON ht."typeID"=h."typeID" JOIN "invGroups" hg ON hg."groupID"=ht."groupID"
-        JOIN entity e ON e."itemID"=c."itemID" AND e."ownerID"=c."ownerID" AND e."typeID"=c."typeID"
-        JOIN "invTypes" et ON et."typeID"=e."typeID"
-        WHERE c."shipID"=$1 AND c."ownerID"=$2 AND h.quantity=1 AND h.singleton<>0 AND hg."categoryID"=6
-        AND e.quantity=1 AND e.singleton<>0
-        AND (e."itemID"=h."itemID" OR (e."locationID"=h."itemID" AND e.flag BETWEEN 11 AND 35 AND et."groupID"=330))
-        ORDER BY c."itemID""#,&[&(ship as i32),&(owner as i32)]).await?;
+pub fn load_history(db:&Db,owner:i64,ship:i64,now:i64)->Result<History,StoreError> {
+    // The hull's own row is the hull, a ship type; the others are fitted
+    // cloaking devices (group 330).
+    let sde=crate::sde::get();
+    let entity=db.table("entity");
+    let mut rows:Vec<(i64,i64,i64)>=db.table("cloakCooldowns").find(&["shipID"],&[Value::Int(ship)])
+        .filter(|c|c.int("ownerID")==Some(owner))
+        .filter(|c|{
+            let Some(h)=c.int("shipID").and_then(|id|entity.get_id(id)) else{return false;};
+            let Some(e)=c.int("itemID").and_then(|id|entity.get_id(id)) else{return false;};
+            h.int("ownerID")==c.int("ownerID") && h.int("typeID")==c.int("shipTypeID")
+                && e.int("ownerID")==c.int("ownerID") && e.int("typeID")==c.int("typeID")
+                && assembled(&h) && of(sde.types_in_category(6),h.int("typeID")) && assembled(&e)
+                && (e.int("itemID")==h.int("itemID")
+                    || (e.int("locationID")==h.int("itemID") && fitted(&e) && of(sde.types_in_group(330),e.int("typeID"))))
+        })
+        .filter_map(|c|Some((c.int("itemID")?,c.int("targetingAt")?,c.int("readyAt")?))).collect();
+    rows.sort_by_key(|r|r.0);
     let mut history=History::default();
-    for row in rows {
-        let id=i64::from(row.get::<_,i32>(0));
-        if id==ship {history.targeting_at=row.get(1);}
-        else if history.module_ready.len()<25 {history.module_ready.insert(id,row.get(2));}
+    for (id,targeting,ready) in rows {
+        if id==ship {history.targeting_at=targeting;}
+        else if history.module_ready.len()<25 {history.module_ready.insert(id,ready);}
     }
     history.prune(now);
     Ok(history)
 }
 
-/// Use after ItemTxn::item has locked/re-read the source module. The supplied
-/// custody predicates and current hull binding are rechecked in this query.
-pub async fn module_reactivation_remaining(db:&impl GenericClient,item:&Item,now:i64)->Result<Option<i64>,tokio_postgres::Error> {
+/// Use after ItemTxn::item has re-read the source module. The supplied
+/// custody predicates and current hull binding are rechecked here.
+pub fn module_reactivation_remaining(db:&Db,item:&Item,now:i64)->Result<Option<i64>,StoreError> {
     if item.category_id!=7 || !item.singleton || item.quantity!=1 || !(11..=35).contains(&item.flag) {
         return Ok(None);
     }
-    let history=load_history(db,item.owner_id,item.location_id,now).await?;
-    let current=db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1 AND "typeID"=$2 AND "ownerID"=$3
-        AND "locationID"=$4 AND flag=$5 AND singleton<>0 AND quantity=1"#,
-        &[&(item.id as i32),&(item.type_id as i32),&(item.owner_id as i32),&(item.location_id as i32),&(item.flag as i32)]).await?;
-    Ok(current.and_then(|_|history.module_ready.get(&item.id).copied()).map(|ready|ready-now))
+    let history=load_history(db,item.owner_id,item.location_id,now)?;
+    let current=db.table("entity").get_id(item.id).is_some_and(|e|e.int("typeID")==Some(item.type_id) && e.int("ownerID")==Some(item.owner_id)
+        && e.int("locationID")==Some(item.location_id) && e.int("flag")==Some(item.flag) && assembled(&e));
+    Ok(current.then(|| history.module_ready.get(&item.id).copied()).flatten().map(|ready|ready-now))
 }

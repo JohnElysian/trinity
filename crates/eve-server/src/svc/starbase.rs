@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 
 use eve_marshal::Value;
-use tokio_postgres::{Client, GenericClient};
 use tracing::{debug, error, info};
 
 use crate::ballpark::Vec3;
@@ -28,9 +27,10 @@ use crate::items::{self, ItemTxn, NewItem};
 use crate::pos::{self, state, Structure};
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::CORP_ROLE_DIRECTOR;
+use crate::store::{self, Db, Store, StoreError, Tx};
 use crate::svc::membership::{access_denied, message, Refused};
 use crate::svc::moonmining;
-use crate::svc::rows::{float, int, line, rowset};
+use crate::svc::rows::rowset;
 use crate::svc::space::{self, entry};
 use crate::world::World;
 
@@ -70,6 +70,12 @@ const TICKS_PER_MS: i64 = 10_000;
 const TICKS_PER_SECOND: i64 = 10_000_000;
 const DEFAULT_PERIOD_MS: i64 = 3_600_000;
 
+/// The states in which a structure draws on its tower (onlining,
+/// reinforced, online, operating).
+fn drawing_state(state: Option<i64>) -> bool {
+    matches!(state, Some(2..=5))
+}
+
 // ---- launching -------------------------------------------------------------------------
 
 /// ship.Drop(itemIDs, ownerID): structures in the hold go into space, owned
@@ -77,13 +83,19 @@ const DEFAULT_PERIOD_MS: i64 = 3_600_000;
 /// None if none of the items is a structure (drones are launched elsewhere).
 pub async fn launch(ctx: &Ctx<'_>, ids: &[i64], owner: Option<i64>) -> Option<Outcome> {
     let structures: Vec<i64> = {
-        let sql = r#"SELECT e."itemID" FROM entity e
-                       JOIN "invTypes" t ON t."typeID" = e."typeID"
-                       JOIN "invGroups" g ON g."groupID" = t."groupID"
-                      WHERE e."itemID" = ANY($1) AND (g."categoryID" = $2 OR g."groupID" = $3)"#;
-        let wanted: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
-        let platforms = crate::svc::outposts::GROUP_CONSTRUCTION_PLATFORM as i32;
-        ctx.query(sql, &[&wanted, &pos::CATEGORY_STRUCTURE, &platforms]).await.iter().filter_map(|r| int(r, 0)).collect()
+        let sde = crate::sde::get();
+        let launchable: Vec<i32> = [sde.types_in_category(pos::CATEGORY_STRUCTURE as i64), sde.types_in_group(crate::svc::outposts::GROUP_CONSTRUCTION_PLATFORM)].concat();
+        ctx.store.read(|db| {
+            let entity = db.table("entity");
+            let mut found: Vec<i64> = ids
+                .iter()
+                .filter(|id| entity.get_id(**id).and_then(|e| e.int("typeID")).is_some_and(|t| launchable.contains(&(t as i32))))
+                .copied()
+                .collect();
+            found.sort_unstable();
+            found.dedup();
+            found
+        })
     };
     if structures.is_empty() {
         return None;
@@ -103,42 +115,33 @@ async fn launch_structures(ctx: &Ctx<'_>, ids: Vec<i64>, owner: Option<i64>) -> 
         return Outcome::custom("You are not in space.");
     };
     let mut rng = crate::combat::Rng::seeded(crate::combat::now_ms() as u64 ^ ship_id as u64);
-    let result: Result<(Vec<(i64, i64, Vec3)>, Vec<Value>), tokio_postgres::Error> = async {
-        let mut client = crate::db::connect(ctx.db_url).await?;
-        let mut txn = ItemTxn::begin(&mut client).await?;
+    let result: Result<(Vec<(i64, i64, Vec3)>, Vec<Value>), StoreError> = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
         let mut launched = Vec::new();
         for id in ids {
-            let Some(item) = txn.item(id).await? else { continue };
+            let Some(item) = txn.item(id)? else { continue };
             if item.owner_id != char_id || item.location_id != ship_id || item.flag != FLAG_CARGO {
                 continue;
             }
             let structure = if item.quantity > 1 {
-                txn.set_quantity(id, item.quantity - 1).await?;
-                txn.create(NewItem { type_id: item.type_id, owner_id: owner, location_id: system, flag: 0, quantity: 1, singleton: true })
-                    .await?
+                txn.set_quantity(id, item.quantity - 1)?;
+                txn.create(NewItem { type_id: item.type_id, owner_id: owner, location_id: system, flag: 0, quantity: 1, singleton: true })?
             } else {
-                txn.move_to(id, system, 0).await?;
-                txn.set_singleton(id, true).await?;
+                txn.move_to(id, system, 0)?;
+                txn.set_singleton(id, true)?;
                 if owner != char_id {
-                    txn.set_owner(id, owner).await?;
+                    txn.set_owner(id, owner)?;
                 }
                 id
             };
-            let radius: f64 = txn
-                .tx()
-                .query_one(r#"SELECT COALESCE("radius", 100) FROM "invTypes" WHERE "typeID" = $1"#, &[&(item.type_id as i32)])
-                .await?
-                .get(0);
+            let radius = crate::sde::table("invTypes").get("typeID", item.type_id).and_then(|t| t.float("radius")).unwrap_or(100.0);
             let pos = ship_pos + rng.in_sphere(1.0).unit() * (ship_radius + radius + LAUNCH_CLEARANCE);
-            txn.set_position(structure, pos.tuple()).await?;
-            txn.tx()
-                .execute(r#"INSERT INTO "posStructures" ("itemID") VALUES ($1) ON CONFLICT ("itemID") DO NOTHING"#, &[&(structure as i32)])
-                .await?;
+            txn.set_position(structure, pos.tuple())?;
+            txn.tx().insert_or_ignore("posStructures", &[("itemID", store::Value::Int(structure))])?;
             launched.push((structure, item.type_id, pos));
         }
-        Ok((launched, txn.commit().await?))
-    }
-    .await;
+        Ok((launched, txn.events()))
+    });
     let (launched, events) = match result {
         Ok(v) => v,
         Err(e) => {
@@ -148,7 +151,7 @@ async fn launch_structures(ctx: &Ctx<'_>, ids: Vec<i64>, owner: Option<i64>) -> 
     };
     items::notify(ctx.world, ctx.client_id, events);
     // Read back through the loader, for the names, owners and delays.
-    let fresh = match pos::load(ctx.db, system).await {
+    let fresh = match ctx.store.read(|db| pos::load(db, system)) {
         Ok(all) => all,
         Err(e) => {
             error!("reading launched structures: {}", crate::logging::chain(&e));
@@ -200,7 +203,7 @@ async fn anchor(ctx: &Ctx<'_>, id: i64, at: Vec3) -> Refused<Value> {
     if !s.is_free(now) {
         return Err(message_with("AlreadyUnanchoring", &[("group", Value::text(&s.name))]));
     }
-    if !allowed(ctx, &s, deploy_flag(ctx.db, s.tower.unwrap_or(s.id), "deployAnchor").await) || distance > CONFIGURE_RANGE {
+    if !allowed(ctx, &s, ctx.store.read(|db| deploy_flag(db, s.tower.unwrap_or(s.id), "deployAnchor"))) || distance > CONFIGURE_RANGE {
         return Err(access_denied("you may not anchor that structure from here"));
     }
     let reach = (at - ship_pos).len();
@@ -210,11 +213,11 @@ async fn anchor(ctx: &Ctx<'_>, id: i64, at: Vec3) -> Refused<Value> {
             &[("structure", Value::text(&s.name)), ("limit", Value::Int(ANCHOR_REACH as i64)), ("actual", Value::Int(reach as i64))],
         ));
     }
-    let security = system_security(ctx.db, system).await;
+    let security = ctx.store.read(|db| system_security(db, system));
     if security >= CONCORD_ANCHOR_LIMIT {
         return Err(message("CantAnchorConcordRestriction"));
     }
-    if let Some(max) = type_attributes(ctx.db, &[s.type_id], &[ATTR_ANCHORING_SECURITY_MAX]).await.get(&(s.type_id, ATTR_ANCHORING_SECURITY_MAX)) {
+    if let Some(max) = type_attributes(&[s.type_id], &[ATTR_ANCHORING_SECURITY_MAX]).get(&(s.type_id, ATTR_ANCHORING_SECURITY_MAX)) {
         if security > *max {
             return Err(Outcome::custom(format!(
                 "CONCORD forbids anchoring the {} in systems above {max:.1} security.",
@@ -229,15 +232,22 @@ async fn anchor(ctx: &Ctx<'_>, id: i64, at: Vec3) -> Refused<Value> {
         (Some(tower_for(ctx, system, &s, at, now).await?), None)
     };
     let stamp = pos::timer_start(now, s.delays[0]);
-    let saved = ctx
-        .db
-        .execute(
-            r#"UPDATE "posStructures" SET "state" = $2, "stateTimestamp" = $3, "controlTowerID" = $4, "moonID" = $5
-                WHERE "itemID" = $1"#,
-            &[&(id as i32), &state::ANCHORED, &stamp, &tower.map(|t| t as i32), &moon.map(|m| m as i32)],
-        )
-        .await
-        .and(ctx.db.execute(r#"UPDATE entity SET "x" = $2, "y" = $3, "z" = $4 WHERE "itemID" = $1"#, &[&(id as i32), &at.x, &at.y, &at.z]).await);
+    let saved = ctx.store.write(|tx| {
+        set_structure(
+            tx,
+            id,
+            &[
+                ("state", store::Value::Int(state::ANCHORED.into())),
+                ("stateTimestamp", store::Value::Int(stamp)),
+                ("controlTowerID", tower.map_or(store::Value::Null, store::Value::Int)),
+                ("moonID", moon.map_or(store::Value::Null, store::Value::Int)),
+            ],
+        )?;
+        if let Some(row) = tx.table("entity").get_id(id).map(|e| e.id) {
+            tx.update("entity", row, &[("x", store::Value::Float(at.x)), ("y", store::Value::Float(at.y)), ("z", store::Value::Float(at.z))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
     if let Err(e) = saved {
         error!("anchoring {id}: {}", crate::logging::chain(&e));
         return Err(Outcome::custom("The structure could not be anchored."));
@@ -272,13 +282,10 @@ async fn moon_for(ctx: &Ctx<'_>, system: i64, s: &Structure, at: Vec3) -> Refuse
         (moon, park.structures.values().filter(|o| o.is_tower() && o.id != s.id && o.fixed()).map(|o| o.id).collect::<Vec<_>>())
     };
     let Some((moon_id, moon_name)) = moon else { return Err(message("CantAnchorNoMoonNearby")) };
-    let occupied = ctx
-        .query_one(
-            r#"SELECT 1 FROM "posStructures" WHERE "moonID" = $1 AND "itemID" = ANY($2)"#,
-            &[&(moon_id as i32), &taken.iter().map(|t| *t as i32).collect::<Vec<_>>()],
-        )
-        .await
-        .is_some();
+    let occupied = ctx.store.read(|db| {
+        let structures = db.table("posStructures");
+        taken.iter().any(|t| structures.get_id(*t).is_some_and(|p| p.int("moonID") == Some(moon_id)))
+    });
     if occupied {
         return Err(message_with("CantAnchorMoonAlreadyHasControlTower", &[("tower", Value::text(&s.name)), ("moon", Value::text(moon_name))]));
     }
@@ -293,7 +300,7 @@ async fn tower_for(ctx: &Ctx<'_>, system: i64, s: &Structure, at: Vec3, now: i64
         park.structures.values().filter(|t| t.is_tower() && t.fixed()).cloned().collect()
     };
     let types: Vec<i64> = towers.iter().map(|t| t.type_id).collect();
-    let reach = type_attributes(ctx.db, &types, &[ATTR_MAX_STRUCTURE_DISTANCE]).await;
+    let reach = type_attributes(&types, &[ATTR_MAX_STRUCTURE_DISTANCE]);
     let near = towers.iter().find(|t| (t.pos - at).len() <= reach.get(&(t.type_id, ATTR_MAX_STRUCTURE_DISTANCE)).copied().unwrap_or(0.0));
     let Some(tower) = near else { return Err(message_with("CantAnchorRequireTower", &[("item", Value::text(&s.name))])) };
     if tower.owner_id != s.owner_id {
@@ -332,20 +339,20 @@ async fn online(ctx: &Ctx<'_>, id: i64) -> Refused<Value> {
     if !s.fully_anchored(now) {
         return Err(message_with("CantDoWhileNotAnchored", &[("item", Value::text(&s.name))]));
     }
-    if !allowed(ctx, &s, deploy_flag(ctx.db, s.tower.unwrap_or(s.id), "deployOnline").await) || distance > CONFIGURE_RANGE {
+    if !allowed(ctx, &s, ctx.store.read(|db| deploy_flag(db, s.tower.unwrap_or(s.id), "deployOnline"))) || distance > CONFIGURE_RANGE {
         return Err(access_denied("you may not put that structure online from here"));
     }
     if s.is_tower() {
-        let fuel = Fuel::of(ctx.db, &s, system).await;
+        let fuel = ctx.store.read(|db| Fuel::of(db, &s, system));
         let burn = fuel.burn(0.0, 0.0);
         if let Some((type_id, need)) = burn.iter().find(|(t, need)| fuel.held.get(t).copied().unwrap_or(0) < *need) {
             return Err(message_with(
                 "CantOnlineTowerLacksResources",
-                &[("tower", Value::text(&s.name)), ("resource", Value::text(format!("{need} x {}", type_name(ctx, *type_id).await)))],
+                &[("tower", Value::text(&s.name)), ("resource", Value::text(format!("{need} x {}", type_name(*type_id))))],
             ));
         }
         // The first period's fuel goes as it comes online.
-        if let Err(e) = consume(ctx.db, id, &burn, now).await {
+        if let Err(e) = ctx.store.write(|tx| consume(tx, id, &burn, now)) {
             error!("fuelling tower {id}: {}", crate::logging::chain(&e));
             return Err(Outcome::custom("The tower could not be fuelled."));
         }
@@ -379,11 +386,11 @@ async fn draw_from_tower(ctx: &Ctx<'_>, system: i64, s: &Structure, now: i64) ->
     }
     let mut types = drawing.clone();
     types.extend([s.type_id, tower.type_id]);
-    let a = type_attributes(ctx.db, &types, &[ATTR_CPU, ATTR_POWER, ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT]).await;
-    let cpu = cpu_factors(ctx.db, tower.type_id, &types).await;
+    let a = type_attributes(&types, &[ATTR_CPU, ATTR_POWER, ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT]);
+    let cpu = cpu_factors(tower.type_id, &types);
     let get = |t: i64, attr: i32| a.get(&(t, attr)).copied().unwrap_or(0.0) * if attr == ATTR_CPU { cpu(t) } else { 1.0 };
     let used = |attr: i32| drawing.iter().map(|t| get(*t, attr)).sum::<f64>();
-    let fuel = Fuel::of(ctx.db, &tower, system).await;
+    let fuel = ctx.store.read(|db| Fuel::of(db, &tower, system));
     for (attr, output, purpose, lacks, what) in [
         (ATTR_CPU, ATTR_CPU_OUTPUT, PURPOSE_CPU, "CantOnlineTowerLacksCpuResources", "CPU"),
         (ATTR_POWER, ATTR_POWER_OUTPUT, PURPOSE_POWER, "CantOnlineTowerLacksPowerResources", "power grid"),
@@ -409,10 +416,10 @@ async fn offline(ctx: &Ctx<'_>, id: i64) -> Refused<Value> {
     if !s.drawing() {
         return Ok(Value::None);
     }
-    if !allowed(ctx, &s, deploy_flag(ctx.db, s.tower.unwrap_or(s.id), "deployOffline").await) || distance > CONFIGURE_RANGE {
+    if !allowed(ctx, &s, ctx.store.read(|db| deploy_flag(db, s.tower.unwrap_or(s.id), "deployOffline"))) || distance > CONFIGURE_RANGE {
         return Err(access_denied("you may not take that structure offline from here"));
     }
-    take_offline(ctx.db, ctx.world, system, id).await;
+    take_offline(ctx.store, ctx.world, system, id).await;
     info!("took {} ({id}) offline in {system}", s.name);
     Ok(Value::None)
 }
@@ -424,7 +431,7 @@ async fn unanchor(ctx: &Ctx<'_>, id: i64) -> Refused<Value> {
     if !s.fully_anchored(now) {
         return Err(message_with("CantDoWhileNotAnchored", &[("item", Value::text(&s.name))]));
     }
-    if !allowed(ctx, &s, deploy_flag(ctx.db, s.tower.unwrap_or(s.id), "deployUnanchor").await) || distance > CONFIGURE_RANGE {
+    if !allowed(ctx, &s, ctx.store.read(|db| deploy_flag(db, s.tower.unwrap_or(s.id), "deployUnanchor"))) || distance > CONFIGURE_RANGE {
         return Err(access_denied("you may not unanchor that structure from here"));
     }
     if s.is_tower() {
@@ -433,7 +440,7 @@ async fn unanchor(ctx: &Ctx<'_>, id: i64) -> Refused<Value> {
             return Err(message_with("CantUnanchorTowerStructuresPresent", &[("tower", Value::text(&s.name))]));
         }
     }
-    let holding = ctx.query_one(r#"SELECT 1 FROM entity WHERE "locationID" = $1 LIMIT 1"#, &[&(id as i32)]).await.is_some();
+    let holding = ctx.store.read(|db| db.table("entity").find(&["locationID"], &[store::Value::Int(id)]).next().is_some());
     if holding {
         return Err(message_with("CantUnanchorContainerNotEmpty", &[("structure", Value::text(&s.name))]));
     }
@@ -465,30 +472,32 @@ async fn scoop_structure(ctx: &Ctx<'_>, s: Structure, system: i64, distance: f64
     if distance > crate::loot::TRANSFER_RANGE {
         return Err(Outcome::custom(format!("The {} is {distance:.0} m away; get within {:.0} m to scoop it.", s.name, crate::loot::TRANSFER_RANGE)));
     }
-    let room = ctx
-        .query_one(
-            r#"SELECT (SELECT COALESCE("capacity", 0) FROM "invTypes" t JOIN entity sh ON sh."typeID" = t."typeID" WHERE sh."itemID" = $1)
-                    - (SELECT COALESCE(sum(t."volume" * e."quantity"), 0) FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                        WHERE e."locationID" = $1 AND e."flag" = $3),
-                      (SELECT "volume" FROM "invTypes" WHERE "typeID" = $2)"#,
-            &[&(ship_id as i32), &(s.type_id as i32), &(FLAG_CARGO as i32)],
-        )
-        .await;
-    let (free, volume) = room.map_or((0.0, f64::MAX), |r| (float(&r, 0).unwrap_or(0.0), float(&r, 1).unwrap_or(0.0)));
+    let types = crate::sde::table("invTypes");
+    let (free, volume) = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        // No hold at all for a ship that is gone or of a type the data does
+        // not know; the cargo is summed in the order it comes, and what has
+        // no volume takes no room.
+        let capacity = entity.get_id(ship_id).and_then(|r| r.int("typeID")).and_then(|t| types.get("typeID", t)).map(|t| t.float("capacity").unwrap_or(0.0));
+        let used: f64 = entity
+            .find(&["locationID", "flag"], &[store::Value::Int(ship_id), store::Value::Int(FLAG_CARGO)])
+            .filter_map(|r| Some(types.get("typeID", r.int("typeID")?)?.float("volume")? * r.int("quantity")? as f64))
+            .sum();
+        let volume = types.get("typeID", s.type_id).and_then(|t| t.float("volume"));
+        (capacity.map_or(0.0, |c| c - used), volume.unwrap_or(0.0))
+    });
     if volume > free + 1e-6 {
         return Err(Outcome::custom(format!("Not enough room: the {} needs {volume:.0} m3 and only {free:.0} m3 is free.", s.name)));
     }
-    let result = async {
-        let mut client = crate::db::connect(ctx.db_url).await?;
-        let mut txn = ItemTxn::begin(&mut client).await?;
-        txn.move_to(s.id, ship_id, FLAG_CARGO).await?;
+    let result = ctx.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
+        txn.move_to(s.id, ship_id, FLAG_CARGO)?;
         if s.owner_id != char_id {
-            txn.set_owner(s.id, char_id).await?;
+            txn.set_owner(s.id, char_id)?;
         }
-        txn.tx().execute(r#"DELETE FROM "posStructures" WHERE "itemID" = $1"#, &[&(s.id as i32)]).await?;
-        txn.commit().await
-    }
-    .await;
+        txn.tx().delete_where("posStructures", &["itemID"], &[store::Value::Int(s.id)])?;
+        Ok::<_, StoreError>(txn.events())
+    });
     let events = match result {
         Ok(events) => events,
         Err(e) => {
@@ -511,10 +520,9 @@ async fn scoop_structure(ctx: &Ctx<'_>, s: Structure, system: i64, distance: f64
 
 /// Saves a structure's new state and shows it to the system.
 async fn set_state(ctx: &Ctx<'_>, system: i64, id: i64, new: i16, stamp: Option<i64>) -> Refused<()> {
-    let saved = ctx
-        .db
-        .execute(r#"UPDATE "posStructures" SET "state" = $2, "stateTimestamp" = $3 WHERE "itemID" = $1"#, &[&(id as i32), &new, &stamp])
-        .await;
+    let saved = ctx.store.write(|tx| {
+        set_structure(tx, id, &[("state", store::Value::Int(new.into())), ("stateTimestamp", stamp.map_or(store::Value::Null, store::Value::Int))])
+    });
     if let Err(e) = saved {
         error!("saving the state of structure {id}: {}", crate::logging::chain(&e));
         return Err(Outcome::custom("The structure could not do that just now."));
@@ -525,6 +533,14 @@ async fn set_state(ctx: &Ctx<'_>, system: i64, id: i64, new: i16, stamp: Option<
         Vec::new()
     });
     Ok(())
+}
+
+/// Sets columns of the posStructures row of `id` (nothing if there is none).
+fn set_structure(tx: &mut Tx<'_>, id: i64, sets: store::Sets) -> Result<(), StoreError> {
+    match tx.table("posStructures").get_id(id).map(|p| p.id) {
+        Some(row) => tx.update("posStructures", row, sets),
+        None => Ok(()),
+    }
 }
 
 /// Changes a structure in its park and broadcasts `f`'s destiny entries,
@@ -540,12 +556,21 @@ fn update(world: &World, system: i64, id: i64, f: impl FnOnce(&mut Structure, i6
 }
 
 /// A structure, and if it is a tower everything drawing on it, goes offline.
-pub async fn take_offline(db: &impl GenericClient, world: &World, system: i64, id: i64) {
-    let sql = r#"UPDATE "posStructures" SET "state" = $2, "stateTimestamp" = NULL
-                  WHERE ("itemID" = $1 OR "controlTowerID" = $1) AND "state" IN (2, 3, 4, 5)
-                 RETURNING "itemID""#;
-    let ids: Vec<i64> = match db.query(sql, &[&(id as i32), &state::ANCHORED]).await {
-        Ok(rows) => rows.iter().filter_map(|r| int(r, 0)).collect(),
+pub async fn take_offline(store: &Store, world: &World, system: i64, id: i64) {
+    let offline = store.write(|tx| {
+        let rows: Vec<(store::RowId, i64)> = tx
+            .table("posStructures")
+            .rows()
+            .filter(|p| (p.int("itemID") == Some(id) || p.int("controlTowerID") == Some(id)) && drawing_state(p.int("state")))
+            .filter_map(|p| Some((p.id, p.int("itemID")?)))
+            .collect();
+        for (row, _) in &rows {
+            tx.update("posStructures", *row, &[("state", store::Value::Int(state::ANCHORED.into())), ("stateTimestamp", store::Value::Null)])?;
+        }
+        Ok::<_, StoreError>(rows.into_iter().map(|(_, id)| id).collect::<Vec<i64>>())
+    });
+    let ids: Vec<i64> = match offline {
+        Ok(ids) => ids,
         Err(e) => {
             error!("taking structure {id} offline: {}", crate::logging::chain(&e));
             return;
@@ -575,9 +600,15 @@ fn not_reinforced(ctx: &Ctx<'_>, s: &Structure) -> Refused<()> {
 // ---- combat ----------------------------------------------------------------------------
 
 /// What a structure has left after a fight, so it outlives a restart.
-pub async fn save_damage(db: &Client, id: i64, shield: f64, armor: f64, hull: f64) {
-    let sql = r#"UPDATE "posStructures" SET "shieldCharge" = $2, "armorDamage" = $3, "hullDamage" = $4 WHERE "itemID" = $1"#;
-    if let Err(e) = db.execute(sql, &[&(id as i32), &shield, &armor, &hull]).await {
+pub async fn save_damage(store: &Store, id: i64, shield: f64, armor: f64, hull: f64) {
+    let saved = store.write(|tx| {
+        set_structure(
+            tx,
+            id,
+            &[("shieldCharge", store::Value::Float(shield)), ("armorDamage", store::Value::Float(armor)), ("hullDamage", store::Value::Float(hull))],
+        )
+    });
+    if let Err(e) = saved {
         error!("saving the damage of structure {id}: {}", crate::logging::chain(&e));
     }
 }
@@ -585,9 +616,14 @@ pub async fn save_damage(db: &Client, id: i64, shield: f64, armor: f64, hull: f6
 /// A tower fell below a quarter shield. Its strontium buys whole periods of
 /// reinforcement, all burnt now; until they run out it takes no damage and
 /// nothing around it changes. Without strontium it stays open.
-pub async fn reinforce(world: &World, db: &mut Client, system: i64, tower_id: i64) {
-    let Ok(Some(tower)) = tower_as_loaded(&*db, system, tower_id).await else { return };
-    let fuel = Fuel::of(&*db, &tower, system).await;
+pub async fn reinforce(world: &World, store: &Store, system: i64, tower_id: i64) {
+    let Some((tower, fuel)) = store.read(|db| {
+        let tower = tower_as_loaded(db, system, tower_id).ok().flatten()?;
+        let fuel = Fuel::of(db, &tower, system);
+        Some((tower, fuel))
+    }) else {
+        return;
+    };
     let per_period: Vec<(i64, i64)> = fuel
         .needs
         .iter()
@@ -599,24 +635,16 @@ pub async fn reinforce(world: &World, db: &mut Client, system: i64, tower_id: i6
         info!("tower {tower_id} in {system} is below a quarter shield with no strontium to reinforce it");
         return;
     }
-    let period = type_attributes(&*db, &[tower.type_id], &[ATTR_TOWER_PERIOD])
-        .await
+    let period = type_attributes(&[tower.type_id], &[ATTR_TOWER_PERIOD])
         .get(&(tower.type_id, ATTR_TOWER_PERIOD))
         .map_or(DEFAULT_PERIOD_MS, |ms| *ms as i64)
         * TICKS_PER_MS;
     let until = crate::bulkdata::filetime_now() + periods * period;
     let burn: Vec<(i64, i64)> = per_period.iter().map(|(t, q)| (*t, q * periods)).collect();
-    let saved = async {
-        let tx = db.transaction().await?;
-        take(&tx, tower_id, &burn).await?;
-        tx.execute(
-            r#"UPDATE "posStructures" SET "state" = $2, "stateTimestamp" = $3 WHERE "itemID" = $1"#,
-            &[&(tower_id as i32), &state::REINFORCED, &until],
-        )
-        .await?;
-        tx.commit().await
-    }
-    .await;
+    let saved = store.write(|tx| {
+        take(tx, tower_id, &burn)?;
+        set_structure(tx, tower_id, &[("state", store::Value::Int(state::REINFORCED.into())), ("stateTimestamp", store::Value::Int(until))])
+    });
     if let Err(e) = saved {
         error!("reinforcing tower {tower_id}: {}", crate::logging::chain(&e));
         return;
@@ -631,26 +659,34 @@ pub async fn reinforce(world: &World, db: &mut Client, system: i64, tower_id: i6
 
 /// A structure was destroyed: it goes with what it held; a tower's
 /// structures go offline and come loose from it.
-pub async fn lost(db: &mut Client, id: i64, tower: bool) {
-    let result = async {
-        let tx = db.transaction().await?;
-        tx.execute(r#"DELETE FROM entity WHERE "locationID" = $1"#, &[&(id as i32)]).await?;
-        tx.execute(r#"DELETE FROM entity WHERE "itemID" = $1"#, &[&(id as i32)]).await?;
-        tx.execute(r#"DELETE FROM "posStructures" WHERE "itemID" = $1"#, &[&(id as i32)]).await?;
-        if tower {
-            tx.execute(
-                r#"UPDATE "posStructures"
-                      SET "state" = CASE WHEN "state" IN (2, 3, 4, 5) THEN $2 ELSE "state" END,
-                          "stateTimestamp" = CASE WHEN "state" IN (2, 3, 4, 5) THEN NULL ELSE "stateTimestamp" END,
-                          "controlTowerID" = NULL
-                    WHERE "controlTowerID" = $1"#,
-                &[&(id as i32), &state::ANCHORED],
-            )
-            .await?;
+pub async fn lost(store: &Store, id: i64, tower: bool) {
+    let result = store.write(|tx| {
+        let held: Vec<store::RowId> = tx.table("entity").find(&["locationID"], &[store::Value::Int(id)]).map(|e| e.id).collect();
+        for row in held {
+            tx.delete("entity", row)?;
         }
-        tx.commit().await
-    }
-    .await;
+        if let Some(row) = tx.table("entity").get_id(id).map(|e| e.id) {
+            tx.delete("entity", row)?;
+        }
+        tx.delete_where("posStructures", &["itemID"], &[store::Value::Int(id)])?;
+        if tower {
+            let loose: Vec<(store::RowId, bool)> = tx
+                .table("posStructures")
+                .rows()
+                .filter(|p| p.int("controlTowerID") == Some(id))
+                .map(|p| (p.id, drawing_state(p.int("state"))))
+                .collect();
+            for (row, drawing) in loose {
+                let mut sets = vec![("controlTowerID", store::Value::Null)];
+                if drawing {
+                    sets.push(("state", store::Value::Int(state::ANCHORED.into())));
+                    sets.push(("stateTimestamp", store::Value::Null));
+                }
+                tx.update("posStructures", row, &sets)?;
+            }
+        }
+        Ok::<_, StoreError>(())
+    });
     if let Err(e) = result {
         error!("clearing away structure {id}: {}", crate::logging::chain(&e));
     }
@@ -673,42 +709,37 @@ pub(crate) fn allowed(ctx: &Ctx<'_>, s: &Structure, deploy: i16) -> bool {
     }
 }
 
-async fn deploy_flag(db: &impl GenericClient, tower: i64, column: &str) -> i16 {
-    let sql = format!(r#"SELECT "{column}" FROM "posStructures" WHERE "itemID" = $1"#);
-    db.query_opt(sql.as_str(), &[&(tower as i32)]).await.ok().flatten().and_then(|r| int(&r, 0)).unwrap_or(0) as i16
+fn deploy_flag(db: &Db, tower: i64, column: &str) -> i16 {
+    db.table("posStructures").get_id(tower).and_then(|p| p.int(column)).unwrap_or(0) as i16
 }
 
 /// Base attribute values: (typeID, attributeID) -> value.
-async fn type_attributes(db: &impl GenericClient, types: &[i64], attrs: &[i32]) -> HashMap<(i64, i32), f64> {
-    let types: Vec<i32> = types.iter().map(|t| *t as i32).collect();
-    let sql = r#"SELECT "typeID", "attributeID", COALESCE("valueFloat", "valueInt"::float8)
-                   FROM "dgmTypeAttributes" WHERE "typeID" = ANY($1) AND "attributeID" = ANY($2)"#;
-    match db.query(sql, &[&types, &attrs]).await {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|r| Some(((int(r, 0)?, int(r, 1)? as i32), float(r, 2)?)))
-            .collect(),
-        Err(e) => {
-            error!("reading structure attributes: {}", crate::logging::chain(&e));
-            HashMap::new()
-        }
-    }
+fn type_attributes(types: &[i64], attrs: &[i32]) -> HashMap<(i64, i32), f64> {
+    let sde = crate::sde::get();
+    types
+        .iter()
+        .flat_map(|t| sde.type_attributes(*t).iter().filter(|(a, _)| attrs.contains(a)).map(move |(a, v)| ((*t, *a), *v)))
+        .collect()
 }
 
-async fn system_security(db: &impl GenericClient, system: i64) -> f64 {
-    let sql = r#"SELECT "security" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#;
-    db.query_opt(sql, &[&(system as i32)]).await.ok().flatten().and_then(|r| float(&r, 0)).unwrap_or(0.0)
+fn system_security(db: &Db, system: i64) -> f64 {
+    db.table("mapSolarSystems").get_id(system).and_then(|s| s.float("security")).unwrap_or(0.0)
 }
 
+/// A corporation's name, else a character's, else ''.
 async fn owner_name(ctx: &Ctx<'_>, owner: i64) -> String {
-    let sql = r#"SELECT COALESCE((SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $1),
-                                 (SELECT "characterName" FROM "character_" WHERE "characterID" = $1), '')"#;
-    ctx.query_one(sql, &[&(owner as i32)]).await.and_then(|r| crate::svc::rows::text(&r, 0)).unwrap_or_default()
+    ctx.store.read(|db| {
+        db.table("corporation")
+            .get_id(owner)
+            .and_then(|c| c.text("corporationName"))
+            .or_else(|| db.table("character_").get_id(owner).and_then(|c| c.text("characterName")))
+            .unwrap_or_default()
+            .to_string()
+    })
 }
 
-async fn type_name(ctx: &Ctx<'_>, type_id: i64) -> String {
-    let sql = r#"SELECT "typeName" FROM "invTypes" WHERE "typeID" = $1"#;
-    ctx.query_one(sql, &[&(type_id as i32)]).await.and_then(|r| crate::svc::rows::text(&r, 0)).unwrap_or_default()
+fn type_name(type_id: i64) -> String {
+    crate::sde::get().type_(type_id).map(|t| t.name.to_string()).unwrap_or_default()
 }
 
 fn message_with(key: &str, args: &[(&str, Value)]) -> Outcome {
@@ -728,32 +759,28 @@ struct Fuel {
 }
 
 impl Fuel {
-    async fn of(db: &impl GenericClient, tower: &Structure, system: i64) -> Fuel {
-        let needs = db
-            .query(
-                r#"SELECT r."resourceTypeID", r."purpose", r."quantity"
-                     FROM "invControlTowerResources" r, "mapSolarSystems" s
-                     LEFT JOIN "mapConstellations" c ON c."constellationID" = s."constellationID"
-                     LEFT JOIN "mapRegions" g ON g."regionID" = s."regionID"
-                    WHERE r."controlTowerTypeID" = $1 AND s."solarSystemID" = $2
-                      AND (r."minSecurityLevel" IS NULL OR s."security" >= r."minSecurityLevel")
-                      AND (r."factionID" IS NULL OR r."factionID" = COALESCE(s."factionID", c."factionID", g."factionID"))"#,
-                &[&(tower.type_id as i32), &(system as i32)],
-            )
-            .await
-            .map(|rows| rows.iter().map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0), int(r, 2).unwrap_or(0))).collect())
-            .unwrap_or_default();
-        let held = db
-            .query(r#"SELECT "typeID", sum("quantity") FROM entity WHERE "locationID" = $1 GROUP BY "typeID""#, &[&(tower.id as i32)])
-            .await
-            .map(|rows| rows.iter().map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0))).collect())
-            .unwrap_or_default();
-        let sovereign = db
-            .query_opt(r#"SELECT 1 FROM "mapSolarSystems" WHERE "solarSystemID" = $1 AND "allianceID" = $2"#, &[&(system as i32), &tower.alliance_id.map(|a| a as i32)])
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+    fn of(db: &Db, tower: &Structure, system: i64) -> Fuel {
+        let here = db.table("mapSolarSystems").get_id(system);
+        let needs = here.map_or_else(Vec::new, |s| {
+            let sde = crate::sde::get();
+            let security = s.float("security");
+            // The system's faction, else its constellation's, else its region's.
+            let faction = s
+                .int("factionID")
+                .or_else(|| sde.table("mapConstellations").get("constellationID", s.int("constellationID")?)?.int("factionID"))
+                .or_else(|| sde.table("mapRegions").get("regionID", s.int("regionID")?)?.int("factionID"));
+            sde.table("invControlTowerResources")
+                .find("controlTowerTypeID", tower.type_id)
+                .filter(|r| r.float("minSecurityLevel").is_none_or(|min| security.is_some_and(|s| s >= min)))
+                .filter(|r| r.int("factionID").is_none_or(|f| faction == Some(f)))
+                .map(|r| (r.int("resourceTypeID").unwrap_or(0), r.int("purpose").unwrap_or(0), r.int("quantity").unwrap_or(0)))
+                .collect()
+        });
+        let mut held: HashMap<i64, i64> = HashMap::new();
+        for e in db.table("entity").find(&["locationID"], &[store::Value::Int(tower.id)]) {
+            *held.entry(e.int("typeID").unwrap_or(0)).or_insert(0) += e.int("quantity").unwrap_or(0);
+        }
+        let sovereign = here.is_some_and(|s| tower.alliance_id.is_some() && s.int("allianceID") == tower.alliance_id);
         Fuel { needs, held, factor: if sovereign { SOVEREIGN_FUEL } else { 1.0 } }
     }
 
@@ -781,31 +808,30 @@ impl Fuel {
 }
 
 /// Takes `burn` out of a tower's bay and records the period as paid for.
-async fn consume(db: &impl GenericClient, tower: i64, burn: &[(i64, i64)], now: i64) -> Result<(), tokio_postgres::Error> {
-    take(db, tower, burn).await?;
-    db.execute(r#"UPDATE "posStructures" SET "lastFuel" = $2 WHERE "itemID" = $1"#, &[&(tower as i32), &now]).await?;
-    Ok(())
+fn consume(tx: &mut Tx<'_>, tower: i64, burn: &[(i64, i64)], now: i64) -> Result<(), StoreError> {
+    take(tx, tower, burn)?;
+    set_structure(tx, tower, &[("lastFuel", store::Value::Int(now))])
 }
 
 /// Takes `burn` out of a tower's bay, smallest stacks first.
-async fn take(db: &impl GenericClient, tower: i64, burn: &[(i64, i64)]) -> Result<(), tokio_postgres::Error> {
+fn take(tx: &mut Tx<'_>, tower: i64, burn: &[(i64, i64)]) -> Result<(), StoreError> {
     for &(type_id, mut amount) in burn {
-        let stacks = db
-            .query(
-                r#"SELECT "itemID", "quantity" FROM entity WHERE "locationID" = $1 AND "typeID" = $2 ORDER BY "quantity""#,
-                &[&(tower as i32), &(type_id as i32)],
-            )
-            .await?;
-        for r in stacks {
+        let mut stacks: Vec<(store::RowId, i64)> = tx
+            .table("entity")
+            .find(&["locationID"], &[store::Value::Int(tower)])
+            .filter(|e| e.int("typeID") == Some(type_id))
+            .map(|e| (e.id, e.int("quantity").unwrap_or(0)))
+            .collect();
+        stacks.sort_by_key(|(_, quantity)| *quantity);
+        for (row, quantity) in stacks {
             if amount == 0 {
                 break;
             }
-            let (item, quantity) = (int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0));
             let take = amount.min(quantity);
             if take == quantity {
-                db.execute(r#"DELETE FROM entity WHERE "itemID" = $1"#, &[&item]).await?;
+                tx.delete("entity", row)?;
             } else {
-                db.execute(r#"UPDATE entity SET "quantity" = "quantity" - $2 WHERE "itemID" = $1"#, &[&item, &(take as i32)]).await?;
+                tx.update("entity", row, &[("quantity", store::Value::Int(quantity - take))])?;
             }
             amount -= take;
         }
@@ -815,69 +841,67 @@ async fn take(db: &impl GenericClient, tower: i64, burn: &[(i64, i64)]) -> Resul
 
 /// Every online tower whose period is up burns another period's fuel, or
 /// goes offline without it. Run by the heartbeat.
-pub async fn burn_fuel(world: &World, db: &mut Client) {
+pub async fn burn_fuel(world: &World, store: &Store) {
     let now = crate::bulkdata::filetime_now();
-    let sql = r#"SELECT p."itemID", e."locationID", p."lastFuel",
-                        COALESCE(a."valueFloat", a."valueInt"::float8, $2)
-                   FROM "posStructures" p
-                   JOIN entity e ON e."itemID" = p."itemID"
-                   JOIN "invTypes" t ON t."typeID" = e."typeID"
-                   LEFT JOIN "dgmTypeAttributes" a ON a."typeID" = e."typeID" AND a."attributeID" = $3
-                  WHERE t."groupID" = $1 AND p."state" IN (2, 3, 4, 5)"#;
-    let towers = match db.query(sql, &[&(pos::GROUP_CONTROL_TOWER as i32), &(DEFAULT_PERIOD_MS as f64), &ATTR_TOWER_PERIOD]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("reading the towers to fuel: {}", crate::logging::chain(&e));
-            return;
-        }
-    };
-    for r in towers {
-        let (tower_id, system) = (int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0));
-        let period = float(&r, 3).unwrap_or(DEFAULT_PERIOD_MS as f64) as i64 * TICKS_PER_MS;
-        let last = int(&r, 2).unwrap_or(now);
+    let sde = crate::sde::get();
+    let towers: Vec<(i64, i64, Option<i64>, i64)> = store.read(|db| {
+        let types = sde.types_in_group(pos::GROUP_CONTROL_TOWER as i64);
+        let entity = db.table("entity");
+        db.table("posStructures")
+            .rows()
+            .filter(|p| drawing_state(p.int("state")))
+            .filter_map(|p| {
+                let e = entity.get_id(p.int("itemID")?)?;
+                let type_id = e.int("typeID").filter(|t| types.contains(&(*t as i32)))?;
+                Some((p.int("itemID")?, e.int("locationID").unwrap_or(0), p.int("lastFuel"), type_id))
+            })
+            .collect()
+    });
+    for (tower_id, system, last, type_id) in towers {
+        let period = sde.type_attribute(type_id, ATTR_TOWER_PERIOD).unwrap_or(DEFAULT_PERIOD_MS as f64) as i64 * TICKS_PER_MS;
+        let last = last.unwrap_or(now);
         if now < last + period {
             continue;
         }
-        let Ok(Some(tower)) = tower_as_loaded(db, system, tower_id).await else { continue };
-        let fuel = Fuel::of(&*db, &tower, system).await;
-        let (power, cpu) = tower_load(db, &tower).await;
+        let Some((fuel, (power, cpu))) = store.read(|db| {
+            let tower = tower_as_loaded(db, system, tower_id).ok().flatten()?;
+            Some((Fuel::of(db, &tower, system), tower_load(db, &tower)))
+        }) else {
+            continue;
+        };
         let burn = fuel.burn(power, cpu);
         let short = burn.iter().find(|(t, need)| fuel.held.get(t).copied().unwrap_or(0) < *need).copied();
         match short {
             Some((type_id, need)) => {
                 info!("tower {tower_id} in {system} goes offline: it needs {need} of type {type_id}");
-                take_offline(&*db, world, system, tower_id).await;
+                take_offline(store, world, system, tower_id).await;
             }
-            None => {
-                let paid = async {
-                    let tx = db.transaction().await?;
-                    consume(&tx, tower_id, &burn, last + period).await?;
-                    tx.commit().await
-                }
-                .await;
-                match paid {
-                    Ok(()) => moonmining::cycle(db, tower_id).await,
-                    Err(e) => error!("fuelling tower {tower_id}: {}", crate::logging::chain(&e)),
-                }
-            }
+            None => match store.write(|tx| consume(tx, tower_id, &burn, last + period)) {
+                Ok(()) => moonmining::cycle(store, tower_id).await,
+                Err(e) => error!("fuelling tower {tower_id}: {}", crate::logging::chain(&e)),
+            },
         }
     }
 }
 
 /// A tower as the park loader reads it (owner, alliance, type).
-async fn tower_as_loaded(db: &impl GenericClient, system: i64, tower: i64) -> Result<Option<Structure>, tokio_postgres::Error> {
-    Ok(pos::load(db, system).await?.into_iter().find(|s| s.id == tower))
+fn tower_as_loaded(db: &Db, system: i64, tower: i64) -> Result<Option<Structure>, StoreError> {
+    Ok(pos::load(db, system)?.into_iter().find(|s| s.id == tower))
 }
 
 /// The fractions of a tower's power grid and CPU its online structures use.
-async fn tower_load(db: &impl GenericClient, tower: &Structure) -> (f64, f64) {
-    let sql = r#"SELECT e."typeID" FROM "posStructures" p JOIN entity e ON e."itemID" = p."itemID"
-                  WHERE p."controlTowerID" = $1 AND p."state" IN (2, 3, 4, 5)"#;
-    let drawing: Vec<i64> = db.query(sql, &[&(tower.id as i32)]).await.map(|rows| rows.iter().filter_map(|r| int(r, 0)).collect()).unwrap_or_default();
+fn tower_load(db: &Db, tower: &Structure) -> (f64, f64) {
+    let entity = db.table("entity");
+    let drawing: Vec<i64> = db
+        .table("posStructures")
+        .rows()
+        .filter(|p| p.int("controlTowerID") == Some(tower.id) && drawing_state(p.int("state")))
+        .filter_map(|p| entity.get_id(p.int("itemID")?)?.int("typeID"))
+        .collect();
     let mut types = drawing.clone();
     types.push(tower.type_id);
-    let a = type_attributes(db, &types, &[ATTR_CPU, ATTR_POWER, ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT]).await;
-    let cpu = cpu_factors(db, tower.type_id, &types).await;
+    let a = type_attributes(&types, &[ATTR_CPU, ATTR_POWER, ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT]);
+    let cpu = cpu_factors(tower.type_id, &types);
     let get = |t: i64, attr: i32| a.get(&(t, attr)).copied().unwrap_or(0.0) * if attr == ATTR_CPU { cpu(t) } else { 1.0 };
     let load = |attr: i32, output: i32| {
         let out = get(tower.type_id, output);
@@ -889,17 +913,11 @@ async fn tower_load(db: &impl GenericClient, tower: &Structure) -> (f64, f64) {
 /// What each type's CPU need is multiplied by at this tower: its
 /// controlTowerMoonHarvesterCPUBonus (a percentage) for moon harvesters, 1
 /// for everything else.
-async fn cpu_factors(db: &impl GenericClient, tower_type: i64, types: &[i64]) -> impl Fn(i64) -> f64 {
-    let bonus = type_attributes(db, &[tower_type], &[ATTR_HARVESTER_CPU_BONUS]).await.get(&(tower_type, ATTR_HARVESTER_CPU_BONUS)).copied().unwrap_or(0.0);
-    let ids: Vec<i32> = types.iter().map(|t| *t as i32).collect();
-    let sql = r#"SELECT "typeID" FROM "invTypes" WHERE "typeID" = ANY($1) AND "groupID" = $2"#;
-    let harvesters: Vec<i64> = match db.query(sql, &[&ids, &(moonmining::GROUP_MOON_MINING as i32)]).await {
-        Ok(rows) => rows.iter().filter_map(|r| int(r, 0)).collect(),
-        Err(e) => {
-            error!("reading which structures are harvesters: {}", crate::logging::chain(&e));
-            Vec::new()
-        }
-    };
+fn cpu_factors(tower_type: i64, types: &[i64]) -> impl Fn(i64) -> f64 {
+    let bonus = type_attributes(&[tower_type], &[ATTR_HARVESTER_CPU_BONUS]).get(&(tower_type, ATTR_HARVESTER_CPU_BONUS)).copied().unwrap_or(0.0);
+    let sde = crate::sde::get();
+    let harvesters: Vec<i64> =
+        types.iter().copied().filter(|t| sde.type_(*t).is_some_and(|ty| ty.group_id as i64 == moonmining::GROUP_MOON_MINING)).collect();
     move |t| if harvesters.contains(&t) { 1.0 + bonus / 100.0 } else { 1.0 }
 }
 
@@ -907,48 +925,77 @@ async fn cpu_factors(db: &impl GenericClient, tower_type: i64, types: &[i64]) ->
 
 /// Counts claiming towers and moves sovereignty where it has changed hands.
 /// Run by the heartbeat.
-pub async fn sovereignty(db: &Client, claim_delay_secs: i64) {
+pub async fn sovereignty(store: &Store, claim_delay_secs: i64) {
     let now = crate::bulkdata::filetime_now();
-    let started = db
-        .execute(r#"UPDATE "posStructures" SET "claimSince" = $1 WHERE "claim" = 1 AND "state" IN (2, 3, 4, 5) AND "claimSince" IS NULL"#, &[&now])
-        .await;
-    let lapsed = db
-        .execute(r#"UPDATE "posStructures" SET "claimSince" = NULL WHERE ("claim" = 0 OR "state" NOT IN (2, 3, 4, 5)) AND "claimSince" IS NOT NULL"#, &[])
-        .await;
-    if let Err(e) = started.and(lapsed) {
+    // A claim starts standing when its tower is online, and lapses when it
+    // is not, or no longer claims.
+    let claimed = store.write(|tx| {
+        let changes: Vec<(store::RowId, store::Value)> = tx
+            .table("posStructures")
+            .rows()
+            .filter_map(|p| {
+                let (claim, drawing, since) = (p.int("claim"), drawing_state(p.int("state")), p.int("claimSince"));
+                if claim == Some(1) && drawing && since.is_none() {
+                    Some((p.id, store::Value::Int(now)))
+                } else if (claim == Some(0) || !drawing) && since.is_some() {
+                    Some((p.id, store::Value::Null))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (row, since) in changes {
+            tx.update("posStructures", row, &[("claimSince", since)])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = claimed {
         error!("updating claims: {}", crate::logging::chain(&e));
         return;
     }
     let standing = now - claim_delay_secs * TICKS_PER_SECOND;
-    let claims = db
-        .query(
-            r#"SELECT s."solarSystemID", NULLIF(COALESCE(co."allianceID", cc."allianceID"), 0), count(*)
-                 FROM "posStructures" p
-                 JOIN entity e ON e."itemID" = p."itemID"
-                 JOIN "mapSolarSystems" s ON s."solarSystemID" = e."locationID"
-                 LEFT JOIN "corporation" co ON co."corporationID" = e."ownerID"
-                 LEFT JOIN "character_" ch ON ch."characterID" = e."ownerID"
-                 LEFT JOIN "corporation" cc ON cc."corporationID" = ch."corporationID"
-                WHERE p."claim" = 1 AND p."claimSince" <= $1 AND s."factionID" IS NULL
-                GROUP BY 1, 2"#,
-            &[&standing],
-        )
-        .await;
-    let held = db.query(r#"SELECT "solarSystemID", "allianceID" FROM "mapSolarSystems" WHERE "allianceID" IS NOT NULL"#, &[]).await;
-    let (claims, held) = match (claims, held) {
-        (Ok(c), Ok(h)) => (c, h),
-        (Err(e), _) | (_, Err(e)) => {
-            error!("reading sovereignty claims: {}", crate::logging::chain(&e));
-            return;
+    // Standing claims by system and alliance (a corporation's, or its
+    // owning character's corporation's), and who holds each system now.
+    let (claims, holders) = store.read(|db| {
+        let entity = db.table("entity");
+        let systems = db.table("mapSolarSystems");
+        let corporations = db.table("corporation");
+        let characters = db.table("character_");
+        let mut claims: Vec<((i64, Option<i64>), i64)> = Vec::new();
+        for p in db.table("posStructures").rows() {
+            if p.int("claim") != Some(1) || !p.int("claimSince").is_some_and(|t| t <= standing) {
+                continue;
+            }
+            let Some(e) = p.int("itemID").and_then(|id| entity.get_id(id)) else { continue };
+            let Some(system) = e.int("locationID").and_then(|l| systems.get_id(l)) else { continue };
+            if !system.value("factionID").is_null() {
+                continue;
+            }
+            let owner = e.int("ownerID");
+            let alliance = owner
+                .and_then(|o| corporations.get_id(o))
+                .and_then(|co| co.int("allianceID"))
+                .or_else(|| {
+                    let corp = owner.and_then(|o| characters.get_id(o))?.int("corporationID")?;
+                    corporations.get_id(corp)?.int("allianceID")
+                })
+                .filter(|a| *a != 0);
+            let key = (system.int("solarSystemID").unwrap_or(0), alliance);
+            match claims.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, n)) => *n += 1,
+                None => claims.push((key, 1)),
+            }
         }
-    };
+        let holders: HashMap<i64, i64> =
+            systems.rows().filter_map(|s| Some((s.int("solarSystemID")?, s.int("allianceID")?))).collect();
+        (claims, holders)
+    });
     let mut by_system: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
-    for r in &claims {
-        if let (Some(system), Some(alliance)) = (int(r, 0), int(r, 1)) {
-            by_system.entry(system).or_default().push((alliance, int(r, 2).unwrap_or(0)));
+    for ((system, alliance), count) in claims {
+        if let Some(alliance) = alliance {
+            by_system.entry(system).or_default().push((alliance, count));
         }
     }
-    let holders: HashMap<i64, i64> = held.iter().filter_map(|r| Some((int(r, 0)?, int(r, 1)?))).collect();
     let mut systems: Vec<i64> = by_system.keys().chain(holders.keys()).copied().collect();
     systems.sort_unstable();
     systems.dedup();
@@ -964,9 +1011,10 @@ pub async fn sovereignty(db: &Client, claim_delay_secs: i64) {
     let many = changes.len() > SOV_CHANGES_LISTED;
     let mut moved = 0;
     for (system, holder, winner) in &changes {
-        let saved = db
-            .execute(r#"UPDATE "mapSolarSystems" SET "allianceID" = $2 WHERE "solarSystemID" = $1"#, &[&(*system as i32), &winner.map(|a| a as i32)])
-            .await;
+        let saved = store.write(|tx| match tx.table("mapSolarSystems").get_id(*system).map(|s| s.id) {
+            Some(row) => tx.update("mapSolarSystems", row, &[("allianceID", winner.map_or(store::Value::Null, store::Value::Int))]),
+            None => Ok(()),
+        });
         match saved {
             Ok(_) if many => debug!("sovereignty of {system} passes from {holder:?} to {winner:?}"),
             Ok(_) => info!("sovereignty of {system} passes from {holder:?} to {winner:?}"),
@@ -1010,9 +1058,12 @@ pub async fn pos_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "UninstallJumpBridgeLink" => return Some(super::bridges::uninstall(ctx, call.arg_id(0)).await),
         "GetControlTowerFuelRequirements" => {
             let header = ["controlTowerTypeID", "resourceTypeID", "purpose", "quantity", "minSecurityLevel", "factionID"];
-            let sql = r#"SELECT "controlTowerTypeID", "resourceTypeID", "purpose", "quantity", "minSecurityLevel", "factionID"
-                           FROM "invControlTowerResources" ORDER BY 1, 3, 2"#;
-            Ok(ctx.rowset(&header, sql, &[]).await)
+            let mut resources: Vec<_> = crate::sde::table("invControlTowerResources").rows().collect();
+            // ORDER BY 1, 3, 2, NULLs last.
+            resources.sort_by_key(|r| {
+                (r.int("controlTowerTypeID"), r.int("purpose").is_none(), r.int("purpose"), r.int("resourceTypeID"))
+            });
+            Ok(rowset(&header, resources.iter().map(|r| Value::List(r.line(&header))).collect()))
         }
         "AnchorStructure" => {
             let at = call.args.get(1).and_then(|v| v.seq()).map(|p| p.iter().filter_map(|c| c.as_f64()).collect::<Vec<_>>());
@@ -1022,19 +1073,18 @@ pub async fn pos_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             }
         }
         "GetMoonForTower" => Ok(moonmining::moon_for_tower(ctx, tower).await),
-        "GetTowerClaim" => Ok(Value::Bool(setting(ctx, tower, r#""claim""#).await.and_then(|v| v.as_i64()) == Some(1))),
+        "GetTowerClaim" => Ok(Value::Bool(setting(ctx, tower, "claim").await.and_then(|v| v.as_i64()) == Some(1))),
         "SetTowerClaim" => {
             let claim = flag(1);
-            configure(ctx, tower, r#""claim" = $2, "claimSince" = NULL"#, &[&i16::from(claim)]).await.map(|v| {
+            configure(ctx, tower, &[("claim", store::Value::Int(i64::from(claim))), ("claimSince", store::Value::Null)]).await.map(|v| {
                 info!("tower {tower} {} sovereignty", if claim { "claims" } else { "no longer claims" });
                 v
             })
         }
         "GetTowerSentrySettings" => {
-            let sql = r#"SELECT "sentryStanding", "sentryStatus", "sentryStandingDrop", "sentryStatusDrop", "sentryAggression", "sentryWar"
-                           FROM "posStructures" WHERE "itemID" = $1"#;
-            let r = ctx.query_one(sql, &[&(tower as i32)]).await;
-            let cell = |i: usize| r.as_ref().map_or(Value::None, |r| crate::svc::rows::cell(r, i));
+            const COLUMNS: [&str; 6] = ["sentryStanding", "sentryStatus", "sentryStandingDrop", "sentryStatusDrop", "sentryAggression", "sentryWar"];
+            let r = ctx.store.read(|db| db.table("posStructures").get_id(tower).map(|p| p.line(&COLUMNS)));
+            let cell = |i: usize| r.as_ref().map_or(Value::None, |r| r[i].clone());
             let truth = |i: usize| Value::Bool(cell(i).as_i64() == Some(1));
             Ok(Value::Tuple(vec![cell(0), cell(1), truth(2), truth(3), truth(4), truth(5)]))
         }
@@ -1052,12 +1102,18 @@ pub async fn pos_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             if let Some(s) = ctx.world.lock().parks.get_mut(&system).and_then(|p| p.structures.get_mut(&tower)) {
                 s.sentry = sentry;
             }
+            let number = |v: Option<f64>| v.map_or(store::Value::Null, store::Value::Float);
             configure(
                 ctx,
                 tower,
-                r#""sentryStanding" = $2, "sentryStatus" = $3, "sentryStandingDrop" = $4, "sentryStatusDrop" = $5,
-                   "sentryAggression" = $6, "sentryWar" = $7"#,
-                &[&opt(1), &opt(2), &i16::from(flag(3)), &i16::from(flag(4)), &i16::from(flag(5)), &i16::from(flag(6))],
+                &[
+                    ("sentryStanding", number(opt(1))),
+                    ("sentryStatus", number(opt(2))),
+                    ("sentryStandingDrop", store::Value::Int(i64::from(flag(3)))),
+                    ("sentryStatusDrop", store::Value::Int(i64::from(flag(4)))),
+                    ("sentryAggression", store::Value::Int(i64::from(flag(5)))),
+                    ("sentryWar", store::Value::Int(i64::from(flag(6)))),
+                ],
             )
             .await
         }
@@ -1065,13 +1121,11 @@ pub async fn pos_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "SetTowerPassword" => {
             let password = call.arg_text(1);
             let (corp, alliance) = (flag(2), flag(3));
-            let saved = configure(
-                ctx,
-                tower,
-                r#""password" = COALESCE($2, "password"), "allowCorp" = $3, "allowAlliance" = $4"#,
-                &[&password, &i16::from(corp), &i16::from(alliance)],
-            )
-            .await;
+            let mut sets = vec![("allowCorp", store::Value::Int(i64::from(corp))), ("allowAlliance", store::Value::Int(i64::from(alliance)))];
+            if let Some(p) = &password {
+                sets.push(("password", store::Value::Text(p.as_str().into())));
+            }
+            let saved = configure(ctx, tower, &sets).await;
             if saved.is_ok() {
                 // The field retunes on the next pulse (pos::step).
                 let system = ctx.session.solar_system_id.unwrap_or(0);
@@ -1130,8 +1184,7 @@ fn ship_password(ctx: &Ctx<'_>, password: &str) -> Refused<Value> {
 
 /// One column of a structure's settings row.
 async fn setting(ctx: &Ctx<'_>, id: i64, column: &str) -> Option<Value> {
-    let sql = format!(r#"SELECT {column} FROM "posStructures" WHERE "itemID" = $1"#);
-    ctx.query_one(&sql, &[&(id as i32)]).await.map(|r| crate::svc::rows::cell(&r, 0))
+    ctx.store.read(|db| db.table("posStructures").get_id(id).map(|p| p.cell(column)))
 }
 
 /// Whether the caller may configure the tower (Starbase Config, or owner).
@@ -1145,17 +1198,13 @@ fn may_configure(ctx: &Ctx<'_>, tower: i64) -> Refused<()> {
 }
 
 /// Changes a tower's settings, for those allowed to configure it.
-async fn configure(ctx: &Ctx<'_>, tower: i64, set: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Refused<Value> {
+async fn configure(ctx: &Ctx<'_>, tower: i64, sets: store::Sets<'_>) -> Refused<Value> {
     let Some(Seen { s, .. }) = seen(ctx, tower) else { return Err(Outcome::custom("That tower is not here.")) };
     not_reinforced(ctx, &s)?;
     if !allowed(ctx, &s, 0) {
         return Err(message("CantConfigureCorpStarbaseRoleLacking"));
     }
-    let sql = format!(r#"UPDATE "posStructures" SET {set} WHERE "itemID" = $1"#);
-    let id = tower as i32;
-    let mut all: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id];
-    all.extend_from_slice(params);
-    match ctx.db.execute(sql.as_str(), &all).await {
+    match ctx.store.write(|tx| set_structure(tx, tower, sets)) {
         Ok(_) => Ok(Value::None),
         Err(e) => {
             error!("configuring tower {tower}: {}", crate::logging::chain(&e));
@@ -1169,15 +1218,20 @@ const USAGE_HEADER: [&str; 4] = ["structureID", "viewput", "viewputtake", "use"]
 /// (deployFlags, usageFlagsList): who may anchor, unanchor, online and
 /// offline around the tower; and per structure, who may look, take and use.
 async fn permissions(ctx: &Ctx<'_>, tower: i64) -> Value {
-    let sql = r#"SELECT "deployAnchor", "deployUnanchor", "deployOnline", "deployOffline" FROM "posStructures" WHERE "itemID" = $1"#;
-    let r = ctx.query_one(sql, &[&(tower as i32)]).await;
-    let flag = |i: usize| Value::Int(r.as_ref().and_then(|r| int(r, i)).unwrap_or(0));
+    let (flags, lines) = ctx.store.read(|db| {
+        let structures = db.table("posStructures");
+        let r = structures.get_id(tower);
+        let flags: Vec<i64> =
+            ["deployAnchor", "deployUnanchor", "deployOnline", "deployOffline"].iter().map(|c| r.and_then(|r| r.int(c)).unwrap_or(0)).collect();
+        let mut usage: Vec<_> = structures.rows().filter(|p| p.int("controlTowerID") == Some(tower)).collect();
+        usage.sort_by_key(|p| p.int("itemID"));
+        let lines: Vec<Value> = usage.iter().map(|p| Value::List(p.line(&["itemID", "useViewPut", "useViewPutTake", "useUse"]))).collect();
+        (flags, lines)
+    });
     let deploy = Value::Dict(
-        ["anchor", "unanchor", "online", "offline"].iter().enumerate().map(|(i, k)| (Value::bytes(*k), flag(i))).collect(),
+        ["anchor", "unanchor", "online", "offline"].iter().zip(flags).map(|(k, flag)| (Value::bytes(*k), Value::Int(flag))).collect(),
     );
-    let sql = r#"SELECT "itemID", "useViewPut", "useViewPutTake", "useUse" FROM "posStructures"
-                  WHERE "controlTowerID" = $1 ORDER BY "itemID""#;
-    let usage = rowset(&USAGE_HEADER, ctx.query(sql, &[&(tower as i32)]).await.iter().map(|r| Value::List(line(r))).collect());
+    let usage = rowset(&USAGE_HEADER, lines);
     Value::Tuple(vec![deploy, usage])
 }
 
@@ -1188,11 +1242,11 @@ async fn set_permissions(ctx: &Ctx<'_>, tower: i64, call: &Call) -> Refused<Valu
             _ => 0,
         }
     };
+    let flag = |key: &str| store::Value::Int(deploy(key).into());
     configure(
         ctx,
         tower,
-        r#""deployAnchor" = $2, "deployUnanchor" = $3, "deployOnline" = $4, "deployOffline" = $5"#,
-        &[&deploy("anchor"), &deploy("unanchor"), &deploy("online"), &deploy("offline")],
+        &[("deployAnchor", flag("anchor")), ("deployUnanchor", flag("unanchor")), ("deployOnline", flag("online")), ("deployOffline", flag("offline"))],
     )
     .await?;
     // usageFlagsList: a util.Rowset of [structureID, viewput, viewputtake, use].
@@ -1203,12 +1257,19 @@ async fn set_permissions(ctx: &Ctx<'_>, tower: i64, call: &Call) -> Refused<Valu
         },
         _ => None,
     };
-    for l in lines.unwrap_or_default() {
-        let Some(l) = l.seq() else { continue };
-        let at = |i: usize| l.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
-        let sql = r#"UPDATE "posStructures" SET "useViewPut" = $3, "useViewPutTake" = $4, "useUse" = $5
-                      WHERE "itemID" = $1 AND "controlTowerID" = $2"#;
-        ctx.execute(sql, &[&(at(0) as i32), &(tower as i32), &(at(1) as i16), &(at(2) as i16), &(at(3) as i16)]).await;
+    let saved = ctx.store.write(|tx| {
+        for l in lines.unwrap_or_default() {
+            let Some(l) = l.seq() else { continue };
+            let at = |i: usize| l.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
+            // Only the tower's own structures.
+            let Some(row) = tx.table("posStructures").get_id(at(0)).filter(|p| p.int("controlTowerID") == Some(tower)).map(|p| p.id) else { continue };
+            let usage = |i: usize| store::Value::Int((at(i) as i16).into());
+            tx.update("posStructures", row, &[("useViewPut", usage(1)), ("useViewPutTake", usage(2)), ("useUse", usage(3))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = saved {
+        error!("statement failed: {}", crate::logging::chain(&e));
     }
     Ok(Value::None)
 }
@@ -1242,7 +1303,7 @@ pub async fn may(ctx: &Ctx<'_>, id: i64, access: Access) -> Option<bool> {
         Access::Take => "useViewPutTake",
         Access::Use => "useUse",
     };
-    Some(allowed(ctx, &s, deploy_flag(ctx.db, s.id, column).await))
+    Some(allowed(ctx, &s, ctx.store.read(|db| deploy_flag(db, s.id, column))))
 }
 
 #[cfg(test)]

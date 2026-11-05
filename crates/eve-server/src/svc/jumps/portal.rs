@@ -1,12 +1,14 @@
 //! Opening a titan portal has one accepted-start point: the final live check
-//! after staging payment. Source identity and SQL custody stay reserved through
-//! COMMIT. A later loss of the destination closes that accepted portal; it can
-//! never make an unusable destination available to travelers.
+//! after staging payment, at the end of the store write that pays. A later
+//! loss of the destination closes that accepted portal; it can never make an
+//! unusable destination available to travelers.
 
 use super::*;
 use crate::combat::{self, Charged};
 use crate::dogma::{Catalog, State};
+use crate::store::Store;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 mod journal;
 pub use journal::{Pending, ensure, blocked, blocked_character, blocked_in_memory, blocked_character_in_memory, retry};
 
@@ -16,7 +18,6 @@ mod tests;
 #[derive(Clone)]
 struct Request {
     world: World,
-    url: String,
     pilot: i64,
     client: i64,
     ship: i64,
@@ -53,12 +54,12 @@ struct Reservation {
     state: CommitState,
     receipt: Option<journal::Receipt>,
 }
-#[derive(PartialEq)] enum CommitState {Prepared, Uncertain, Accepted, Released}
+#[derive(PartialEq)] enum CommitState {Prepared, Accepted}
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        // An unacknowledged COMMIT is not rollback. The journal/retry owner
-        // keeps the source reserved until fresh custody locks prove its result.
+        // An accepted start is the journal's to finish; only a refused one,
+        // whose payment the store write undid, is released here.
         if self.state != CommitState::Prepared {return;}
         let mut w = self.world.lock();
         if let Some(receipt)=&self.receipt {w.pending_portals.remove(&receipt.generation);}
@@ -91,18 +92,51 @@ pub fn active_until_locked(w:&WorldState,ship:i64)->Option<i64> {
         .map(|b|b.until_ms)
 }
 
-fn database(error: tokio_postgres::Error) -> String {
+fn database(error: StoreError) -> String {
     tracing::error!("opening jump portal: {}", crate::logging::chain(&error));
     "The jump portal could not be opened.".into()
 }
 
+/// A refusal inside a portal's store write, which undoes what it did.
+struct Refusal(String);
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Self {
+        Refusal(why)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(why: &str) -> Self {
+        Refusal(why.into())
+    }
+}
+
+impl From<StoreError> for Refusal {
+    fn from(error: StoreError) -> Self {
+        Refusal(database(error))
+    }
+}
+
+/// Whether the fixed beacon `beacon` stands online in `to`, owned by a
+/// corporation of `alliance`, and `corporation` is in that alliance too.
+fn beacon_available(db: &Db, beacon: i64, to: i64, alliance: i64, corporation: i64) -> bool {
+    let in_alliance = |corp: i64| db.table("corporation").get_id(corp).is_some_and(|c| c.int("allianceID") == Some(alliance));
+    db.table("entity").get_id(beacon).is_some_and(|e| {
+        e.int("locationID") == Some(to)
+            && e.int("typeID").is_some_and(|t| crate::sde::get().types_in_group(838).contains(&(t as i32)))
+            && db.table("posStructures").get_id(beacon).is_some_and(|p| matches!(p.int("state"), Some(4 | 5)))
+            && e.int("ownerID").is_some_and(in_alliance)
+    }) && in_alliance(corporation)
+}
+
 pub(super) async fn open(ctx: &Ctx<'_>, pilot: i64, ship: i64, from: i64, member: Option<i64>, beacon: i64, to: i64) -> Refused<()> {
-    let request = Request { world:ctx.world.clone(), url:ctx.db_url.to_string(), pilot, client:ctx.client_id,
+    let request = Request { world:ctx.world.clone(), pilot, client:ctx.client_id,
         ship, from, member, beacon, to, alliance:ctx.session.alliance_id,
         bonuses:ctx.dogma.fleet_bonuses(pilot) };
-    // Dropping the caller cannot cancel a COMMIT whose result still needs to
-    // be published. Before payment, all refusal/cancellation releases RAII state.
-    tokio::spawn(run(request)).await.map_err(|error| {
+    // Dropping the caller cannot cancel the finalization of a payment that
+    // has been accepted. Before payment, every refusal releases RAII state.
+    tokio::spawn(run(request, ctx.store.clone())).await.map_err(|error| {
         tracing::error!("portal startup task: {error}");
         "The jump portal request could not be completed.".to_string()
     })?
@@ -134,8 +168,9 @@ fn destination(w: &WorldState, r: &Request, harmonics:i64) -> Refused<()> {
             return Err("A standard portal cannot lock onto a covert cynosural field.".into());
         }
     } else {
-        // SQL locks protect the fixed beacon's actual owner and state. Also
-        // reject a live source whose alliance changed during preparation.
+        // The paying store write checks the fixed beacon's actual owner and
+        // state. Also reject a live source whose alliance changed during
+        // preparation.
         let hull = w.parks.get(&r.from).and_then(|p| p.ships.get(&r.ship)).ok_or("Your ship is no longer in space.")?;
         if r.alliance.filter(|id| *id > 0) != hull.pilot.alliance_id.filter(|id| *id > 0) {
             return Err("Your alliance changed while opening the portal.".into());
@@ -153,54 +188,53 @@ pub(super) fn bridge_live(w: &WorldState, ship: i64, b: &crate::world::Bridge) -
         Some(member) => w.gangs.of(b.titan_pilot).is_some() && w.gangs.of(b.titan_pilot) == w.gangs.of(member)
             && field_at(w, b.to_system, b.beacon, member).is_some()
             && w.parks[&b.to_system].beacons.get(&b.beacon).is_some_and(|field|field.type_id != 28650 || b.harmonics >= 2),
-        None => true, // Fixed-beacon SQL authorization is freshly checked for every transit.
+        None => true, // Fixed-beacon authorization is freshly checked for every transit.
     }
 }
 
-async fn run(r: Request) -> Refused<()> {
-    let mut db = crate::db::connect(&r.url).await.map_err(database)?;
-    let mut txn = ItemTxn::begin(&mut db).await.map_err(database)?;
-    if !crate::svc::login::lock_character_lifecycle(txn.tx(), r.pilot as i32).await.map_err(database)? {
+async fn run(r: Request, store: Arc<Store>) -> Refused<()> {
+    let (receipt, events, _owner) = store.write(|tx| -> Result<_, Refusal> {
+    let mut txn = ItemTxn::new(tx);
+    if txn.db().table("character_").get_id(r.pilot).is_none() {
         return Err("That character is no longer available.".into());
     }
-    if crate::losses::pending::blocked_character(txn.tx(),r.pilot).await.map_err(database)?
+    if crate::losses::pending::blocked_character(txn.db(),r.pilot)?
         || crate::losses::journal::blocked_character_in_memory(&r.world,r.pilot)
         || crate::travel::blocked_character_in_memory(&r.world,r.pilot)
         || crate::conn::logout::blocked_character_in_memory(&r.world,r.pilot)
         || blocked_character_in_memory(&r.world,r.pilot) {
         return Err("Your ship has an unresolved state transition or loss.".into());
     }
-    let character = txn.tx().query_opt(r#"SELECT "corporationID" FROM "character_" WHERE "characterID"=$1
-        AND "shipID"=$2 AND "solarSystemID"=$3 AND COALESCE("stationID",0)=0 FOR UPDATE"#,
-        &[&(r.pilot as i32), &(r.ship as i32), &(r.from as i32)]).await.map_err(database)?
+    let corporation = txn.db().table("character_").get_id(r.pilot)
+        .filter(|c| c.int("shipID")==Some(r.ship) && c.int("solarSystemID")==Some(r.from) && c.int("stationID").unwrap_or(0)==0)
+        .map(|c| c.int("corporationID").unwrap_or(0))
         .ok_or("Your ship or location changed. Try again.")?;
-    let corporation = character.get::<_,i32>(0);
-    let hull = txn.item(r.ship).await.map_err(database)?.ok_or("That ship no longer exists.")?;
+    let hull = txn.item(r.ship)?.ok_or("That ship no longer exists.")?;
     if hull.owner_id != r.pilot || hull.location_id != r.from || hull.flag != 0 || hull.quantity != 1 || !hull.singleton || hull.category_id != 6 {
         return Err("You no longer control that ship here in space.".into());
     }
-    if !journal::retire_ready(txn.tx(),&r.world,r.ship).await? {return Err("Your jump portal is already open or being opened.".into());}
-    // All possible generators and their online rows are locked before loading
-    // their effective attributes; a pre-wait loadout is never a custody grant.
-    let generators = txn.tx().query(r#"SELECT e."itemID" FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-        WHERE e."locationID"=$1 AND e."ownerID"=$2 AND t."groupID"=$3 AND e.flag BETWEEN 11 AND 35
-        AND e.singleton=1 AND e.quantity=1 ORDER BY e."itemID" FOR UPDATE OF e"#,
-        &[&(r.ship as i32), &(r.pilot as i32), &(GROUP_JUMP_PORTAL_GENERATOR as i32)]).await.map_err(database)?;
-    let ids: Vec<i32> = generators.iter().map(|row| row.get(0)).collect();
+    if !journal::retire_ready(txn.tx(),&r.world,r.ship)? {return Err("Your jump portal is already open or being opened.".into());}
+    // Every possible generator, fitted and whole; their effective attributes
+    // are loaded in this same write, so no earlier loadout grants custody.
+    let generator_types = crate::sde::get().types_in_group(GROUP_JUMP_PORTAL_GENERATOR);
+    let mut ids: Vec<i64> = txn.db().table("entity").find(&["locationID"], &[store::Value::Int(r.ship)])
+        .filter(|e| e.int("ownerID")==Some(r.pilot) && e.int("typeID").is_some_and(|t| generator_types.contains(&(t as i32)))
+            && e.int("flag").is_some_and(|f| (11..=35).contains(&f)) && e.int("singleton")==Some(1) && e.int("quantity")==Some(1))
+        .filter_map(|e| e.int("itemID"))
+        .collect();
+    ids.sort_unstable();
     if ids.is_empty() { return Err("You have no Jump Portal Generator fitted.".into()); }
-    txn.tx().query(r#"SELECT "itemID" FROM entity_attributes WHERE "itemID"=ANY($1) AND "attributeID"=2
-        ORDER BY "itemID" FOR UPDATE"#, &[&ids]).await.map_err(database)?;
-    let catalog = Catalog::load(txn.tx()).await.map_err(database)?;
+    let catalog = Catalog::new();
     catalog.replace_fleet_bonuses(HashMap::from([(r.pilot, r.bonuses.clone())]));
     let active = r.world.lock().parks.get(&r.from).and_then(|p|p.ships.get(&r.ship)).and_then(|s|s.fight.as_ref())
         .map(|f|f.applied.iter().copied().collect()).unwrap_or_default();
     let quote = {
-    let loadout = Loadout::load(txn.tx(), &catalog, r.pilot, Some(r.ship), &active).await.map_err(database)?;
+    let loadout = Loadout::load(txn.db(), &catalog, r.pilot, Some(r.ship), &active)?;
     let ship_index = loadout.find(r.ship).ok_or("Your ship could not be read.")?;
     if loadout.value(ship_index, ATTR_CAN_JUMP) <= 0.0 && loadout.value(ship_index, ATTR_JUMP_RANGE) <= 0.0 {
         return Err("Your ship cannot open a jump portal.".into());
     }
-    let module = loadout.pieces.iter().position(|p| ids.contains(&(p.item_id as i32)) && p.state != State::Offline)
+    let module = loadout.pieces.iter().position(|p| ids.contains(&p.item_id) && p.state != State::Offline)
         .ok_or("You have no online Jump Portal Generator fitted.")?;
     if loadout.value(module, combat::attr::HP) > 0.0 && loadout.value(module, combat::attr::DAMAGE) >= loadout.value(module, combat::attr::HP) {
         return Err("Repair that portal generator before activating it.".into());
@@ -221,23 +255,13 @@ async fn run(r: Request) -> Refused<()> {
         || !quote.mass_factor.is_finite() || quote.mass_factor <= 0.0 || !quote.range.is_finite() || quote.range <= 0.0 {
         return Err("That portal generator has invalid operating attributes.".into());
     }
-    let rows = txn.tx().query(r#"SELECT "solarSystemID",x,y,z FROM "mapSolarSystems" WHERE "solarSystemID"=ANY($1)"#,
-        &[&vec![r.from as i32,r.to as i32]]).await.map_err(database)?;
-    let at = |id:i64| rows.iter().find(|row|i64::from(row.get::<_,i32>(0))==id).map(|row|Vec3::new(
-        row.get::<_,Option<f64>>(1).unwrap_or(0.0),row.get::<_,Option<f64>>(2).unwrap_or(0.0),row.get::<_,Option<f64>>(3).unwrap_or(0.0)));
-    let ly = (at(r.from).ok_or("The source system was not found.")? - at(r.to).ok_or("The destination system was not found.")?).len()/METERS_PER_LIGHT_YEAR;
-    if !ly.is_finite() || ly > quote.range { return Err(format!("That field is outside your portal's {:.2} light-year range.",quote.range)); }
+    let ly = (system_at(txn.db(), r.from).ok_or("The source system was not found.")? - system_at(txn.db(), r.to).ok_or("The destination system was not found.")?).len()/METERS_PER_LIGHT_YEAR;
+    if !ly.is_finite() || ly > quote.range { return Err(format!("That field is outside your portal's {:.2} light-year range.",quote.range).into()); }
     if r.member.is_none() {
         let alliance = r.alliance.filter(|a|*a>0).ok_or("You must belong to the beacon's alliance.")?;
-        // Shared row locks preserve owner, system, operational state, and both
-        // corporations' alliances through payment. No cached session grant.
-        let found = txn.tx().query_opt(r#"SELECT 1 FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-            JOIN "posStructures" p ON p."itemID"=e."itemID" JOIN corporation destination ON destination."corporationID"=e."ownerID"
-            JOIN corporation source ON source."corporationID"=$4
-            WHERE e."itemID"=$1 AND e."locationID"=$2 AND t."groupID"=838 AND p.state IN (4,5)
-            AND destination."allianceID"=$3 AND source."allianceID"=$3 FOR SHARE OF e,p,destination,source"#,
-            &[&(r.beacon as i32),&(r.to as i32),&(alliance as i32),&corporation]).await.map_err(database)?;
-        if found.is_none() { return Err("That alliance beacon is no longer available to your corporation.".into()); }
+        // Owner, system, operational state, and both corporations' alliances
+        // are read in the same write that pays. No cached session grant.
+        if !beacon_available(txn.db(), r.beacon, r.to, alliance, corporation) { return Err("That alliance beacon is no longer available to your corporation.".into()); }
     }
     let mut reservation = {
         let mut w = r.world.lock();
@@ -252,29 +276,29 @@ async fn run(r: Request) -> Refused<()> {
         Reservation { world:r.world.clone(),system:r.from,ship:r.ship,pilot:r.pilot,client:r.client,
             capacitor:quote.capacitor,before,reserved,state:CommitState::Prepared,receipt:None }
     };
-    if quote.fuel>0 { FuelCost { cargo:r.ship,type_id:quote.fuel_type,quantity:quote.fuel,flag:Some(FLAG_CARGO) }.debit(&mut txn).await?; }
-    let events=txn.prepare_events().await.map_err(database)?;
+    if quote.fuel>0 { FuelCost { cargo:r.ship,type_id:quote.fuel_type,quantity:quote.fuel,flag:Some(FLAG_CARGO) }.debit(&mut txn)?; }
+    let events=txn.events();
     let charge={let w=r.world.lock();source(&w,&r,true)?;destination(&w,&r,quote.harmonics)?;
         w.parks[&r.from].ships[&r.ship].fight.as_ref().unwrap().vitals.capacitor.at(combat::now_ms())};
     if !charge.is_finite() || charge<0.0 {return Err("Your capacitor state is invalid.".into());}
     // Persist the already-reserved live charge with fuel and the receipt. The
     // marker still quarantines unknown later combat; finalization writes fresh
     // current vitals, never replays this captured charge into the live ship.
-    txn.tx().execute(r#"INSERT INTO entity_attributes("itemID","attributeID","valueInt","valueFloat") VALUES($1,18,NULL,$2)
-        ON CONFLICT("itemID","attributeID") DO UPDATE SET "valueInt"=NULL,"valueFloat"=EXCLUDED."valueFloat""#,
-        &[&(r.ship as i32),&charge]).await.map_err(database)?;
-    let receipt=journal::begin(txn.tx(),&r,&quote,hull.type_id).await?;
+    let charged=[("valueInt",store::Value::Null),("valueFloat",store::Value::Float(charge))];
+    txn.tx().upsert("entity_attributes",&["itemID","attributeID"],
+        &[("itemID",store::Value::Int(r.ship)),("attributeID",store::Value::Int(18)),charged[0].clone(),charged[1].clone()],&charged)?;
+    let receipt=journal::begin(txn.tx(),&r,&quote,hull.type_id)?;
     reservation.receipt=Some(receipt.clone());
     {
         let mut w = r.world.lock();
         source(&w,&r,true)?; destination(&w,&r,quote.harmonics)?;
         w.pending_portals.insert(receipt.generation,Pending::owned(receipt.clone(),r.client,reservation.before,reservation.reserved));
     } // Accepted-start point. Later dynamic revocations close this accepted portal.
-    let _owner=journal::owner_guard(&r.world,receipt.generation);
-    reservation.state=CommitState::Uncertain;
-    let outcome=txn.commit_prepared().await;
-    if let Err(ref error)=outcome {tracing::warn!(generation=receipt.generation,"portal COMMIT outcome unresolved: {}",crate::logging::chain(error));}
-    journal::complete_owned(&r,&receipt,&mut reservation,events,outcome.is_ok()).await
+    let owner=journal::owner_guard(&r.world,receipt.generation);
+    reservation.state=CommitState::Accepted;
+    Ok((receipt,events,owner))
+    }).map_err(|Refusal(why)| why)?;
+    journal::complete_owned(&r,&store,&receipt,events).await
 }
 
 fn announce(w:&WorldState,r:&Request,open:bool) {

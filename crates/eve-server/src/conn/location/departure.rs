@@ -1,12 +1,12 @@
-//! Revalidate departure permissions inside the arrival/payment transaction.
-//! SQL endpoint locks last through COMMIT. Dynamic fleet/field authorization is
-//! accepted under the world lock immediately before COMMIT, never before a fuel wait.
+//! Revalidate departure permissions inside the arrival/payment write.
+//! Endpoint state is read in that write. Dynamic fleet/field authorization is
+//! accepted under the world lock immediately before it commits.
 use super::*;
 use crate::{
     services::Ctx,
     world::{Bridge, World, WorldState},
 };
-use tokio_postgres::Transaction;
+use crate::store::Db;
 
 #[cfg(test)]
 mod tests;
@@ -147,39 +147,25 @@ impl<'a> Departure<'a> {
         self.live(&self.world.lock())
     }
 
-    pub(super) async fn lock_endpoints(
-        &self,
-        tx: &Transaction<'_>,
-    ) -> std::result::Result<(), String> {
-        let pilot = self.ship.pilot.char_id as i32;
-        let corp = tx
-            .query_one(
-                r#"SELECT "corporationID" FROM "character_" WHERE "characterID"=$1"#,
-                &[&pilot],
-            )
-            .await
-            .map_err(travel_failed)?
-            .get::<_, i32>(0);
+    /// The endpoints' durable state, read in the arrival/payment write.
+    pub(super) fn check_endpoints(&self, db: &Db) -> std::result::Result<(), String> {
+        let pilot = self.ship.pilot.char_id;
+        let corp = corporation_of(db, pilot).ok_or_else(unsaved)?;
         match self.request {
-            JumpRequest::Alliance { beacon } => self.fixed_beacon(tx, corp, beacon).await?,
+            JumpRequest::Alliance { beacon } => self.fixed_beacon(db, corp, beacon)?,
             JumpRequest::Portal {
                 pilot: host,
                 ship: portal,
                 alliance,
             } => {
-                // Match the host's own transition lock order: character first,
-                // then hull, fitted generator and fuel.
-                let host_corp=tx.query_opt(r#"SELECT "corporationID" FROM "character_" WHERE "characterID"=$1 FOR SHARE"#,&[&(host as i32)]).await.map_err(travel_failed)?
-                    .ok_or("The jump portal's pilot is unavailable.")?.get::<_,i32>(0);
-                let row = tx
-                    .query_opt(
-                        r#"SELECT "itemID" FROM entity WHERE "itemID"=$1 AND "ownerID"=$2
-                    AND "locationID"=$3 AND COALESCE(flag,0)=0 AND quantity>0 FOR SHARE"#,
-                        &[&(portal as i32), &(host as i32), &(self.from as i32)],
-                    )
-                    .await
-                    .map_err(travel_failed)?;
-                if row.is_none() {
+                let host_corp=corporation_of(db,host).ok_or("The jump portal's pilot is unavailable.")?;
+                let in_place = db.table("entity").get_id(portal).is_some_and(|e| {
+                    e.int("ownerID") == Some(host)
+                        && e.int("locationID") == Some(self.from)
+                        && e.int("flag").unwrap_or(0) == 0
+                        && e.int("quantity").is_some_and(|q| q > 0)
+                });
+                if !in_place {
                     return Err("The jump portal's ship has moved.".into());
                 }
                 let generator = self
@@ -187,23 +173,23 @@ impl<'a> Departure<'a> {
                     .as_ref()
                     .ok_or("The jump portal closed.")?
                     .generator_id;
-                let fitted=tx.query_opt(r#"SELECT 1 FROM entity e JOIN entity_attributes a ON a."itemID"=e."itemID" AND a."attributeID"=2
-                    WHERE e."itemID"=$1 AND e."ownerID"=$2 AND e."locationID"=$3 AND e.flag BETWEEN 11 AND 35
-                    AND e.quantity>0 AND e.singleton<>0 AND COALESCE(a."valueFloat",a."valueInt"::float8,0)<>0 FOR SHARE OF e,a"#,
-                    &[&(generator as i32),&(host as i32),&(portal as i32)]).await.map_err(travel_failed)?;
-                if fitted.is_none() {
+                let fitted=db.table("entity").get_id(generator).is_some_and(|e|e.int("ownerID")==Some(host) && e.int("locationID")==Some(portal)
+                    && e.int("flag").is_some_and(|f|(11..=35).contains(&f)) && e.int("quantity").is_some_and(|q|q>0)
+                    && e.int("singleton").is_some_and(|s|s!=0))
+                    && db.table("entity_attributes").get(&[StoreValue::Int(generator),StoreValue::Int(2)])
+                        .is_some_and(|a|a.float("valueFloat").or_else(||a.float("valueInt")).unwrap_or(0.0)!=0.0);
+                if !fitted {
                     return Err("The jump portal generator is no longer fitted and online.".into());
                 }
                 let harmonics = self.bridge.as_ref().unwrap().harmonics;
                 if harmonics > 0 {
                     let loadout = crate::dogma::Loadout::load(
-                        tx,
+                        db,
                         self.catalog,
                         self.ship.pilot.char_id,
                         Some(self.ship.id),
                         &Default::default(),
                     )
-                    .await
                     .map_err(travel_failed)?;
                     let index = loadout
                         .find(self.ship.id)
@@ -215,63 +201,59 @@ impl<'a> Departure<'a> {
                     }
                 }
                 if alliance {
-                    let members = affiliations(tx, &[corp, host_corp]).await?;
+                    let members = affiliations(db, &[corp, host_corp]);
                     let own = members.get(&corp).copied().flatten().filter(|id| *id > 0);
                     if own.is_none() || own != members.get(&host_corp).copied().flatten() {
                         return Err("The jump portal's alliance changed.".into());
                     }
                 }
                 if let Some(b) = self.bridge.as_ref().filter(|b| b.member.is_none()) {
-                    self.fixed_beacon(tx, corp, b.beacon).await?;
+                    self.fixed_beacon(db, corp, b.beacon)?;
                 }
             }
             JumpRequest::Structure { local, remote } => {
-                let link=tx.query_opt(r#"SELECT 1 FROM "jumpBridgeLinks" WHERE "sourceID"=$1 AND "destinationID"=$2 FOR SHARE"#,
-                    &[&(local as i32),&(remote as i32)]).await.map_err(travel_failed)?;
-                if link.is_none() {
+                let link=db.table("jumpBridgeLinks").get_id(local).is_some_and(|l|l.int("destinationID")==Some(remote));
+                if !link {
                     return Err("The jump array link has changed.".into());
                 }
-                let ids = vec![local as i32, remote as i32];
-                let rows = tx
-                    .query(
-                        r#"SELECT e."itemID",e."ownerID",e."locationID",t."groupID",e.quantity
-                    FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-                    WHERE e."itemID"=ANY($1) ORDER BY e."itemID" FOR SHARE OF e"#,
-                        &[&ids],
-                    )
-                    .await
-                    .map_err(travel_failed)?;
+                let mut ids = vec![local, remote];
+                ids.sort_unstable();
+                ids.dedup();
+                let rows: Vec<_> = ids.iter().filter_map(|id| db.table("entity").get_id(*id)).collect();
                 if rows.len() != 2
                     || rows.iter().any(|r| {
-                        r.get::<_, i32>(3) != 707
-                            || r.get::<_, i32>(4) <= 0
-                            || i64::from(r.get::<_, i32>(2))
-                                != if i64::from(r.get::<_, i32>(0)) == local {
+                        // An endpoint of a type the static data does not
+                        // know is no jump array (joining on it left it out).
+                        r.int("typeID").and_then(|t| crate::sde::get().type_(t)).map(|t| t.group_id) != Some(707)
+                            || r.int("quantity").is_none_or(|q| q <= 0)
+                            || r.int("locationID")
+                                != Some(if r.int("itemID") == Some(local) {
                                     self.from
                                 } else {
                                     self.to
-                                }
+                                })
                     })
                 {
                     return Err("The jump array endpoints have changed.".into());
                 }
-                let states=tx.query(r#"SELECT state FROM "posStructures" WHERE "itemID"=ANY($1) ORDER BY "itemID" FOR SHARE"#,&[&ids]).await.map_err(travel_failed)?;
-                if states.len() != 2 || states.iter().any(|r| !matches!(r.get::<_, i16>(0), 4 | 5))
+                let states: Vec<_> = ids.iter().filter_map(|id| db.table("posStructures").get_id(*id)).collect();
+                if states.len() != 2 || states.iter().any(|r| !matches!(r.int("state"), Some(4 | 5)))
                 {
                     return Err("Both jump arrays must remain online.".into());
                 }
                 let owner = rows
                     .iter()
-                    .find(|r| i64::from(r.get::<_, i32>(0)) == local)
+                    .find(|r| r.int("itemID") == Some(local))
                     .unwrap()
-                    .get::<_, i32>(1);
-                if rows.iter().any(|r| r.get::<_, i32>(1) != owner) {
+                    .int("ownerID");
+                if rows.iter().any(|r| r.int("ownerID") != owner) {
                     return Err(
                         "The linked jump arrays no longer belong to the same corporation.".into(),
                     );
                 }
+                let owner = owner.unwrap_or(0);
                 if corp != owner {
-                    let members = affiliations(tx, &[corp, owner]).await?;
+                    let members = affiliations(db, &[corp, owner]);
                     let own = members.get(&corp).copied().flatten().filter(|id| *id > 0);
                     if own.is_none() || own != members.get(&owner).copied().flatten() {
                         return Err("The jump array's alliance changed.".into());
@@ -283,27 +265,29 @@ impl<'a> Departure<'a> {
         Ok(())
     }
 
-    async fn fixed_beacon(
+    fn fixed_beacon(
         &self,
-        tx: &Transaction<'_>,
-        corp: i32,
+        db: &Db,
+        corp: i64,
         beacon: i64,
     ) -> std::result::Result<(), String> {
-        let row=tx.query_opt(r#"SELECT e."ownerID" FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-            WHERE e."itemID"=$1 AND e."locationID"=$2 AND t."groupID"=838 AND e.quantity>0 FOR SHARE OF e"#,
-            &[&(beacon as i32),&(self.to as i32)]).await.map_err(travel_failed)?.ok_or("The alliance beacon has moved or disappeared.")?;
-        let state = tx
-            .query_opt(
-                r#"SELECT state FROM "posStructures" WHERE "itemID"=$1 FOR SHARE"#,
-                &[&(beacon as i32)],
-            )
-            .await
-            .map_err(travel_failed)?;
-        if state.is_none_or(|r| !matches!(r.get::<_, i16>(0), 4 | 5)) {
+        let beacons = crate::sde::get().types_in_group(838);
+        let owner = db
+            .table("entity")
+            .get_id(beacon)
+            .filter(|e| {
+                e.int("locationID") == Some(self.to)
+                    && e.int("typeID").is_some_and(|t| beacons.contains(&(t as i32)))
+                    && e.int("quantity").is_some_and(|q| q > 0)
+            })
+            .ok_or("The alliance beacon has moved or disappeared.")?
+            .int("ownerID")
+            .unwrap_or(0);
+        let online = db.table("posStructures").get_id(beacon).is_some_and(|r| matches!(r.int("state"), Some(4 | 5)));
+        if !online {
             return Err("The alliance beacon is no longer online.".into());
         }
-        let owner = row.get::<_, i32>(0);
-        let members = affiliations(tx, &[corp, owner]).await?;
+        let members = affiliations(db, &[corp, owner]);
         let own = members.get(&corp).copied().flatten().filter(|id| *id > 0);
         if own.is_none() || own != members.get(&owner).copied().flatten() {
             return Err("The beacon no longer belongs to your alliance.".into());
@@ -312,10 +296,22 @@ impl<'a> Departure<'a> {
     }
 }
 
-async fn affiliations(
-    tx: &Transaction<'_>,
-    corps: &[i32],
-) -> std::result::Result<std::collections::BTreeMap<i32, Option<i32>>, String> {
-    let rows=tx.query(r#"SELECT "corporationID","allianceID" FROM corporation WHERE "corporationID"=ANY($1) ORDER BY "corporationID" FOR SHARE"#,&[&corps]).await.map_err(travel_failed)?;
-    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+fn corporation_of(db: &Db, pilot: i64) -> Option<i64> {
+    db.table("character_").get_id(pilot).and_then(|c| c.int("corporationID"))
+}
+
+/// What a lookup that found no row reported: the save failed.
+fn unsaved() -> String {
+    "Your ship's location could not be saved. Please try again.".into()
+}
+
+/// Each existing corporation's alliance.
+fn affiliations(
+    db: &Db,
+    corps: &[i64],
+) -> std::collections::BTreeMap<i64, Option<i64>> {
+    corps
+        .iter()
+        .filter_map(|id| db.table("corporation").get_id(*id).map(|co| (*id, co.int("allianceID"))))
+        .collect()
 }

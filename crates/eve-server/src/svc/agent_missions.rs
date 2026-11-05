@@ -21,14 +21,14 @@
 //! time pays a bonus on top. The amounts are this server's choice.
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::{error, info};
 
 use crate::ballpark::Vec3;
 use crate::combat::Rng;
 use crate::items::{ItemTxn, NewItem};
 use crate::services::{Ctx, Outcome};
-use crate::svc::rows::{float, int, key_val, text};
+use crate::store::{Db, Row, Store, StoreError, Tx, Value as V};
+use crate::svc::rows::key_val;
 use crate::svc::wallet::{self, Entry, Transfer};
 use crate::world::World;
 
@@ -100,27 +100,26 @@ struct Agent {
     agent_type: i64,
 }
 
-async fn agent(db: &impl GenericClient, id: i64) -> Option<Agent> {
-    let sql = r#"SELECT a."agentID", c."characterName", a."divisionID", a."corporationID", n."factionID", a."stationID",
-                        s."stationName", s."solarSystemID", a."level", COALESCE(a."quality", 0), a."agentTypeID"
-                   FROM "agtAgents" a
-                   JOIN "staStations" s ON s."stationID" = a."stationID"
-                   LEFT JOIN "character_" c ON c."characterID" = a."agentID"
-                   LEFT JOIN "crpNPCCorporations" n ON n."corporationID" = a."corporationID"
-                  WHERE a."agentID" = $1"#;
-    let r = db.query_opt(sql, &[&(id as i32)]).await.ok().flatten()?;
+/// An agent, if it is one and its station is known: its name is on its
+/// character row, its faction its corporation's.
+fn agent(db: &Db, id: i64) -> Option<Agent> {
+    let a = crate::sde::table("agtAgents").get("agentID", (id as i32).into())?;
+    let station = a.int("stationID")?;
+    let s = db.table("staStations").get_id(station)?;
+    let name = db.table("character_").get_id(id).and_then(|c| c.text("characterName")).unwrap_or_default();
+    let corp = a.int("corporationID");
     Some(Agent {
-        id: int(&r, 0)?,
-        name: text(&r, 1).unwrap_or_default(),
-        division: int(&r, 2).unwrap_or(0),
-        corp: int(&r, 3).unwrap_or(0),
-        faction: int(&r, 4),
-        station: int(&r, 5)?,
-        station_name: text(&r, 6).unwrap_or_default(),
-        system: int(&r, 7).unwrap_or(0),
-        level: int(&r, 8).unwrap_or(1).clamp(1, 5) as usize,
-        quality: int(&r, 9).unwrap_or(0),
-        agent_type: int(&r, 10).unwrap_or(2),
+        id: a.int("agentID")?,
+        name: name.to_string(),
+        division: a.int("divisionID").unwrap_or(0),
+        corp: corp.unwrap_or(0),
+        faction: corp.and_then(|c| crate::sde::table("crpNPCCorporations").get("corporationID", c)).and_then(|n| n.int("factionID")),
+        station,
+        station_name: s.text("stationName").unwrap_or_default().to_string(),
+        system: s.int("solarSystemID").unwrap_or(0),
+        level: a.int("level").unwrap_or(1).clamp(1, 5) as usize,
+        quality: a.int("quality").unwrap_or(0),
+        agent_type: a.int("agentTypeID").unwrap_or(2),
     })
 }
 
@@ -143,52 +142,64 @@ struct Mission {
     expires_at: i64,
 }
 
-const MISSION_SELECT: &str = r#"SELECT "missionID", "agentID", "kind", "state", "name", COALESCE("typeID", 0), "quantity", "cargoID",
-                                       COALESCE("destinationID", 0), "siteX", "siteY", "siteZ", "reward", "bonus", "bonusSeconds",
-                                       "acceptedAt", "expiresAt"
-                                  FROM "agtCharMissions""#;
-
-fn mission_of(r: &tokio_postgres::Row) -> Mission {
-    let site = match (float(r, 9), float(r, 10), float(r, 11)) {
+fn mission_of(r: &Row) -> Mission {
+    let site = match (r.float("siteX"), r.float("siteY"), r.float("siteZ")) {
         (Some(x), Some(y), Some(z)) => Some(Vec3::new(x, y, z)),
         _ => None,
     };
     Mission {
-        id: int(r, 0).unwrap_or(0),
-        agent_id: int(r, 1).unwrap_or(0),
-        kind: int(r, 2).unwrap_or(0) as i16,
-        state: int(r, 3).unwrap_or(0) as i16,
-        name: text(r, 4).unwrap_or_default(),
-        type_id: int(r, 5).unwrap_or(0),
-        quantity: int(r, 6).unwrap_or(0),
-        cargo_id: int(r, 7),
-        destination: int(r, 8).unwrap_or(0),
+        id: r.int("missionID").unwrap_or(0),
+        agent_id: r.int("agentID").unwrap_or(0),
+        kind: r.int("kind").unwrap_or(0) as i16,
+        state: r.int("state").unwrap_or(0) as i16,
+        name: r.text("name").unwrap_or_default().to_string(),
+        type_id: r.int("typeID").unwrap_or(0),
+        quantity: r.int("quantity").unwrap_or(0),
+        cargo_id: r.int("cargoID"),
+        destination: r.int("destinationID").unwrap_or(0),
         site,
-        reward: float(r, 12).unwrap_or(0.0),
-        bonus: float(r, 13).unwrap_or(0.0),
-        bonus_seconds: int(r, 14).unwrap_or(0),
-        accepted_at: int(r, 15),
-        expires_at: int(r, 16).unwrap_or(0),
+        reward: r.float("reward").unwrap_or(0.0),
+        bonus: r.float("bonus").unwrap_or(0.0),
+        bonus_seconds: r.int("bonusSeconds").unwrap_or(0),
+        accepted_at: r.int("acceptedAt"),
+        expires_at: r.int("expiresAt").unwrap_or(0),
     }
+}
+
+/// Whether a mission is still open: offered, accepted or cleared.
+fn is_open(r: &Row) -> bool {
+    matches!(r.int("state"), Some(0 | 2 | 3))
 }
 
 /// The character's open missions (one agent's, or all); those past their
 /// time lapse on the way.
-async fn open_missions(db: &impl GenericClient, char_id: i64, agent_id: Option<i64>) -> Vec<Mission> {
+fn open_missions(tx: &mut Tx<'_>, char_id: i64, agent_id: Option<i64>) -> Vec<Mission> {
     let now = crate::bulkdata::filetime_now();
-    let lapse = r#"UPDATE "agtCharMissions" SET "state" = $3, "closedAt" = $2
-                    WHERE "characterID" = $1 AND "state" IN (0, 2, 3) AND "expiresAt" < $2"#;
-    if let Err(e) = db.execute(lapse, &[&(char_id as i32), &now, &EXPIRED]).await {
-        error!("lapsing missions of {char_id}: {}", crate::logging::chain(&e));
-    }
-    let sql = format!(r#"{MISSION_SELECT} WHERE "characterID" = $1 AND "state" IN (0, 2, 3) AND ($2::int IS NULL OR "agentID" = $2) ORDER BY "missionID""#);
-    match db.query(sql.as_str(), &[&(char_id as i32), &agent_id.map(|a| a as i32)]).await {
-        Ok(rows) => rows.iter().map(mission_of).collect(),
-        Err(e) => {
-            error!("reading missions of {char_id}: {}", crate::logging::chain(&e));
-            Vec::new()
+    let lapsed: Vec<_> = tx
+        .table("agtCharMissions")
+        .find(&["characterID"], &[V::Int(char_id)])
+        .filter(|r| is_open(r) && r.int("expiresAt").is_some_and(|e| e < now))
+        .map(|r| r.id)
+        .collect();
+    for row in lapsed {
+        if let Err(e) = tx.update("agtCharMissions", row, &[("state", V::Int(EXPIRED.into())), ("closedAt", V::Int(now))]) {
+            error!("lapsing missions of {char_id}: {}", crate::logging::chain(&e));
+            break;
         }
     }
+    let mut open: Vec<Mission> = tx
+        .table("agtCharMissions")
+        .find(&["characterID"], &[V::Int(char_id)])
+        .filter(|r| is_open(r) && agent_id.is_none_or(|a| r.int("agentID") == Some(a)))
+        .map(|r| mission_of(&r))
+        .collect();
+    open.sort_by_key(|m| m.id);
+    open
+}
+
+/// [`open_missions`] in a write of its own.
+fn open_missions_of(store: &Store, char_id: i64, agent_id: Option<i64>) -> Vec<Mission> {
+    store.write(|tx| Ok::<_, StoreError>(open_missions(tx, char_id, agent_id))).unwrap_or_default()
 }
 
 fn kind_of(division: i64) -> i16 {
@@ -214,10 +225,10 @@ fn kind_name(kind: i16) -> &'static str {
 /// DoAction(actionID) -> ((agentSays, [(actionID, text)]), oob).
 pub async fn conversation(ctx: &Ctx<'_>, agent_id: i64, action: Option<i64>) -> Value {
     let me = ctx.session.char_id.unwrap_or(0);
-    let Some(agent) = agent(ctx.db, agent_id).await else {
+    let Some(agent) = ctx.store.read(|db| agent(db, agent_id)) else {
         return said("I have nothing to say to you.".into(), Vec::new());
     };
-    let open = open_missions(ctx.db, me, Some(agent_id)).await.into_iter().next();
+    let open = open_missions_of(ctx.store, me, Some(agent_id)).into_iter().next();
     let result = match (action, open) {
         (Some(ASK), None) => ask(ctx, &agent).await,
         (Some(ACCEPT), Some(m)) if m.state == OFFERED => accept(ctx, &agent, m).await,
@@ -249,7 +260,7 @@ async fn ask(ctx: &Ctx<'_>, agent: &Agent) -> Result<Value, String> {
         return Err("I don't hand out missions. Perhaps one of my colleagues can help you.".into());
     }
     let me = ctx.session.char_id.unwrap_or(0);
-    let standings = standings_toward(ctx.db, me, agent).await;
+    let standings = ctx.store.read(|db| standings_toward(db, me, agent));
     if standings.iter().any(|s| *s <= -2.0) {
         return Err("I won't work with you. Mend your relations with us first.".into());
     }
@@ -267,7 +278,7 @@ async fn ask(ctx: &Ctx<'_>, agent: &Agent) -> Result<Value, String> {
 
 /// The offer, with what it pays and what the pilot may answer.
 async fn briefing(ctx: &Ctx<'_>, agent: &Agent, m: &Mission) -> Value {
-    let mut says = format!("<b>{}</b><br><br>{}", html(&m.name), objective(ctx.db, agent, m).await);
+    let mut says = format!("<b>{}</b><br><br>{}", html(&m.name), ctx.store.read(|db| objective(db, agent, m)));
     says.push_str(&format!("<br><br>{}", rewards(agent, m)));
     said(says, vec![(ACCEPT, "Accept"), (DECLINE, "Decline")])
 }
@@ -294,7 +305,7 @@ async fn status(ctx: &Ctx<'_>, agent: &Agent, m: &Mission) -> Value {
     if m.state == OFFERED {
         return briefing(ctx, agent, m).await;
     }
-    let mut says = format!("<b>{}</b><br><br>{}", html(&m.name), objective(ctx.db, agent, m).await);
+    let mut says = format!("<b>{}</b><br><br>{}", html(&m.name), ctx.store.read(|db| objective(db, agent, m)));
     if m.state == CLEARED {
         says.push_str("<br><br>I hear the pirates are gone. Good work.");
     }
@@ -302,11 +313,11 @@ async fn status(ctx: &Ctx<'_>, agent: &Agent, m: &Mission) -> Value {
 }
 
 /// What the pilot has to do, in the agent's words.
-async fn objective(db: &impl GenericClient, agent: &Agent, m: &Mission) -> String {
-    let what = html(&type_name(db, m.type_id).await);
+fn objective(db: &Db, agent: &Agent, m: &Mission) -> String {
+    let what = html(&type_name(m.type_id));
     match m.kind {
         KIND_COURIER => {
-            let (station, system) = station_names(db, m.destination).await;
+            let (station, system) = station_names(db, m.destination);
             format!(
                 "I need {} unit(s) of {what} taken from here, {}, to {} in {}. You'll find the cargo in your hangar here once you accept.",
                 m.quantity,
@@ -319,7 +330,7 @@ async fn objective(db: &impl GenericClient, agent: &Agent, m: &Mission) -> Strin
         KIND_TRADE => format!("I'm short of {} unit(s) of {what}. Get them to me here at {}.", m.quantity, html(&agent.station_name)),
         _ => format!(
             "A band of pirates has set up in {}. Clear them out; the location is in your journal. Report back to me when it's done.",
-            html(&system_name(db, m.destination).await)
+            html(&system_name(db, m.destination))
         ),
     }
 }
@@ -338,18 +349,20 @@ async fn offer(ctx: &Ctx<'_>, agent: &Agent) -> Option<Mission> {
     let (name, type_id, quantity, destination, site, reward, bonus, bonus_hours) = match kind {
         KIND_COURIER => {
             let reach = (level as i64 + 1).min(6);
-            let systems: Vec<(i64, i64)> = crate::gates::within(ctx.db, agent.system, reach).await;
-            let ids: Vec<i32> = systems.iter().map(|(s, _)| *s as i32).collect();
-            let sql = r#"SELECT "stationID", "solarSystemID" FROM "staStations" WHERE "solarSystemID" = ANY($1) AND "stationID" <> $2"#;
-            let stations: Vec<(i64, i64)> = ctx
-                .query(sql, &[&ids, &(agent.station as i32)])
-                .await
-                .iter()
-                .filter_map(|r| Some((int(r, 0)?, int(r, 1)?)))
-                .collect();
+            let (systems, stations) = ctx.store.read(|db| {
+                let systems: Vec<(i64, i64)> = crate::gates::within(db, agent.system, reach);
+                let stations: Vec<(i64, i64)> = db
+                    .table("staStations")
+                    .rows()
+                    .filter(|r| r.int("solarSystemID").is_some_and(|s| systems.iter().any(|(id, _)| *id == s)))
+                    .filter(|r| r.int("stationID").is_some_and(|s| s != agent.station))
+                    .filter_map(|r| Some((r.int("stationID")?, r.int("solarSystemID")?)))
+                    .collect();
+                (systems, stations)
+            });
             let &(station, system) = stations.get(rng.below(stations.len().max(1)))?;
             let jumps = systems.iter().find(|(s, _)| *s == system).map_or(0, |(_, n)| *n);
-            let (cargo, volume, _) = commodity(ctx.db, &mut rng, 0.1, 10.0).await?;
+            let (cargo, volume, _) = commodity(&mut rng, 0.1, 10.0)?;
             let quantity = (VOLUME[level - 1] * rng.range(0.5, 1.0) / volume).ceil().max(1.0) as i64;
             let reward = base * (0.6 + 0.15 * jumps as f64);
             (pick(&mut rng, &COURIER_NAMES), cargo, quantity, station, None, reward, reward * 0.5, 1.0 + jumps as f64 * 0.25)
@@ -357,38 +370,58 @@ async fn offer(ctx: &Ctx<'_>, agent: &Agent) -> Option<Mission> {
         KIND_MINING => {
             let ores = ORES[level - 1];
             let ore = ores[rng.below(ores.len()).min(rng.below(ores.len()))];
-            let volume = type_volume(ctx.db, ore).await.max(0.01);
+            let volume = type_volume(ore).max(0.01);
             let quantity = (ORE_VOLUME[level - 1] * rng.range(0.6, 1.0) / volume).round().max(1.0) as i64;
             (pick(&mut rng, &MINING_NAMES), ore, quantity, agent.station, None, base, base * 0.3, 4.0)
         }
         KIND_TRADE => {
-            let (goods, _, price) = commodity(ctx.db, &mut rng, 0.01, 50.0).await?;
+            let (goods, _, price) = commodity(&mut rng, 0.01, 50.0)?;
             let budget = base * 0.5;
             let quantity = (budget / price.max(1.0)).round().clamp(1.0, 100_000.0) as i64;
             let reward = base * 0.5 + price * quantity as f64 * 1.15;
             (pick(&mut rng, &TRADE_NAMES), goods, quantity, agent.station, None, reward, base * 0.2, 4.0)
         }
         _ => {
-            let systems = crate::gates::within(ctx.db, agent.system, level as i64 - 1).await;
+            let systems = ctx.store.read(|db| crate::gates::within(db, agent.system, level as i64 - 1));
             let &(system, _) = systems.get(rng.below(systems.len().max(1)))?;
-            let at = site_position(ctx.db, system, &mut rng).await;
+            let at = ctx.store.read(|db| site_position(db, system, &mut rng));
             let reward = base * 1.3;
             (pick(&mut rng, &ENCOUNTER_NAMES), 0, 0, system, Some(at), reward, reward * 0.4, 2.0)
         }
     };
-    let sql = r#"INSERT INTO "agtCharMissions" ("characterID", "agentID", "kind", "state", "name", "typeID", "quantity",
-                                                "destinationID", "siteX", "siteY", "siteZ", "reward", "bonus", "bonusSeconds",
-                                                "offeredAt", "expiresAt")
-                 VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                 RETURNING "missionID""#;
-    let i = |v: i64| v as i32;
     let (bonus_seconds, expires) = ((bonus_hours * 3_600.0) as i32, now + OFFER_LIFETIME);
-    let (x, y, z) = (site.map(|s: Vec3| s.x), site.map(|s: Vec3| s.y), site.map(|s: Vec3| s.z));
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 15] = [
-        &i(me), &i(agent.id), &kind, &name, &(type_id != 0).then_some(i(type_id)), &i(quantity), &i(destination),
-        &x, &y, &z, &reward.round(), &bonus.round(), &bonus_seconds, &now, &expires,
+    let coordinate = |c: fn(&Vec3) -> f64| site.as_ref().map_or(V::Null, |s| V::Float(c(s)));
+    let sets = [
+        ("characterID", V::Int(me)),
+        ("agentID", V::Int(agent.id)),
+        ("kind", V::Int(kind.into())),
+        ("state", V::Int(0)),
+        ("name", V::Text(name.into())),
+        ("typeID", if type_id != 0 { V::Int(type_id) } else { V::Null }),
+        ("quantity", V::Int(quantity)),
+        ("destinationID", V::Int(destination)),
+        ("siteX", coordinate(|s| s.x)),
+        ("siteY", coordinate(|s| s.y)),
+        ("siteZ", coordinate(|s| s.z)),
+        ("reward", V::Float(reward.round())),
+        ("bonus", V::Float(bonus.round())),
+        ("bonusSeconds", V::Int(bonus_seconds.into())),
+        ("offeredAt", V::Int(now)),
+        ("expiresAt", V::Int(expires)),
     ];
-    let id = ctx.query_one(sql, &params).await.and_then(|r| int(&r, 0))?;
+    // missionID is an identity column the store's schema gives no default:
+    // drawn from its sequence here.
+    let id = ctx
+        .store
+        .write(|tx| {
+            let id = tx.nextval("agtCharMissions_missionID_seq")?;
+            let mut sets = sets.to_vec();
+            sets.push(("missionID", V::Int(id)));
+            tx.insert("agtCharMissions", &sets)?;
+            Ok::<_, StoreError>(id)
+        })
+        .map_err(|e| error!("offering {me} a mission of agent {}: {}", agent.id, crate::logging::chain(&e)))
+        .ok()?;
     info!("agent {} offered {me} mission {id}: {} ({name})", agent.id, kind_name(kind));
     Some(Mission {
         id,
@@ -410,26 +443,31 @@ async fn offer(ctx: &Ctx<'_>, agent: &Agent) -> Option<Mission> {
 }
 
 /// A commodity of one unit's volume within bounds: (typeID, volume, base price).
-async fn commodity(db: &impl GenericClient, rng: &mut Rng, min_volume: f64, max_volume: f64) -> Option<(i64, f64, f64)> {
-    let sql = r#"SELECT t."typeID", t."volume", t."basePrice" FROM "invTypes" t JOIN "invGroups" g ON g."groupID" = t."groupID"
-                  WHERE g."categoryID" = $1 AND t."marketGroupID" IS NOT NULL AND t."basePrice" > 0
-                    AND t."volume" BETWEEN $2 AND $3
-                  ORDER BY t."typeID""#;
-    let rows = db.query(sql, &[&CATEGORY_COMMODITY, &min_volume, &max_volume]).await.ok()?;
+/// Marketable and priced, by type ID.
+fn commodity(rng: &mut Rng, min_volume: f64, max_volume: f64) -> Option<(i64, f64, f64)> {
+    let types = crate::sde::table("invTypes");
+    let rows: Vec<crate::sde::Row> = crate::sde::get()
+        .types_in_category(CATEGORY_COMMODITY.into())
+        .iter()
+        .filter_map(|t| types.get("typeID", (*t).into()))
+        .filter(|t| {
+            t.int("marketGroupID").is_some()
+                && t.float("basePrice").is_some_and(|p| p > 0.0)
+                && t.float("volume").is_some_and(|v| (min_volume..=max_volume).contains(&v))
+        })
+        .collect();
     let r = rows.get(rng.below(rows.len().max(1)))?;
-    Some((int(r, 0)?, float(r, 1).unwrap_or(1.0), float(r, 2).unwrap_or(1.0)))
+    Some((r.int("typeID")?, r.float("volume").unwrap_or(1.0), r.float("basePrice").unwrap_or(1.0)))
 }
 
 /// Somewhere quiet in a system: a few thousand km off one of its planets,
 /// or an AU from the sun if it has none.
-async fn site_position(db: &impl GenericClient, system: i64, rng: &mut Rng) -> Vec3 {
-    let sql = r#"SELECT "x", "y", "z", COALESCE("radius", 0) FROM "mapDenormalize" WHERE "solarSystemID" = $1 AND "groupID" = 7"#;
+fn site_position(db: &Db, system: i64, rng: &mut Rng) -> Vec3 {
     let planets: Vec<(Vec3, f64)> = db
-        .query(sql, &[&(system as i32)])
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|r| Some((Vec3::new(float(r, 0)?, float(r, 1)?, float(r, 2)?), float(r, 3).unwrap_or(0.0))))
+        .table("mapDenormalize")
+        .find(&["solarSystemID"], &[V::Int(system)])
+        .filter(|r| r.int("groupID") == Some(7))
+        .filter_map(|r| Some((Vec3::new(r.float("x")?, r.float("y")?, r.float("z")?), r.float("radius").unwrap_or(0.0))))
         .collect();
     let (centre, radius) = planets.get(rng.below(planets.len().max(1))).copied().unwrap_or((Vec3::ZERO, 1.5e11));
     let out = rng.in_sphere(1.0);
@@ -447,112 +485,61 @@ async fn accept(ctx: &Ctx<'_>, agent: &Agent, m: Mission) -> Result<Value, Strin
         if ctx.session.station_id != Some(agent.station) {
             return Err(format!("Come and see me at {} to pick up the cargo.", html(&agent.station_name)));
         }
-        let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| e.to_string())?;
-        let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| e.to_string())?;
         let crate_ = NewItem { type_id: m.type_id, owner_id: me, location_id: agent.station, flag: FLAG_HANGAR, quantity: m.quantity, singleton: false };
-        cargo = Some(txn.create(crate_).await.map_err(|e| e.to_string())?);
-        let events = txn.commit().await.map_err(|e| e.to_string())?;
+        let (id, events) = ctx
+            .store
+            .write(|tx| {
+                let mut items = ItemTxn::new(tx);
+                let id = items.create(crate_)?;
+                Ok::<_, StoreError>((id, items.events()))
+            })
+            .map_err(|e| e.to_string())?;
+        cargo = Some(id);
         crate::items::notify(ctx.world, ctx.client_id, events);
     }
-    let sql = r#"UPDATE "agtCharMissions" SET "state" = $2, "acceptedAt" = $3, "expiresAt" = $4, "cargoID" = $5
-                  WHERE "missionID" = $1 AND "state" = 0"#;
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 5] =
-        [&(m.id as i32), &ACCEPTED, &now, &(now + MISSION_LIFETIME), &cargo.map(|c| c as i32)];
-    ctx.execute(sql, &params).await;
+    let sets = [
+        ("state", V::Int(ACCEPTED.into())),
+        ("acceptedAt", V::Int(now)),
+        ("expiresAt", V::Int(now + MISSION_LIFETIME)),
+        ("cargoID", cargo.map_or(V::Null, V::Int)),
+    ];
+    let saved = ctx.store.write(|tx| {
+        let offered = tx.table("agtCharMissions").get_id(m.id).filter(|r| r.int("state") == Some(OFFERED.into())).map(|r| r.id);
+        match offered {
+            Some(row) => tx.update("agtCharMissions", row, &sets),
+            None => Ok(()),
+        }
+    });
+    if let Err(e) = saved {
+        error!("accepting mission {}: {}", m.id, crate::logging::chain(&e));
+    }
     info!("{me} accepted mission {} from agent {}", m.id, agent.id);
     notify_change(ctx.world, me, "accepted", agent.id);
     let accepted = Mission { state: ACCEPTED, accepted_at: Some(now), cargo_id: cargo, ..m };
-    let mut says = format!("Excellent. {}", objective(ctx.db, agent, &accepted).await);
+    let mut says = format!("Excellent. {}", ctx.store.read(|db| objective(db, agent, &accepted)));
     says.push_str("<br><br>Come back to me when you're done.");
     Ok(said(says, Vec::new()))
 }
 
+/// Why completing a mission stopped, as the agent says it.
+struct Refused(String);
+
+impl From<StoreError> for Refused {
+    fn from(e: StoreError) -> Self {
+        Refused(e.to_string())
+    }
+}
+
 async fn complete(ctx: &Ctx<'_>, agent: &Agent, m: Mission) -> Result<Value, String> {
     let me = ctx.session.char_id.unwrap_or(0);
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| e.to_string())?;
-    let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| e.to_string())?;
-    match m.kind {
-        KIND_COURIER => {
-            if ctx.session.station_id != Some(m.destination) {
-                let (station, _) = station_names(ctx.db, m.destination).await;
-                return Err(format!("The cargo has to reach {} first.", html(&station)));
-            }
-            let item = match m.cargo_id {
-                Some(id) => txn.item(id).await.map_err(|e| e.to_string())?,
-                None => None,
-            };
-            let delivered = match &item {
-                Some(i) if i.location_id == m.destination && i.owner_id == me => true,
-                Some(i) if Some(i.location_id) == ctx.session.ship_id => true,
-                _ => false,
-            };
-            if !delivered || item.as_ref().is_some_and(|i| i.quantity < m.quantity) {
-                return Err("I don't see the cargo there. Bring all of it to the drop-off and talk to me again.".into());
-            }
-            txn.destroy(m.cargo_id.unwrap_or(0)).await.map_err(|e| e.to_string())?;
-        }
-        KIND_MINING | KIND_TRADE => {
-            if ctx.session.station_id != Some(agent.station) {
-                return Err(format!("Bring them to me at {}.", html(&agent.station_name)));
-            }
-            let mut left = m.quantity;
-            let sources = [(agent.station, FLAG_HANGAR), (ctx.session.ship_id.unwrap_or(0), FLAG_CARGO)];
-            let mut stacks = Vec::new();
-            for (location, flag) in sources {
-                let sql = r#"SELECT "itemID", "quantity" FROM entity
-                              WHERE "locationID" = $1 AND "ownerID" = $2 AND "flag" = $3 AND "typeID" = $4 AND "singleton" = 0
-                              ORDER BY "itemID" FOR UPDATE"#;
-                let rows = txn
-                    .tx()
-                    .query(sql, &[&(location as i32), &(me as i32), &(flag as i32), &(m.type_id as i32)])
-                    .await
-                    .map_err(|e| e.to_string())?;
-                stacks.extend(rows.iter().map(|r| (int(r, 0).unwrap_or(0), int(r, 1).unwrap_or(0))));
-            }
-            if stacks.iter().map(|(_, q)| q).sum::<i64>() < m.quantity {
-                return Err(format!("You don't have {} unit(s) of {} here yet.", m.quantity, html(&type_name(ctx.db, m.type_id).await)));
-            }
-            for (id, q) in stacks {
-                if left == 0 {
-                    break;
-                }
-                let take = q.min(left);
-                txn.set_quantity(id, q - take).await.map_err(|e| e.to_string())?;
-                left -= take;
-            }
-        }
-        _ if m.state != CLEARED => return Err("Those pirates are still out there.".into()),
-        _ => {}
-    }
-
     let now = crate::bulkdata::filetime_now();
     let in_time = m.accepted_at.is_some_and(|a| now - a <= m.bonus_seconds * SECOND);
-    let reason = format!("Mission: {}", m.name);
-    let mut balance = 0.0;
-    for (amount, ref_type) in [(m.reward, REF_AGENT_MISSION_REWARD), (if in_time { m.bonus } else { 0.0 }, REF_AGENT_MISSION_TIME_BONUS)] {
-        if amount <= 0.0 {
-            continue;
-        }
-        let entry = Entry { ref_type, payer: agent.id, payee: me, arg_id1: "", reason: &reason };
-        balance = match wallet::post(txn.tx(), me, amount, &entry).await {
-            Ok(b) => b,
-            Err(Transfer::Db(e)) => return Err(format!("The reward could not be paid: {e}")),
-            Err(_) => return Err("Your wallet could not be found.".into()),
-        };
-    }
     let earned = mission_lp(agent);
-    if earned > 0 {
-        crate::svc::lp::add_lp(txn.tx(), me as i32, agent.corp as i32, earned)
-            .await
-            .map_err(|e| format!("The loyalty points could not be paid: {e}"))?;
-    }
-    let done = r#"UPDATE "agtCharMissions" SET "state" = $2, "closedAt" = $3 WHERE "missionID" = $1"#;
-    txn.tx().execute(done, &[&(m.id as i32), &COMPLETED, &now]).await.map_err(|e| e.to_string())?;
-    let events = txn.commit().await.map_err(|e| e.to_string())?;
+    let (balance, events) = ctx.store.write(|tx| complete_in(tx, ctx, agent, &m, now, in_time, earned)).map_err(|r| r.0)?;
     crate::items::notify(ctx.world, ctx.client_id, events);
     let gain = 0.01 * (1.0 + agent.level as f64);
-    modify_standing(ctx.db, ctx.world, me, agent.id, gain).await;
-    modify_standing(ctx.db, ctx.world, me, agent.corp, gain / 2.0).await;
+    modify_standing(ctx.store, ctx.world, me, agent.id, gain);
+    modify_standing(ctx.store, ctx.world, me, agent.corp, gain / 2.0);
     close_site(ctx.world, m.id);
     {
         let w = ctx.world.lock();
@@ -573,18 +560,107 @@ async fn complete(ctx: &Ctx<'_>, agent: &Agent, m: Mission) -> Result<Value, Str
     ))
 }
 
+/// Completing, in one transaction: what the mission asked for taken, the
+/// reward and loyalty points paid, the mission closed. The wallet's balance
+/// and the item events.
+fn complete_in(tx: &mut Tx<'_>, ctx: &Ctx<'_>, agent: &Agent, m: &Mission, now: i64, in_time: bool, earned: i64) -> Result<(f64, Vec<Value>), Refused> {
+    let me = ctx.session.char_id.unwrap_or(0);
+    let mut txn = ItemTxn::new(tx);
+    match m.kind {
+        KIND_COURIER => {
+            if ctx.session.station_id != Some(m.destination) {
+                let (station, _) = station_names(txn.db(), m.destination);
+                return Err(Refused(format!("The cargo has to reach {} first.", html(&station))));
+            }
+            let item = match m.cargo_id {
+                Some(id) => txn.item(id)?,
+                None => None,
+            };
+            let delivered = match &item {
+                Some(i) if i.location_id == m.destination && i.owner_id == me => true,
+                Some(i) if Some(i.location_id) == ctx.session.ship_id => true,
+                _ => false,
+            };
+            if !delivered || item.as_ref().is_some_and(|i| i.quantity < m.quantity) {
+                return Err(Refused("I don't see the cargo there. Bring all of it to the drop-off and talk to me again.".into()));
+            }
+            txn.destroy(m.cargo_id.unwrap_or(0))?;
+        }
+        KIND_MINING | KIND_TRADE => {
+            if ctx.session.station_id != Some(agent.station) {
+                return Err(Refused(format!("Bring them to me at {}.", html(&agent.station_name))));
+            }
+            let mut left = m.quantity;
+            let sources = [(agent.station, FLAG_HANGAR), (ctx.session.ship_id.unwrap_or(0), FLAG_CARGO)];
+            let mut stacks = Vec::new();
+            for (location, flag) in sources {
+                let mut here: Vec<(i64, i64)> = txn
+                    .db()
+                    .table("entity")
+                    .find(&["locationID", "flag", "ownerID"], &[V::Int(location), V::Int(flag), V::Int(me)])
+                    .filter(|r| r.int("typeID") == Some(m.type_id) && r.int("singleton") == Some(0))
+                    .map(|r| (r.int("itemID").unwrap_or(0), r.int("quantity").unwrap_or(0)))
+                    .collect();
+                here.sort_by_key(|(id, _)| *id);
+                stacks.extend(here);
+            }
+            if stacks.iter().map(|(_, q)| q).sum::<i64>() < m.quantity {
+                return Err(Refused(format!("You don't have {} unit(s) of {} here yet.", m.quantity, html(&type_name(m.type_id)))));
+            }
+            for (id, q) in stacks {
+                if left == 0 {
+                    break;
+                }
+                let take = q.min(left);
+                txn.set_quantity(id, q - take)?;
+                left -= take;
+            }
+        }
+        _ if m.state != CLEARED => return Err(Refused("Those pirates are still out there.".into())),
+        _ => {}
+    }
+
+    let reason = format!("Mission: {}", m.name);
+    let mut balance = 0.0;
+    for (amount, ref_type) in [(m.reward, REF_AGENT_MISSION_REWARD), (if in_time { m.bonus } else { 0.0 }, REF_AGENT_MISSION_TIME_BONUS)] {
+        if amount <= 0.0 {
+            continue;
+        }
+        let entry = Entry { ref_type, payer: agent.id, payee: me, arg_id1: "", reason: &reason };
+        balance = match wallet::post(txn.tx(), me, amount, &entry) {
+            Ok(b) => b,
+            Err(Transfer::Db(e)) => return Err(Refused(format!("The reward could not be paid: {e}"))),
+            Err(_) => return Err(Refused("Your wallet could not be found.".into())),
+        };
+    }
+    if earned > 0 {
+        crate::svc::lp::add_lp(txn.tx(), me as i32, agent.corp as i32, earned)
+            .map_err(|e| Refused(format!("The loyalty points could not be paid: {e}")))?;
+    }
+    if let Some(row) = txn.db().table("agtCharMissions").get_id(m.id).map(|r| r.id) {
+        txn.tx().update("agtCharMissions", row, &[("state", V::Int(COMPLETED.into())), ("closedAt", V::Int(now))])?;
+    }
+    Ok((balance, txn.events()))
+}
+
 async fn quit(ctx: &Ctx<'_>, agent: &Agent, m: &Mission) -> Result<Value, String> {
     close(ctx, agent, m, QUIT, "quit").await?;
     let me = ctx.session.char_id.unwrap_or(0);
-    modify_standing(ctx.db, ctx.world, me, agent.id, -0.02 * agent.level as f64).await;
+    modify_standing(ctx.store, ctx.world, me, agent.id, -0.02 * agent.level as f64);
     close_site(ctx.world, m.id);
     Ok(said("That's disappointing. I'll remember this.".into(), Vec::new()))
 }
 
 async fn close(ctx: &Ctx<'_>, agent: &Agent, m: &Mission, state: i16, what: &'static str) -> Result<(), String> {
     let me = ctx.session.char_id.unwrap_or(0);
-    let sql = r#"UPDATE "agtCharMissions" SET "state" = $2, "closedAt" = $3 WHERE "missionID" = $1"#;
-    ctx.execute(sql, &[&(m.id as i32), &state, &crate::bulkdata::filetime_now()]).await;
+    let now = crate::bulkdata::filetime_now();
+    let saved = ctx.store.write(|tx| match tx.table("agtCharMissions").get_id(m.id).map(|r| r.id) {
+        Some(row) => tx.update("agtCharMissions", row, &[("state", V::Int(state.into())), ("closedAt", V::Int(now))]),
+        None => Ok(()),
+    });
+    if let Err(e) = saved {
+        error!("closing mission {}: {}", m.id, crate::logging::chain(&e));
+    }
     info!("{me} {what} mission {} of agent {}", m.id, agent.id);
     notify_change(ctx.world, me, what, agent.id);
     Ok(())
@@ -601,11 +677,20 @@ fn close_site(world: &World, mission_id: i64) {
 }
 
 /// Heartbeat job: an encounter's last pirate is dead.
-pub async fn site_cleared(world: &World, db: &tokio_postgres::Client, mission_id: i64, char_id: i64) {
-    let sql = r#"UPDATE "agtCharMissions" SET "state" = $3 WHERE "missionID" = $1 AND "characterID" = $2 AND "state" = $4 RETURNING "agentID""#;
-    match db.query_opt(sql, &[&(mission_id as i32), &(char_id as i32), &CLEARED, &ACCEPTED]).await {
-        Ok(Some(r)) => {
-            let agent = int(&r, 0).unwrap_or(0);
+pub async fn site_cleared(world: &World, store: &Store, mission_id: i64, char_id: i64) {
+    let cleared = store.write(|tx| {
+        let accepted = tx
+            .table("agtCharMissions")
+            .get_id(mission_id)
+            .filter(|r| r.int("characterID") == Some(char_id) && r.int("state") == Some(ACCEPTED.into()))
+            .map(|r| (r.id, r.int("agentID")));
+        let Some((row, agent)) = accepted else { return Ok(None) };
+        tx.update("agtCharMissions", row, &[("state", V::Int(CLEARED.into()))])?;
+        Ok::<_, StoreError>(Some(agent))
+    });
+    match cleared {
+        Ok(Some(agent)) => {
+            let agent = agent.unwrap_or(0);
             info!("mission {mission_id} of {char_id}: the site is cleared");
             notify_change(world, char_id, "objective", agent);
             let w = world.lock();
@@ -620,10 +705,14 @@ pub async fn site_cleared(world: &World, db: &tokio_postgres::Client, mission_id
 // ---- standings -------------------------------------------------------------------------------
 
 /// The pilot's standing from the agent, its corporation and its faction.
-async fn standings_toward(db: &impl GenericClient, me: i64, agent: &Agent) -> Vec<f64> {
-    let ids: Vec<i32> = [Some(agent.id), Some(agent.corp), agent.faction].into_iter().flatten().map(|i| i as i32).collect();
-    let sql = r#"SELECT "standing" FROM "chrNPCStandings" WHERE "characterID" = $1 AND "fromID" = ANY($2)"#;
-    let mut found: Vec<f64> = db.query(sql, &[&(me as i32), &ids]).await.unwrap_or_default().iter().filter_map(|r| float(r, 0)).collect();
+fn standings_toward(db: &Db, me: i64, agent: &Agent) -> Vec<f64> {
+    let ids: Vec<i64> = [Some(agent.id), Some(agent.corp), agent.faction].into_iter().flatten().collect();
+    let mut found: Vec<f64> = db
+        .table("chrNPCStandings")
+        .find(&["characterID"], &[V::Int(me)])
+        .filter(|r| r.int("fromID").is_some_and(|from| ids.contains(&from)))
+        .filter_map(|r| r.float("standing"))
+        .collect();
     found.resize(ids.len(), 0.0);
     found
 }
@@ -637,16 +726,21 @@ pub fn modified(standing: f64, m: f64) -> f64 {
     (new * 10.0).clamp(-10.0, 10.0)
 }
 
-async fn modify_standing(db: &impl GenericClient, world: &World, me: i64, from: i64, m: f64) {
-    let sql = r#"SELECT "standing" FROM "chrNPCStandings" WHERE "characterID" = $1 AND "fromID" = $2"#;
-    let old = db.query_opt(sql, &[&(me as i32), &(from as i32)]).await.ok().flatten().and_then(|r| float(&r, 0)).unwrap_or(0.0);
-    let new = modified(old, m);
-    let save = r#"INSERT INTO "chrNPCStandings" ("characterID", "fromID", "standing") VALUES ($1, $2, $3)
-                  ON CONFLICT ("characterID", "fromID") DO UPDATE SET "standing" = $3"#;
-    if let Err(e) = db.execute(save, &[&(me as i32), &(from as i32), &new]).await {
-        error!("saving the standing of {from} toward {me}: {}", crate::logging::chain(&e));
-        return;
-    }
+fn modify_standing(store: &Store, world: &World, me: i64, from: i64, m: f64) {
+    let saved = store.write(|tx| {
+        let old = tx.table("chrNPCStandings").get(&[V::Int(me), V::Int(from)]).and_then(|r| r.float("standing")).unwrap_or(0.0);
+        let new = modified(old, m);
+        let sets = [("characterID", V::Int(me)), ("fromID", V::Int(from)), ("standing", V::Float(new))];
+        tx.upsert("chrNPCStandings", &["characterID", "fromID"], &sets, &[("standing", V::Float(new))])?;
+        Ok::<_, StoreError>(new)
+    });
+    let new = match saved {
+        Ok(new) => new,
+        Err(e) => {
+            error!("saving the standing of {from} toward {me}: {}", crate::logging::chain(&e));
+            return;
+        }
+    };
     let w = world.lock();
     w.notify(&w.clients_of(me), "OnStandingSet", Value::Tuple(vec![Value::Int(from), Value::Int(me), Value::Double(new)]));
 }
@@ -664,9 +758,9 @@ fn notify_change(world: &World, char_id: i64, what: &str, agent_id: i64) {
 pub async fn journal(ctx: &Ctx<'_>, agent_id: Option<i64>) -> Value {
     let me = ctx.session.char_id.unwrap_or(0);
     let mut missions = Vec::new();
-    for m in open_missions(ctx.db, me, agent_id).await {
+    for m in open_missions_of(ctx.store, me, agent_id) {
         let state = if m.state == OFFERED { 0 } else { 2 };
-        let bookmarks = bookmarks(ctx.db, &m).await;
+        let bookmarks = ctx.store.read(|db| bookmarks(db, &m));
         missions.push(Value::Tuple(vec![
             Value::Int(state),
             Value::Int(0),
@@ -682,7 +776,7 @@ pub async fn journal(ctx: &Ctx<'_>, agent_id: Option<i64>) -> Value {
 
 /// The places a mission sends the pilot, as the address book merges them
 /// into its own (addressbook.py GetMapBookmarks).
-async fn bookmarks(db: &impl GenericClient, m: &Mission) -> Vec<Value> {
+fn bookmarks(db: &Db, m: &Mission) -> Vec<Value> {
     let bookmark = |location_type: &str, hint: String, item: i64, type_id: i64, system: i64, at: Vec3| {
         key_val(vec![
             ("agentID", Value::Int(m.agent_id)),
@@ -699,15 +793,14 @@ async fn bookmarks(db: &impl GenericClient, m: &Mission) -> Vec<Value> {
     };
     match (m.kind, m.site) {
         (KIND_ENCOUNTER, Some(at)) => {
-            let name = system_name(db, m.destination).await;
+            let name = system_name(db, m.destination);
             vec![bookmark("dungeon", format!("Objective ({name})"), m.destination, TYPE_SOLAR_SYSTEM, m.destination, at)]
         }
         (KIND_COURIER, _) => {
-            let sql = r#"SELECT "stationTypeID", "solarSystemID", "x", "y", "z", "stationName" FROM "staStations" WHERE "stationID" = $1"#;
-            let Some(r) = db.query_opt(sql, &[&(m.destination as i32)]).await.ok().flatten() else { return Vec::new() };
-            let at = Vec3::new(float(&r, 2).unwrap_or(0.0), float(&r, 3).unwrap_or(0.0), float(&r, 4).unwrap_or(0.0));
-            let hint = format!("Drop-off ({})", text(&r, 5).unwrap_or_default());
-            vec![bookmark("dropoff", hint, m.destination, int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0), at)]
+            let Some(r) = db.table("staStations").get_id(m.destination) else { return Vec::new() };
+            let at = Vec3::new(r.float("x").unwrap_or(0.0), r.float("y").unwrap_or(0.0), r.float("z").unwrap_or(0.0));
+            let hint = format!("Drop-off ({})", r.text("stationName").unwrap_or_default());
+            vec![bookmark("dropoff", hint, m.destination, r.int("stationTypeID").unwrap_or(0), r.int("solarSystemID").unwrap_or(0), at)]
         }
         _ => Vec::new(),
     }
@@ -716,8 +809,8 @@ async fn bookmarks(db: &impl GenericClient, m: &Mission) -> Vec<Value> {
 /// GetMissionJournalInfo(): the mission's page, or None without one.
 pub async fn mission_page(ctx: &Ctx<'_>, agent_id: i64) -> Value {
     let me = ctx.session.char_id.unwrap_or(0);
-    let Some(agent) = agent(ctx.db, agent_id).await else { return Value::None };
-    let Some(m) = open_missions(ctx.db, me, Some(agent_id)).await.into_iter().next() else { return Value::None };
+    let Some(agent) = ctx.store.read(|db| agent(db, agent_id)) else { return Value::None };
+    let Some(m) = open_missions_of(ctx.store, me, Some(agent_id)).into_iter().next() else { return Value::None };
     let state = match m.state {
         OFFERED => "Offered",
         CLEARED => "Objective complete; report to the agent",
@@ -729,7 +822,7 @@ pub async fn mission_page(ctx: &Ctx<'_>, agent_id: i64) -> Value {
         html(&agent.name),
         kind_name(m.kind),
         state,
-        objective(ctx.db, &agent, &m).await,
+        ctx.store.read(|db| objective(db, &agent, &m)),
         rewards(&agent, &m)
     );
     Value::text(page)
@@ -743,8 +836,13 @@ pub async fn mission_page(ctx: &Ctx<'_>, agent_id: i64) -> Value {
 pub async fn go_to(ctx: &Ctx<'_>, number: i64, range: f64, approach: bool) -> Outcome {
     let me = ctx.session.char_id.unwrap_or(0);
     let Some(system) = ctx.session.solar_system_id else { return Outcome::custom("You have to be in space for that.") };
-    let sql = format!(r#"{MISSION_SELECT} WHERE "missionID" = $1 AND "characterID" = $2 AND "state" IN (2, 3)"#);
-    let Some(m) = ctx.query_one(sql.as_str(), &[&(number as i32), &(me as i32)]).await.map(|r| mission_of(&r)) else {
+    let mission = ctx.store.read(|db| {
+        db.table("agtCharMissions")
+            .get_id(number)
+            .filter(|r| r.int("characterID") == Some(me) && matches!(r.int("state"), Some(2 | 3)))
+            .map(|r| mission_of(&r))
+    });
+    let Some(m) = mission else {
         return Outcome::custom("That mission is not yours, or is over.");
     };
     let (at, radius) = match (m.kind, m.site) {
@@ -758,12 +856,17 @@ pub async fn go_to(ctx: &Ctx<'_>, number: i64, range: f64, approach: bool) -> Ou
             (at, 0.0)
         }
         _ => {
-            let sql = r#"SELECT "x", "y", "z", COALESCE("radius", 0), "solarSystemID" FROM "mapDenormalize" WHERE "itemID" = $1"#;
-            let Some(r) = ctx.query_one(sql, &[&(m.destination as i32)]).await else { return Outcome::custom("That station is gone.") };
-            if int(&r, 4) != Some(system) {
+            let place = ctx.store.read(|db| {
+                db.table("mapDenormalize").get_id(m.destination).map(|r| {
+                    let at = Vec3::new(r.float("x").unwrap_or(0.0), r.float("y").unwrap_or(0.0), r.float("z").unwrap_or(0.0));
+                    (at, r.float("radius").unwrap_or(0.0), r.int("solarSystemID"))
+                })
+            });
+            let Some((at, radius, in_system)) = place else { return Outcome::custom("That station is gone.") };
+            if in_system != Some(system) {
                 return Outcome::custom("That location is in another solar system. Set your destination there first.");
             }
-            (Vec3::new(float(&r, 0).unwrap_or(0.0), float(&r, 1).unwrap_or(0.0), float(&r, 2).unwrap_or(0.0)), float(&r, 3).unwrap_or(0.0))
+            (at, radius)
         }
     };
     if approach {
@@ -774,7 +877,7 @@ pub async fn go_to(ctx: &Ctx<'_>, number: i64, range: f64, approach: bool) -> Ou
 }
 
 async fn open_site(ctx: &Ctx<'_>, m: &Mission, system: i64, at: Vec3) {
-    let level = agent(ctx.db, m.agent_id).await.map_or(1, |a| a.level);
+    let level = ctx.store.read(|db| agent(db, m.agent_id)).map_or(1, |a| a.level);
     let mut w = ctx.world.lock();
     let Some(park) = w.parks.get_mut(&system) else { return };
     if park.sites.values().any(|s| s.mission_id == m.id) {
@@ -794,28 +897,29 @@ async fn open_site(ctx: &Ctx<'_>, m: &Mission, system: i64, at: Vec3) {
 
 // ---- names and amounts -----------------------------------------------------------------------
 
-async fn type_name(db: &impl GenericClient, type_id: i64) -> String {
-    let sql = r#"SELECT "typeName" FROM "invTypes" WHERE "typeID" = $1"#;
-    db.query_opt(sql, &[&(type_id as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_default()
+fn static_type(type_id: i64) -> Option<crate::sde::Row<'static>> {
+    crate::sde::table("invTypes").get("typeID", (type_id as i32).into())
 }
 
-async fn type_volume(db: &impl GenericClient, type_id: i64) -> f64 {
-    let sql = r#"SELECT "volume" FROM "invTypes" WHERE "typeID" = $1"#;
-    db.query_opt(sql, &[&(type_id as i32)]).await.ok().flatten().and_then(|r| float(&r, 0)).unwrap_or(1.0)
+fn type_name(type_id: i64) -> String {
+    static_type(type_id).and_then(|r| r.text("typeName")).unwrap_or_default().to_string()
 }
 
-async fn system_name(db: &impl GenericClient, system: i64) -> String {
-    let sql = r#"SELECT "solarSystemName" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#;
-    db.query_opt(sql, &[&(system as i32)]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_default()
+fn type_volume(type_id: i64) -> f64 {
+    static_type(type_id).and_then(|r| r.float("volume")).unwrap_or(1.0)
+}
+
+fn system_name(db: &Db, system: i64) -> String {
+    db.table("mapSolarSystems").get_id(system).and_then(|r| r.text("solarSystemName")).unwrap_or_default().to_string()
 }
 
 /// A station's name and its system's.
-async fn station_names(db: &impl GenericClient, station: i64) -> (String, String) {
-    let sql = r#"SELECT s."stationName", m."solarSystemName" FROM "staStations" s
-                   JOIN "mapSolarSystems" m ON m."solarSystemID" = s."solarSystemID" WHERE s."stationID" = $1"#;
-    match db.query_opt(sql, &[&(station as i32)]).await.ok().flatten() {
-        Some(r) => (text(&r, 0).unwrap_or_default(), text(&r, 1).unwrap_or_default()),
-        None => (String::new(), String::new()),
+fn station_names(db: &Db, station: i64) -> (String, String) {
+    let s = db.table("staStations").get_id(station);
+    let m = s.and_then(|s| db.table("mapSolarSystems").get_id(s.int("solarSystemID")?));
+    match (s, m) {
+        (Some(s), Some(m)) => (s.text("stationName").unwrap_or_default().to_string(), m.text("solarSystemName").unwrap_or_default().to_string()),
+        _ => (String::new(), String::new()),
     }
 }
 

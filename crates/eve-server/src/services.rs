@@ -7,14 +7,14 @@ use std::pin::Pin;
 
 use eve_marshal::{StringTable, Value};
 use eve_proto::{MachoPacket, ProtoError};
-use tokio_postgres::types::ToSql;
-use tokio_postgres::Row;
-use tracing::error;
+use std::sync::Arc;
+
 
 use crate::bulkdata::BulkData;
 use crate::session::Session;
 use crate::world::World;
-use crate::svc::{bound, rows};
+use crate::store::Store;
+use crate::svc::bound;
 
 pub struct Call {
     /// The service name, or for a bound object its full ID (`N=1:invbroker#60000004`).
@@ -123,49 +123,13 @@ pub struct Ctx<'a> {
     pub bulk: &'a BulkData,
     pub dogma: &'a crate::dogma::Catalog,
     pub session: &'a Session,
-    pub db: &'a tokio_postgres::Client,
-    pub db_url: &'a str,
+    /// The live data (`store.read` / `store.write`); an `Arc` so a task that
+    /// outlives the call can keep it.
+    pub store: &'a Arc<Store>,
     pub node_id: i64,
     pub world: &'a World,
     /// The caller's connection, to queue notifications for it.
     pub client_id: i64,
-}
-
-type Params<'p> = &'p [&'p (dyn ToSql + Sync)];
-
-impl Ctx<'_> {
-    /// Rows of a query. A database error is logged (the call span says which call)
-    /// and yields no rows, so the client gets an empty answer rather than an error.
-    pub async fn query(&self, sql: &str, params: Params<'_>) -> Vec<Row> {
-        match self.db.query(sql, params).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!("query failed: {}", crate::logging::chain(&e));
-                Vec::new()
-            }
-        }
-    }
-
-    /// The first row of a query, if any. Errors as for [`Ctx::query`].
-    pub async fn query_one(&self, sql: &str, params: Params<'_>) -> Option<Row> {
-        self.query(sql, params).await.into_iter().next()
-    }
-
-    /// A query whose columns are `header`, as a `util.Rowset`.
-    pub async fn rowset(&self, header: &[&str], sql: &str, params: Params<'_>) -> Value {
-        rows::rowset(header, rows::lines(&self.query(sql, params).await))
-    }
-
-    /// Runs a statement; false (and logged) if it failed.
-    pub async fn execute(&self, sql: &str, params: Params<'_>) -> bool {
-        match self.db.execute(sql, params).await {
-            Ok(_) => true,
-            Err(e) => {
-                error!("statement failed: {}", crate::logging::chain(&e));
-                false
-            }
-        }
-    }
 }
 
 pub type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Option<Outcome>> + Send + 'a>>;

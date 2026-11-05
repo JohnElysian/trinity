@@ -3,48 +3,40 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
-use tokio_postgres::GenericClient;
-use tracing::error;
-
-use crate::svc::rows::int;
+use crate::sde;
+use crate::store::Db;
 
 static GATES: OnceLock<HashMap<i64, Vec<i64>>> = OnceLock::new();
 
 /// Each system's neighbours across a gate.
 pub type Graph = HashMap<i64, Vec<i64>>;
 
-pub async fn graph(db: &impl GenericClient) -> Option<&'static Graph> {
-    gates(db).await
+/// The gates are static data now, so the live data these were once read
+/// from goes unused; the callers still pass it.
+pub fn graph(_db: &Db) -> Option<&'static Graph> {
+    Some(gates())
 }
 
-async fn gates(db: &impl GenericClient) -> Option<&'static HashMap<i64, Vec<i64>>> {
-    if let Some(g) = GATES.get() {
-        return Some(g);
-    }
-    let sql = r#"SELECT "fromSolarSystemID", "toSolarSystemID" FROM "mapSolarSystemJumps""#;
-    let rows = match db.query(sql, &[]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("reading the star gates: {}", crate::logging::chain(&e));
-            return None;
+/// Each system's neighbours, in the order the data lists the jumps.
+fn gates() -> &'static HashMap<i64, Vec<i64>> {
+    GATES.get_or_init(|| {
+        let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
+        for r in sde::table("mapSolarSystemJumps").rows() {
+            map.entry(r.int("fromSolarSystemID").unwrap_or(0)).or_default().push(r.int("toSolarSystemID").unwrap_or(0));
         }
-    };
-    let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
-    for r in rows {
-        map.entry(int(&r, 0).unwrap_or(0)).or_default().push(int(&r, 1).unwrap_or(0));
-    }
-    Some(GATES.get_or_init(|| map))
+        map
+    })
 }
 
 /// The jumps from one system to another, if no more than `limit`.
-pub async fn jumps(db: &impl GenericClient, from: i64, to: i64, limit: i64) -> Option<i64> {
-    hops(gates(db).await?, from, to, limit)
+pub fn jumps(_db: &Db, from: i64, to: i64, limit: i64) -> Option<i64> {
+    hops(gates(), from, to, limit)
 }
 
 /// Every system within `limit` jumps of `from` (itself included), with its
 /// distance, nearest first.
-pub async fn within(db: &impl GenericClient, from: i64, limit: i64) -> Vec<(i64, i64)> {
-    gates(db).await.map(|g| reach(g, from, limit)).unwrap_or_default()
+pub fn within(_db: &Db, from: i64, limit: i64) -> Vec<(i64, i64)> {
+    reach(gates(), from, limit)
 }
 
 /// The systems to jump through from `from` to `to`, `to` last and `from`

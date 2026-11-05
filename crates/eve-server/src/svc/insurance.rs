@@ -6,7 +6,8 @@ use eve_marshal::Value;
 use crate::items::ItemTxn;
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::{CORP_ROLE_ACCOUNTANT, CORP_ROLE_DIRECTOR};
-use crate::svc::rows::{line, row, rowset};
+use crate::store::{Db, StoreError, Value as V};
+use crate::svc::rows::{row, rowset};
 use crate::svc::wallet::{self, Entry, Transfer};
 
 const CORP_ROLE_JUNIOR_ACCOUNTANT: i64 = 4_503_599_627_370_496;
@@ -22,8 +23,6 @@ const HEADER: &[&str] = &[
     "payout",
     "isCorp",
 ];
-const SELECT: &str = r#"SELECT "contractID","shipID","ownerID","startDate","endDate","fraction",
-                               "amount","payout","isCorp" FROM "insuranceContracts""#;
 
 pub async fn insurance_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
@@ -47,27 +46,29 @@ pub async fn insurance_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             let Some(owner) = owner else {
                 return Some(Outcome::Value(rowset(HEADER, vec![])));
             };
-            let sql = format!(
-                r#"{SELECT} WHERE "ownerID" = $1 AND "endDate" > $2 ORDER BY "contractID""#
-            );
-            ctx.rowset(
-                HEADER,
-                &sql,
-                &[&(owner as i32), &crate::bulkdata::filetime_now()],
-            )
-            .await
+            let now = crate::bulkdata::filetime_now();
+            let lines = ctx.store.read(|db| {
+                let mut current: Vec<_> = db
+                    .table("insuranceContracts")
+                    .find(&["ownerID"], &[V::Int(owner)])
+                    .filter(|r| r.int("endDate").is_some_and(|end| end > now))
+                    .collect();
+                current.sort_by_key(|r| r.int("contractID"));
+                current.iter().map(|r| Value::List(r.line(HEADER))).collect()
+            });
+            rowset(HEADER, lines)
         }
         // infosvc reads contract.ownerID/.fraction/.startDate/.endDate, or None.
         "GetContractForShip" => {
-            let sql = format!(r#"{SELECT} WHERE "shipID" = $1 AND "endDate" > $2"#);
-            match ctx
-                .query_one(
-                    &sql,
-                    &[&(call.arg_id(0) as i32), &crate::bulkdata::filetime_now()],
-                )
-                .await
-            {
-                Some(r) => row(HEADER, line(&r)),
+            let now = crate::bulkdata::filetime_now();
+            let line = ctx.store.read(|db| {
+                db.table("insuranceContracts")
+                    .find(&["shipID"], &[V::Int(call.arg_id(0))])
+                    .find(|r| r.int("endDate").is_some_and(|end| end > now))
+                    .map(|r| r.line(HEADER))
+            });
+            match line {
+                Some(line) => row(HEADER, line),
                 None => Value::None,
             }
         }
@@ -132,6 +133,20 @@ async fn insure(
     }
 }
 
+/// Why a purchase or a cancellation stopped, as the client is told it; a
+/// store error is logged and told as the insurance not being updated.
+struct Refusal(Outcome);
+
+impl From<StoreError> for Refusal {
+    fn from(error: StoreError) -> Self {
+        Refusal(db_failed(error))
+    }
+}
+
+fn refused(reason: &str) -> Refusal {
+    Refusal(insure_failed(reason))
+}
+
 async fn purchase(
     ctx: &Ctx<'_>,
     ship_id: i64,
@@ -155,107 +170,91 @@ async fn purchase(
     } else {
         char_id
     };
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(db_failed)?;
-    let mut tx = ItemTxn::begin(&mut client).await.map_err(db_failed)?;
-    let ship = tx
-        .item(ship_id)
-        .await
-        .map_err(db_failed)?
-        .ok_or_else(|| insure_failed("That ship no longer exists."))?;
-    if ship.category_id != 6 || !ship.singleton {
-        return Err(insure_failed("That is not an assembled ship."));
-    }
-    if ship.owner_id != owner
-        || !at_station(&tx, ship.location_id, ship.flag, owner, station, is_corp).await?
-    {
-        return Err(insure_failed(
-            "The ship must be yours and in this station's hangar or corporation office.",
-        ));
-    }
-    let base_price: f64 = tx
-        .tx()
-        .query_one(
-            r#"SELECT COALESCE("basePrice",0.0) FROM "invTypes" WHERE "typeID"=$1"#,
-            &[&(ship.type_id as i32)],
-        )
-        .await
-        .map_err(db_failed)?
-        .get(0);
-    let (premium, fraction) = quote(amount, base_price)
-        .ok_or_else(|| insure_failed("That is not a premium on offer."))?;
-    let now = crate::bulkdata::filetime_now();
-    if let Some(old) = tx
-        .tx()
-        .query_opt(
-            r#"SELECT "ownerID","endDate" FROM "insuranceContracts" WHERE "shipID"=$1 FOR UPDATE"#,
-            &[&(ship_id as i32)],
-        )
-        .await
-        .map_err(db_failed)?
-    {
-        let previous = old.get::<_, i32>(0) as i64;
-        if old.get::<_, i64>(1) > now {
-            if previous == owner {
-                return Err(Outcome::UserError {
-                    msg: "InsureShipFailedMultipleContracts".into(),
-                    args: vec![],
-                });
+    let (payout, fraction, premium) = ctx
+        .store
+        .write(|tx| {
+            let mut tx = ItemTxn::new(tx);
+            let ship = tx
+                .item(ship_id)?
+                .ok_or_else(|| refused("That ship no longer exists."))?;
+            if ship.category_id != 6 || !ship.singleton {
+                return Err(refused("That is not an assembled ship."));
             }
-            if !void_old {
-                return Err(Outcome::UserError {
-                    msg: "InsureShipFailedSingleContract".into(),
-                    args: vec![(
-                        "ownerName".into(),
-                        Value::Tuple(vec![Value::Int(2), Value::Int(previous)]),
-                    )],
-                });
+            if ship.owner_id != owner
+                || !at_station(tx.db(), ship.location_id, ship.flag, owner, station, is_corp)
+            {
+                return Err(refused(
+                    "The ship must be yours and in this station's hangar or corporation office.",
+                ));
             }
-        }
-        tx.tx()
-            .execute(
-                r#"DELETE FROM "insuranceContracts" WHERE "shipID"=$1"#,
-                &[&(ship_id as i32)],
-            )
-            .await
-            .map_err(db_failed)?;
-    }
-    let arg = ship_id.to_string();
-    let entry = Entry {
-        payer: owner,
-        payee: 0,
-        ref_type: REF_INSURANCE,
-        arg_id1: &arg,
-        reason: "",
-    };
-    wallet::post(tx.tx(), owner, -premium, &entry)
-        .await
-        .map_err(|e| match e {
-            Transfer::NotEnough { need, have } => Outcome::not_enough_money(need, have),
-            Transfer::NoSuchOwner => insure_failed("There is no wallet to pay from."),
-            Transfer::Db(e) => db_failed(e),
-        })?;
-    let end = now + CONTRACT_WEEKS * 7 * 24 * 3_600 * 10_000_000;
-    let sql = r#"INSERT INTO "insuranceContracts"
-                    ("contractID","shipID","ownerID","startDate","endDate","fraction","amount","payout","isCorp")
-                 VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, $5, $6, $7, $8)"#;
-    let payout = fraction * base_price;
-    tx.tx()
-        .execute(
-            sql,
-            &[
-                &(ship_id as i32),
-                &(owner as i32),
-                &now,
-                &end,
-                &fraction,
-                &premium,
-                &payout,
-                &i16::from(is_corp),
-            ],
-        )
-        .await
-        .map_err(db_failed)?;
-    tx.commit().await.map_err(db_failed)?;
+            // The ship is of category 6, so its type is known.
+            let base_price = crate::sde::table("invTypes")
+                .get("typeID", ship.type_id)
+                .and_then(|t| t.float("basePrice"))
+                .unwrap_or(0.0);
+            let (premium, fraction) = quote(amount, base_price)
+                .ok_or_else(|| refused("That is not a premium on offer."))?;
+            let now = crate::bulkdata::filetime_now();
+            let old = tx
+                .db()
+                .table("insuranceContracts")
+                .find_one(&["shipID"], &[V::Int(ship_id)])
+                .map(|r| (r.id, r.int("ownerID").unwrap_or(0), r.int("endDate").unwrap_or(0)));
+            if let Some((old, previous, end)) = old {
+                if end > now {
+                    if previous == owner {
+                        return Err(Refusal(Outcome::UserError {
+                            msg: "InsureShipFailedMultipleContracts".into(),
+                            args: vec![],
+                        }));
+                    }
+                    if !void_old {
+                        return Err(Refusal(Outcome::UserError {
+                            msg: "InsureShipFailedSingleContract".into(),
+                            args: vec![(
+                                "ownerName".into(),
+                                Value::Tuple(vec![Value::Int(2), Value::Int(previous)]),
+                            )],
+                        }));
+                    }
+                }
+                tx.tx().delete("insuranceContracts", old)?;
+            }
+            let arg = ship_id.to_string();
+            let entry = Entry {
+                payer: owner,
+                payee: 0,
+                ref_type: REF_INSURANCE,
+                arg_id1: &arg,
+                reason: "",
+            };
+            wallet::post(tx.tx(), owner, -premium, &entry).map_err(|e| {
+                Refusal(match e {
+                    Transfer::NotEnough { need, have } => Outcome::not_enough_money(need, have),
+                    Transfer::NoSuchOwner => insure_failed("There is no wallet to pay from."),
+                    Transfer::Db(e) => db_failed(e),
+                })
+            })?;
+            let end = now + CONTRACT_WEEKS * 7 * 24 * 3_600 * 10_000_000;
+            let payout = fraction * base_price;
+            let contract = tx.tx().nextval("dyn_id_seq")?;
+            tx.tx().insert(
+                "insuranceContracts",
+                &[
+                    ("contractID", V::Int(contract)),
+                    ("shipID", V::Int(ship_id)),
+                    ("ownerID", V::Int(owner)),
+                    ("startDate", V::Int(now)),
+                    ("endDate", V::Int(end)),
+                    ("fraction", V::Float(fraction)),
+                    ("amount", V::Float(premium)),
+                    ("payout", V::Float(payout)),
+                    ("isCorp", V::Int(i64::from(is_corp))),
+                ],
+            )?;
+            Ok((payout, fraction, premium))
+        })
+        .map_err(|r: Refusal| r.0)?;
     tracing::info!(
         "ship {ship_id} insured for {payout} ISK ({:.0}%) for {premium} ISK",
         fraction * 100.0
@@ -268,21 +267,23 @@ fn may_manage_corp(ctx: &Ctx<'_>) -> bool {
         && ctx.session.corp_role() & (CORP_ROLE_ACCOUNTANT | CORP_ROLE_DIRECTOR) != 0
 }
 
-async fn at_station(
-    tx: &ItemTxn<'_>,
+fn at_station(
+    db: &Db,
     location: i64,
     flag: i64,
     owner: i64,
     station: i64,
     corp: bool,
-) -> Result<bool, Outcome> {
+) -> bool {
     if location == station {
-        return Ok(if corp { flag == 62 } else { flag == 4 });
+        return if corp { flag == 62 } else { flag == 4 };
     }
     if !corp || super::corphangar::division(flag).is_none() {
-        return Ok(false);
+        return false;
     }
-    Ok(tx.tx().query_opt(r#"SELECT 1 FROM "crpOffices" WHERE "itemID"=$1 AND "corporationID"=$2 AND "stationID"=$3"#,&[&(location as i32),&(owner as i32),&(station as i32)]).await.map_err(db_failed)?.is_some())
+    db.table("crpOffices")
+        .find(&["itemID"], &[V::Int(location)])
+        .any(|r| r.int("corporationID") == Some(owner) && r.int("stationID") == Some(station))
 }
 
 async fn uninsure(ctx: &Ctx<'_>, ship_id: i64) -> Result<(), Outcome> {
@@ -294,49 +295,38 @@ async fn uninsure(ctx: &Ctx<'_>, ship_id: i64) -> Result<(), Outcome> {
     if ship_id <= 0 || ship_id > i32::MAX as i64 {
         return Err(insure_failed("That is not a ship."));
     }
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(db_failed)?;
-    let mut tx = ItemTxn::begin(&mut client).await.map_err(db_failed)?;
-    let ship = tx
-        .item(ship_id)
-        .await
-        .map_err(db_failed)?
-        .ok_or_else(|| insure_failed("That ship no longer exists."))?;
-    let Some(policy) = tx
-        .tx()
-        .query_opt(
-            r#"SELECT "ownerID","isCorp" FROM "insuranceContracts" WHERE "shipID"=$1 FOR UPDATE"#,
-            &[&(ship_id as i32)],
-        )
-        .await
-        .map_err(db_failed)?
-    else {
-        return Ok(());
-    };
-    let owner = policy.get::<_, i32>(0) as i64;
-    let corp = policy.get::<_, i16>(1) != 0;
-    let permitted = if corp {
-        ctx.session.corp_id == Some(owner) && may_manage_corp(ctx)
-    } else {
-        owner == me
-    };
-    if !permitted
-        || ship.owner_id != owner
-        || !at_station(&tx, ship.location_id, ship.flag, owner, station, corp).await?
-    {
-        return Err(insure_failed("You cannot cancel insurance for that ship."));
-    }
-    tx.tx()
-        .execute(
-            r#"DELETE FROM "insuranceContracts" WHERE "shipID"=$1"#,
-            &[&(ship_id as i32)],
-        )
-        .await
-        .map_err(db_failed)?;
-    tx.commit().await.map_err(db_failed)?;
-    Ok(())
+    ctx.store
+        .write(|tx| {
+            let mut tx = ItemTxn::new(tx);
+            let ship = tx
+                .item(ship_id)?
+                .ok_or_else(|| refused("That ship no longer exists."))?;
+            let Some((policy, owner, corp)) = tx
+                .db()
+                .table("insuranceContracts")
+                .find_one(&["shipID"], &[V::Int(ship_id)])
+                .map(|r| (r.id, r.int("ownerID").unwrap_or(0), r.int("isCorp").unwrap_or(0) != 0))
+            else {
+                return Ok(());
+            };
+            let permitted = if corp {
+                ctx.session.corp_id == Some(owner) && may_manage_corp(ctx)
+            } else {
+                owner == me
+            };
+            if !permitted
+                || ship.owner_id != owner
+                || !at_station(tx.db(), ship.location_id, ship.flag, owner, station, corp)
+            {
+                return Err(refused("You cannot cancel insurance for that ship."));
+            }
+            tx.tx().delete("insuranceContracts", policy)?;
+            Ok(())
+        })
+        .map_err(|r: Refusal| r.0)
 }
 
-fn db_failed(error: tokio_postgres::Error) -> Outcome {
+fn db_failed(error: StoreError) -> Outcome {
     tracing::error!("insurance: {}", crate::logging::chain(&error));
     insure_failed("The insurance could not be updated.")
 }
@@ -372,38 +362,57 @@ mod tests {
     }
 
     async fn pilot(db: &crate::test_support::Database) -> crate::session::Session {
-        let id = db.id().await;
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,100000000)"#,&[&id,&format!("Insurance fixture {id}")]).await.unwrap();
+        let id = db.id().await as i64;
+        db.store
+            .write(|tx| {
+                tx.insert(
+                    "character_",
+                    &[
+                        ("characterID", V::Int(id)),
+                        ("characterName", V::Text(format!("Insurance fixture {id}").into())),
+                        ("balance", V::Float(100_000_000.0)),
+                    ],
+                )
+            })
+            .unwrap();
         crate::session::Session {
-            char_id: Some(id as i64),
+            char_id: Some(id),
             station_id: Some(60000004),
             ..Default::default()
         }
     }
     async fn ship(db: &crate::test_support::Database, owner: i64, location: i64) -> i64 {
-        db.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",flag,quantity,singleton) VALUES (587,$1,$2,4,1,1) RETURNING "itemID""#,&[&(owner as i32),&(location as i32)]).await.unwrap().get::<_,i32>(0) as i64
+        db.store
+            .write(|tx| {
+                let row = tx.insert(
+                    "entity",
+                    &[
+                        ("typeID", V::Int(587)),
+                        ("ownerID", V::Int(owner)),
+                        ("locationID", V::Int(location)),
+                        ("flag", V::Int(4)),
+                        ("quantity", V::Int(1)),
+                        ("singleton", V::Int(1)),
+                    ],
+                )?;
+                Ok::<_, StoreError>(tx.table("entity").row(row).and_then(|r| r.int("itemID")).unwrap())
+            })
+            .unwrap()
     }
     async fn balance(db: &crate::test_support::Database, owner: i64, corp: bool) -> f64 {
-        let sql = if corp {
-            r#"SELECT balance FROM corporation WHERE "corporationID"=$1"#
-        } else {
-            r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#
-        };
-        db.db
-            .query_one(sql, &[&(owner as i32)])
-            .await
-            .unwrap()
-            .get(0)
+        let table = if corp { "corporation" } else { "character_" };
+        db.store.read(|db| db.table(table).get_id(owner).and_then(|r| r.float("balance")).unwrap())
     }
-    async fn premium(db: &crate::test_support::Database) -> f64 {
-        db.db
-            .query_one(
-                r#"SELECT "basePrice"*0.05 FROM "invTypes" WHERE "typeID"=587"#,
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0)
+    fn contracts(db: &crate::test_support::Database, ship: i64) -> Vec<(i64, i64, i64)> {
+        db.store.read(|db| {
+            db.table("insuranceContracts")
+                .find(&["shipID"], &[V::Int(ship)])
+                .map(|r| (r.int("contractID").unwrap(), r.int("ownerID").unwrap(), r.int("endDate").unwrap()))
+                .collect()
+        })
+    }
+    fn premium() -> f64 {
+        crate::sde::table("invTypes").get("typeID", 587).unwrap().float("basePrice").unwrap() * 0.05
     }
     fn call(method: &str, args: Vec<Value>) -> Call {
         Call {
@@ -415,14 +424,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn insurance_purchase_is_atomic_concurrent_and_renews_expired_coverage() {
         let db = crate::test_support::Database::load().await;
         let session = pilot(&db).await;
         let me = session.char_id.unwrap();
         let ctx = db.ctx(&session);
         let hull = ship(&db, me, 60000004).await;
-        let premium = premium(&db).await;
+        let premium = premium();
         let (one, two) = tokio::join!(
             insure(&ctx, hull, premium, false, false),
             insure(&ctx, hull, premium, false, false)
@@ -435,22 +443,12 @@ mod tests {
             1
         );
         assert_eq!(balance(&db, me, false).await, 100_000_000.0 - premium);
-        let policies: i64 = db
-            .db
-            .query_one(
-                r#"SELECT count(*) FROM "insuranceContracts" WHERE "shipID"=$1"#,
-                &[&(hull as i32)],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(policies, 1);
-        db.db
-            .execute(
-                r#"UPDATE "insuranceContracts" SET "endDate"=0 WHERE "shipID"=$1"#,
-                &[&(hull as i32)],
-            )
-            .await
+        assert_eq!(contracts(&db, hull).len(), 1);
+        db.store
+            .write(|tx| {
+                let row = tx.table("insuranceContracts").find_one(&["shipID"], &[V::Int(hull)]).unwrap().id;
+                tx.update("insuranceContracts", row, &[("endDate", V::Int(0))])
+            })
             .unwrap();
         assert!(matches!(
             insurance_svc(&call("GetContractForShip", vec![Value::Int(hull)]), &ctx).await,
@@ -463,28 +461,37 @@ mod tests {
         let before = balance(&db, me, false).await;
         assert_eq!(before, 100_000_000.0 - 2.0 * premium);
 
-        // Force the final insert to fail after the debit and journal write.
+        // Make the final insert fail after the debit and journal write: a
+        // contract already holds the ID it will draw.
         let failing = ship(&db, me, 60000004).await;
-        let constraint = format!("insurance_failure_fixture_{failing}");
-        db.db.batch_execute(&format!(r#"ALTER TABLE "insuranceContracts" ADD CONSTRAINT {constraint} CHECK ("shipID" <> {failing})"#)).await.unwrap();
-        let result = insure(&ctx, failing, premium, false, false).await;
-        db.db
-            .batch_execute(&format!(
-                r#"ALTER TABLE "insuranceContracts" DROP CONSTRAINT {constraint}"#
-            ))
-            .await
+        let elsewhere = db.id().await as i64;
+        let blocker = db
+            .store
+            .write(|tx| {
+                let next = tx.db().sequence("dyn_id_seq").unwrap() + 1;
+                tx.insert(
+                    "insuranceContracts",
+                    &[
+                        ("contractID", V::Int(next)),
+                        ("shipID", V::Int(elsewhere)),
+                        ("ownerID", V::Int(me)),
+                        ("startDate", V::Int(0)),
+                        ("endDate", V::Int(0)),
+                        ("fraction", V::Float(0.5)),
+                    ],
+                )
+            })
             .unwrap();
+        let result = insure(&ctx, failing, premium, false, false).await;
+        db.store.write(|tx| tx.delete("insuranceContracts", blocker)).unwrap();
         assert!(!matches!(result, Outcome::Value(_)));
         assert_eq!(balance(&db, me, false).await, before);
-        let journals: i64 = db
-            .db
-            .query_one(
-                r#"SELECT count(*) FROM market_journal WHERE "characterID"=$1 AND "argID1"=$2"#,
-                &[&(me as i32), &failing.to_string()],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let journals = db.store.read(|db| {
+            db.table("market_journal")
+                .rows()
+                .filter(|r| r.int("characterID") == Some(me) && r.text("argID1") == Some(failing.to_string().as_str()))
+                .count()
+        });
         assert_eq!(journals, 0);
         let other = ship(&db, me, 60000004).await;
         let (one, two) = tokio::join!(
@@ -492,35 +499,58 @@ mod tests {
             insure(&ctx, other, premium, false, false)
         );
         assert!(matches!(one, Outcome::Value(_)) && matches!(two, Outcome::Value(_)));
-        let ids:i64=db.db.query_one(r#"SELECT count(DISTINCT "contractID") FROM "insuranceContracts" WHERE "shipID"=ANY($1)"#,&[&vec![failing as i32,other as i32]]).await.unwrap().get(0);
-        assert_eq!(ids, 2);
+        let mut ids: Vec<i64> = [failing, other].iter().flat_map(|s| contracts(&db, *s)).map(|c| c.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
         assert_eq!(balance(&db, me, false).await, before - 2.0 * premium);
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn insurance_corporation_office_permissions_replacement_and_cancellation() {
         let db = crate::test_support::Database::load().await;
         let mut session = pilot(&db).await;
         let me = session.char_id.unwrap();
-        let premium = premium(&db).await;
+        let premium = premium();
         let hull = ship(&db, me, 60000004).await;
         assert!(matches!(
             insure(&db.ctx(&session), hull, premium, false, false).await,
             Outcome::Value(_)
         ));
-        let corp = db.id().await;
-        let office = db.id().await;
-        db.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName",balance) VALUES ($1,$2,100000000)"#,&[&corp,&format!("Insurance corporation {corp}")]).await.unwrap();
-        db.db.execute(r#"INSERT INTO "crpOffices" ("corporationID","stationID","itemID","officeFolderID") VALUES ($1,60000004,$2,$2)"#,&[&corp,&office]).await.unwrap();
-        db.db
-            .execute(
-                r#"UPDATE entity SET "ownerID"=$2,"locationID"=$3 WHERE "itemID"=$1"#,
-                &[&(hull as i32), &corp, &office],
-            )
-            .await
+        let corp = db.id().await as i64;
+        let office = db.id().await as i64;
+        let set_corp_balance = |balance: f64| {
+            db.store
+                .write(|tx| {
+                    let row = tx.table("corporation").get_id(corp).unwrap().id;
+                    tx.update("corporation", row, &[("balance", V::Float(balance))])
+                })
+                .unwrap()
+        };
+        db.store
+            .write(|tx| {
+                tx.insert(
+                    "corporation",
+                    &[
+                        ("corporationID", V::Int(corp)),
+                        ("corporationName", V::Text(format!("Insurance corporation {corp}").into())),
+                        ("balance", V::Float(100_000_000.0)),
+                    ],
+                )?;
+                tx.insert(
+                    "crpOffices",
+                    &[
+                        ("corporationID", V::Int(corp)),
+                        ("stationID", V::Int(60000004)),
+                        ("itemID", V::Int(office)),
+                        ("officeFolderID", V::Int(office)),
+                    ],
+                )?;
+                let row = tx.table("entity").get_id(hull).unwrap().id;
+                tx.update("entity", row, &[("ownerID", V::Int(corp)), ("locationID", V::Int(office))])
+            })
             .unwrap();
-        session.corp_id = Some(corp as i64);
+        session.corp_id = Some(corp);
         assert!(!matches!(
             insure(&db.ctx(&session), hull, premium, true, true).await,
             Outcome::Value(_)
@@ -534,34 +564,13 @@ mod tests {
         assert!(
             matches!(insure(&db.ctx(&session),hull,premium,true,false).await,Outcome::UserError {msg,..} if msg=="InsureShipFailedSingleContract")
         );
-        db.db
-            .execute(
-                r#"UPDATE corporation SET balance=0 WHERE "corporationID"=$1"#,
-                &[&corp],
-            )
-            .await
-            .unwrap();
+        set_corp_balance(0.0);
         assert!(!matches!(
             insure(&db.ctx(&session), hull, premium, true, true).await,
             Outcome::Value(_)
         ));
-        let owner: i32 = db
-            .db
-            .query_one(
-                r#"SELECT "ownerID" FROM "insuranceContracts" WHERE "shipID"=$1"#,
-                &[&(hull as i32)],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(owner, me as i32);
-        db.db
-            .execute(
-                r#"UPDATE corporation SET balance=100000000 WHERE "corporationID"=$1"#,
-                &[&corp],
-            )
-            .await
-            .unwrap();
+        assert_eq!(contracts(&db, hull)[0].1, me);
+        set_corp_balance(100_000_000.0);
         let mut request = call(
             "InsureShip",
             vec![Value::Int(hull), Value::Double(premium), Value::Bool(true)],
@@ -574,24 +583,16 @@ mod tests {
             Some(Outcome::Value(_))
         ));
         assert_eq!(
-            balance(&db, corp as i64, true).await,
+            balance(&db, corp, true).await,
             100_000_000.0 - premium
         );
         session.roles_at_all = CORP_ROLE_JUNIOR_ACCOUNTANT;
         assert!(uninsure(&db.ctx(&session), hull).await.is_err());
         session.roles_at_all = CORP_ROLE_ACCOUNTANT;
         assert!(uninsure(&db.ctx(&session), hull).await.is_ok());
-        assert!(db
-            .db
-            .query_opt(
-                r#"SELECT 1 FROM "insuranceContracts" WHERE "shipID"=$1"#,
-                &[&(hull as i32)]
-            )
-            .await
-            .unwrap()
-            .is_none());
+        assert!(contracts(&db, hull).is_empty());
         assert_eq!(
-            balance(&db, corp as i64, true).await,
+            balance(&db, corp, true).await,
             100_000_000.0 - premium
         );
     }

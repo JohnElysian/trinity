@@ -714,11 +714,11 @@ fn ship_for(bot: &Bot, id: &Identity, ship_id: i64, hull: &NpcType, pos: Vec3, c
 }
 
 /// The hull types bots fly, loaded once.
-pub async fn hulls(db: &tokio_postgres::Client, ids: &[Identity], more: impl IntoIterator<Item = i64>) -> HashMap<i64, NpcType> {
+pub fn hulls(db: &crate::store::Db, ids: &[Identity], more: impl IntoIterator<Item = i64>) -> HashMap<i64, NpcType> {
     let mut types: Vec<i64> = ids.iter().map(|i| i.hull).filter(|h| *h != 0).chain([TYPE_CAPSULE]).chain(more).collect();
     types.sort_unstable();
     types.dedup();
-    match crate::npc::load_types(db, &types).await {
+    match crate::npc::load_types(db, &types) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!("bots: reading the hulls: {}", crate::logging::chain(&e));

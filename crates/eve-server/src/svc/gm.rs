@@ -18,13 +18,13 @@
 //! A type or a skill is its ID or its name.
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::info;
 
 use crate::ballpark::Vec3;
 use crate::items::{ItemTxn, NewItem};
+use crate::sde;
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{float, int, text};
+use crate::store::{StoreError, Value as V};
 use crate::svc::wallet::{self, Entry};
 use crate::world::Move;
 
@@ -40,6 +40,16 @@ const ATTR_SKILL_LEVEL: i32 = 280;
 /// refAgentMiscellaneous, for money a GM conjures.
 const REF_GM: i32 = 25;
 const OWNER_SYSTEM: i64 = 1;
+
+/// Why a command's store write was refused: the store's error, or the
+/// command's own reason, said to the GM as it is.
+struct Refused(String);
+
+impl From<StoreError> for Refused {
+    fn from(e: StoreError) -> Self {
+        Refused(e.to_string())
+    }
+}
 
 const HELP: &str = "/create <type> [qty], /giveisk <amount>, /givelp <amount> [corpID],/giveskill <skill> [level], /setstanding <ownerID> <standing>, /spawn, /tr me <place or pilot>, /bots on|off|status|event <kind>|war <a> | <b>|density <region> <x>|follow <name>";
 
@@ -85,16 +95,86 @@ pub async fn slash(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     })
 }
 
-/// A type by ID, or by its name (exactly, else the first that starts so).
-async fn find_type(db: &impl GenericClient, words: &[&str], category: Option<i32>) -> Option<(i64, String)> {
+/// A type by ID, or by its name (exactly, else the first that starts so):
+/// the ID first, then an exact name (case aside), then the shortest name.
+/// Only types whose group is known count, and only types in `category` if
+/// one is given.
+fn find_type(words: &[&str], category: Option<i32>) -> Option<(i64, String)> {
     let key = words.join(" ");
-    let sql = r#"SELECT t."typeID", t."typeName" FROM "invTypes" t JOIN "invGroups" g ON g."groupID" = t."groupID"
-                  WHERE ($3::int IS NULL OR g."categoryID" = $3)
-                    AND (t."typeID"::text = $1 OR lower(t."typeName") = lower($1) OR lower(t."typeName") LIKE lower($2))
-                  ORDER BY (t."typeID"::text = $1) DESC, (lower(t."typeName") = lower($1)) DESC, length(t."typeName")
-                  LIMIT 1"#;
-    let r = db.query_opt(sql, &[&key, &format!("{key}%"), &category]).await.ok().flatten()?;
-    Some((int(&r, 0)?, text(&r, 1).unwrap_or_default()))
+    // The database lowered ASCII letters only (its locale is C), and the
+    // key's own % and _ were wildcards in its LIKE.
+    let lower = key.to_ascii_lowercase();
+    let prefix = format!("{lower}%");
+    let groups = sde::table("invGroups");
+    sde::table("invTypes")
+        .rows()
+        .filter_map(|t| {
+            let id = t.int("typeID")?;
+            let group = groups.get("groupID", t.int("groupID")?)?;
+            if category.is_some_and(|c| group.int("categoryID") != Some(c as i64)) {
+                return None;
+            }
+            let name = t.text("typeName");
+            let by_id = id.to_string() == key;
+            let exact = name.map(|n| n.to_ascii_lowercase() == lower);
+            if !(by_id || exact == Some(true) || name.is_some_and(|n| like(&n.to_ascii_lowercase(), &prefix))) {
+                return None;
+            }
+            // ORDER BY ... DESC puts NULL (no name) first.
+            let exact_rank = match exact {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            };
+            let length = name.map(|n| n.chars().count());
+            Some(((!by_id, exact_rank, length.is_none(), length.unwrap_or(0)), id, name))
+        })
+        .min_by_key(|(rank, _, _)| *rank)
+        .map(|(_, id, name)| (id, name.unwrap_or_default().to_string()))
+}
+
+/// SQL's LIKE: `%` matches any run of characters, `_` any one, and `\`
+/// takes the next character as it is.
+fn like(text: &str, pattern: &str) -> bool {
+    enum Token {
+        Any,
+        One,
+        Char(char),
+    }
+    let mut tokens = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        tokens.push(match c {
+            '%' => Token::Any,
+            '_' => Token::One,
+            '\\' => match chars.next() {
+                Some(c) => Token::Char(c),
+                // The database refuses a pattern ending in its escape.
+                None => return false,
+            },
+            c => Token::Char(c),
+        });
+    }
+    let text: Vec<char> = text.chars().collect();
+    // Which lengths of the text the pattern so far can match.
+    let mut matched = vec![false; text.len() + 1];
+    matched[0] = true;
+    for token in tokens {
+        let mut next = vec![false; text.len() + 1];
+        match token {
+            Token::Any => {
+                let mut reached = false;
+                for (n, m) in matched.iter().enumerate() {
+                    reached |= *m;
+                    next[n] = reached;
+                }
+            }
+            Token::One => (0..text.len()).for_each(|n| next[n + 1] = matched[n]),
+            Token::Char(c) => (0..text.len()).for_each(|n| next[n + 1] = matched[n] && text[n] == c),
+        }
+        matched = next;
+    }
+    matched[text.len()]
 }
 
 /// The trailing number of a command, if there is one, and the words before.
@@ -112,18 +192,20 @@ async fn create(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
     let me = ctx.session.char_id.unwrap_or(0);
     let (name, quantity) = trailing_number(words);
     let quantity = quantity.unwrap_or(1.0).max(1.0) as i64;
-    let (type_id, type_name) = find_type(ctx.db, name, None).await.ok_or("No such type.")?;
+    let (type_id, type_name) = find_type(name, None).ok_or("No such type.")?;
     let (location, flag) = match (ctx.session.station_id, ctx.session.ship_id) {
         (Some(station), _) => (station, FLAG_HANGAR),
         (None, Some(ship)) => (ship, FLAG_CARGO),
         _ => return Err("You have nowhere to put it.".into()),
     };
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| e.to_string())?;
-    let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| e.to_string())?;
-    txn.create(NewItem { type_id, owner_id: me, location_id: location, flag, quantity, singleton: false })
-        .await
+    let events = ctx
+        .store
+        .write(|tx| {
+            let mut items = ItemTxn::new(tx);
+            items.create(NewItem { type_id, owner_id: me, location_id: location, flag, quantity, singleton: false })?;
+            Ok::<_, StoreError>(items.events())
+        })
         .map_err(|e| e.to_string())?;
-    let events = txn.commit().await.map_err(|e| e.to_string())?;
     crate::items::notify(ctx.world, ctx.client_id, events);
     Ok(format!("Created {quantity} x {type_name}"))
 }
@@ -131,11 +213,11 @@ async fn create(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
 async fn give_isk(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
     let me = ctx.session.char_id.unwrap_or(0);
     let amount: f64 = words.first().and_then(|w| w.replace(',', "").parse().ok()).ok_or("How much?")?;
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| e.to_string())?;
-    let tx = client.transaction().await.map_err(|e| e.to_string())?;
     let entry = Entry { ref_type: REF_GM, payer: OWNER_SYSTEM, payee: me, arg_id1: "", reason: "GM" };
-    let balance = wallet::post(&tx, me, amount, &entry).await.map_err(|_| "The wallet would go below zero.".to_string())?;
-    tx.commit().await.map_err(|e| e.to_string())?;
+    let balance = ctx
+        .store
+        .write(|tx| wallet::post(tx, me, amount, &entry).map_err(|_| Refused("The wallet would go below zero.".into())))
+        .map_err(|r| r.0)?;
     let w = ctx.world.lock();
     let cash = Value::Tuple(vec![Value::bytes("cash"), Value::Int(me), Value::Double(balance)]);
     w.notify(&w.clients_of(me), "OnAccountChange", cash);
@@ -150,15 +232,12 @@ async fn give_lp(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
     let corp = match words.get(1) {
         Some(w) => w.parse::<i32>().map_err(|_| "Which corporation (an ID)?")?,
         None => {
-            let station = ctx.session.station_id.ok_or("Dock, or name a corporation ID.")? as i32;
-            let sql = r#"SELECT "corporationID" FROM "staStations" WHERE "stationID" = $1"#;
-            ctx.query_one(sql, &[&station]).await.map(|r| r.get::<_, i32>(0)).ok_or("This station has no owner.")?
+            let station = ctx.session.station_id.ok_or("Dock, or name a corporation ID.")?;
+            let owner = ctx.store.read(|db| db.table("staStations").get_id(station).and_then(|r| r.int("corporationID")));
+            owner.ok_or("This station has no owner.")? as i32
         }
     };
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| e.to_string())?;
-    let tx = client.transaction().await.map_err(|e| e.to_string())?;
-    let total = crate::svc::lp::add_lp(&tx, me, corp, amount).await?;
-    tx.commit().await.map_err(|e| e.to_string())?;
+    let total = ctx.store.write(|tx| crate::svc::lp::add_lp(tx, me, corp, amount).map_err(Refused)).map_err(|r| r.0)?;
     Ok(format!("You now have {total} LP with corporation {corp}."))
 }
 
@@ -168,39 +247,30 @@ async fn give_skill(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
     let me = ctx.session.char_id.unwrap_or(0);
     let (name, level) = trailing_number(words);
     let level = level.unwrap_or(5.0).clamp(0.0, 5.0) as i64;
-    let (type_id, skill_name) = find_type(ctx.db, name, Some(CATEGORY_SKILL)).await.ok_or("No such skill.")?;
-    let stc = ctx
-        .query_one(
-            r#"SELECT COALESCE("valueFloat", "valueInt"::float8) FROM "dgmTypeAttributes" WHERE "typeID" = $1 AND "attributeID" = $2"#,
-            &[&(type_id as i32), &ATTR_SKILL_TIME_CONSTANT],
-        )
-        .await
-        .and_then(|r| float(&r, 0))
-        .unwrap_or(1.0)
-        * 250.0;
+    let (type_id, skill_name) = find_type(name, Some(CATEGORY_SKILL)).ok_or("No such skill.")?;
+    let stc = sde::get().type_attribute(type_id, ATTR_SKILL_TIME_CONSTANT).unwrap_or(1.0) * 250.0;
     let points = crate::losses::points_at(stc, level);
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| e.to_string())?;
-    let mut txn = ItemTxn::begin(&mut client).await.map_err(|e| e.to_string())?;
-    let held = r#"SELECT "itemID" FROM entity WHERE "locationID" = $1 AND "typeID" = $2 AND "flag" = $3"#;
-    let existing = txn
-        .tx()
-        .query_opt(held, &[&(me as i32), &(type_id as i32), &(FLAG_SKILL as i32)])
-        .await
-        .map_err(|e| e.to_string())?
-        .and_then(|r| int(&r, 0));
-    let id = match existing {
-        Some(id) => id,
-        None => txn
-            .create(NewItem { type_id, owner_id: me, location_id: me, flag: FLAG_SKILL, quantity: 1, singleton: true })
-            .await
-            .map_err(|e| e.to_string())?,
-    };
-    let set = r#"INSERT INTO entity_attributes ("itemID", "attributeID", "valueInt", "valueFloat") VALUES ($1, $2, $3, NULL)
-                 ON CONFLICT ("itemID", "attributeID") DO UPDATE SET "valueInt" = $3, "valueFloat" = NULL"#;
-    for (attr, value) in [(ATTR_SKILL_LEVEL, level), (ATTR_SKILL_POINTS, points.round() as i64)] {
-        txn.tx().execute(set, &[&(id as i32), &attr, &value]).await.map_err(|e| e.to_string())?;
-    }
-    let events = txn.commit().await.map_err(|e| e.to_string())?;
+    let events = ctx
+        .store
+        .write(|tx| {
+            let mut items = ItemTxn::new(tx);
+            let existing = items
+                .db()
+                .table("entity")
+                .find(&["locationID"], &[V::Int(me)])
+                .find(|r| r.int("typeID") == Some(type_id) && r.int("flag") == Some(FLAG_SKILL))
+                .and_then(|r| r.int("itemID"));
+            let id = match existing {
+                Some(id) => id,
+                None => items.create(NewItem { type_id, owner_id: me, location_id: me, flag: FLAG_SKILL, quantity: 1, singleton: true })?,
+            };
+            for (attr, value) in [(ATTR_SKILL_LEVEL, level), (ATTR_SKILL_POINTS, points.round() as i64)] {
+                let sets = [("itemID", V::Int(id)), ("attributeID", V::Int(attr as i64)), ("valueInt", V::Int(value)), ("valueFloat", V::Null)];
+                items.tx().upsert("entity_attributes", &["itemID", "attributeID"], &sets, &[("valueInt", V::Int(value)), ("valueFloat", V::Null)])?;
+            }
+            Ok::<_, StoreError>(items.events())
+        })
+        .map_err(|e| e.to_string())?;
     crate::items::notify(ctx.world, ctx.client_id, events);
     Ok(format!("{skill_name} is now at level {level} ({points:.0} SP); log in again to see it in the skill list"))
 }
@@ -210,9 +280,9 @@ async fn set_standing(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
     let from: i64 = words.first().and_then(|w| w.parse().ok()).ok_or("Whose standing?")?;
     let standing: f64 = words.get(1).and_then(|w| w.parse().ok()).ok_or("What standing?")?;
     let standing = standing.clamp(-10.0, 10.0);
-    let sql = r#"INSERT INTO "chrNPCStandings" ("characterID", "fromID", "standing") VALUES ($1, $2, $3)
-                 ON CONFLICT ("characterID", "fromID") DO UPDATE SET "standing" = $3"#;
-    if !ctx.execute(sql, &[&(me as i32), &(from as i32), &standing]).await {
+    let sets = [("characterID", V::Int(me)), ("fromID", V::Int(from)), ("standing", V::Float(standing))];
+    let saved = ctx.store.write(|tx| tx.upsert("chrNPCStandings", &["characterID", "fromID"], &sets, &[("standing", V::Float(standing))]));
+    if saved.is_err() {
         return Err("The standing could not be saved.".into());
     }
     let w = ctx.world.lock();
@@ -241,26 +311,48 @@ async fn teleport(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
         ["me", rest @ ..] if !rest.is_empty() => rest.join(" "),
         _ => return Err("Usage: /tr me <station, system, celestial or pilot>".into()),
     };
-    let place = r#"SELECT d."itemID", d."groupID", COALESCE(d."solarSystemID", d."itemID"), s."constellationID", s."regionID",
-                          d."x", d."y", d."z", COALESCE(d."radius", 0), d."itemName"
-                     FROM "mapDenormalize" d
-                     JOIN "mapSolarSystems" s ON s."solarSystemID" = COALESCE(d."solarSystemID", d."itemID")
-                    WHERE d."itemID"::text = $1 OR lower(d."itemName") = lower($1)
-                    ORDER BY (d."itemID"::text = $1) DESC LIMIT 1"#;
-    let pilot = r#"SELECT "characterID" FROM "character_" WHERE "characterID"::text = $1 OR lower("characterName") = lower($1) LIMIT 1"#;
+    // An ID as its text, or a name as the database lowered it (ASCII
+    // letters only: its locale is C).
+    let by_id = |id: Option<i64>| id.is_some_and(|id| id.to_string() == target);
+    let lower = target.to_ascii_lowercase();
+    let by_name = |name: Option<&str>| name.is_some_and(|n| n.to_ascii_lowercase() == lower);
     let me_in_space = ctx.session.solar_system_id.is_some();
-    let (station, system, constellation, region, pos, name) = if let Some(r) = ctx.query_one(place, &[&target]).await {
-        let i = |n| int(&r, n).unwrap_or(0);
-        let at = Vec3::new(float(&r, 5).unwrap_or(0.0), float(&r, 6).unwrap_or(0.0), float(&r, 7).unwrap_or(0.0));
-        let radius = float(&r, 8).unwrap_or(0.0);
-        let station = (i(1) == 15).then_some(i(0));
+    // The celestial (or station, or system) by that ID, else the first by
+    // that name, in a system that exists.
+    let place = ctx.store.read(|db| {
+        let systems = db.table("mapSolarSystems");
+        let in_a_system = |d: &crate::store::Row| {
+            let system = d.int("solarSystemID").or(d.int("itemID"))?;
+            systems.get_id(system).map(|s| (system, s.int("constellationID"), s.int("regionID")))
+        };
+        let candidates = db.table("mapDenormalize").rows().filter(|d| by_id(d.int("itemID")) || by_name(d.text("itemName")));
+        let mut first = None;
+        for d in candidates {
+            let Some(system) = in_a_system(&d) else { continue };
+            let found = (d.int("itemID"), d.int("groupID"), system, (d.float("x"), d.float("y"), d.float("z")), d.float("radius"), d.text("itemName").map(str::to_string));
+            if by_id(d.int("itemID")) {
+                first = Some(found);
+                break;
+            }
+            first.get_or_insert(found);
+        }
+        first
+    });
+    let pilot = || ctx.store.read(|db| db.table("character_").rows().find(|c| by_id(c.int("characterID")) || by_name(c.text("characterName"))).and_then(|c| c.int("characterID")));
+    let (station, system, constellation, region, pos, name) = if let Some((item, group, (system, constellation, region), (x, y, z), radius, name)) = place {
+        let item = item.unwrap_or(0);
+        let at = Vec3::new(x.unwrap_or(0.0), y.unwrap_or(0.0), z.unwrap_or(0.0));
+        let radius = radius.unwrap_or(0.0);
+        let station = (group == Some(15)).then_some(item);
         // Off a celestial's surface; to a system's sun, an AU out.
-        let pos = if i(0) == i(2) { Vec3::new(1.5e11, 0.0, 0.0) } else { at + Vec3::new(radius + 10_000.0, 0.0, 0.0) };
-        (station, i(2), i(3), i(4), pos, text(&r, 9).unwrap_or_default())
-    } else if let Some(other) = ctx.query_one(pilot, &[&target]).await.and_then(|r| int(&r, 0)) {
+        let pos = if item == system { Vec3::new(1.5e11, 0.0, 0.0) } else { at + Vec3::new(radius + 10_000.0, 0.0, 0.0) };
+        (station, system, constellation.unwrap_or(0), region.unwrap_or(0), pos, name.unwrap_or_default())
+    } else if let Some(other) = pilot() {
         let presence = ctx.world.lock().presence_of(other).ok_or("That pilot is not online.")?;
-        let sql = r#"SELECT "constellationID", "regionID" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#;
-        let r = ctx.query_one(sql, &[&(presence.solar_system_id as i32)]).await.ok_or("That pilot is nowhere.")?;
+        let r = ctx
+            .store
+            .read(|db| db.table("mapSolarSystems").get_id(presence.solar_system_id).map(|s| (s.int("constellationID"), s.int("regionID"))))
+            .ok_or("That pilot is nowhere.")?;
         let pos = {
             let w = ctx.world.lock();
             w.parks
@@ -269,7 +361,7 @@ async fn teleport(ctx: &Ctx<'_>, words: &[&str]) -> Result<String, String> {
                 .map_or(Vec3::new(1.5e11, 0.0, 0.0), |s| s.pos + Vec3::new(2_000.0, 0.0, 0.0))
         };
         let station = presence.station_id;
-        (station, presence.solar_system_id, int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0), pos, target.clone())
+        (station, presence.solar_system_id, r.0.unwrap_or(0), r.1.unwrap_or(0), pos, target.clone())
     } else {
         return Err(format!("Nowhere called {target}."));
     };

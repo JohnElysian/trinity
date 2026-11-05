@@ -3,13 +3,15 @@
 //! has their connection told to read its affiliation again
 //! (`world::Move::Affiliation`), which sends the session change.
 
+use std::collections::HashSet;
+
 use eve_marshal::Value;
-use tokio_postgres::{GenericClient, Transaction};
 use tracing::{error, info};
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::CORP_ROLE_DIRECTOR;
-use crate::svc::rows::{change, index_rowset, int, line, lines, rowset, text};
+use crate::store::{self, Db, Row, StoreError, Tx};
+use crate::svc::rows::{change, index_rowset, rowset};
 use crate::svc::skills;
 use crate::svc::wallet::{self, Entry, Transfer};
 
@@ -31,7 +33,7 @@ const CORP_ROLE_PERSONNEL_MANAGER: i64 = 128;
 /// Starbase Config among them): what a CEO is given.
 pub const ALL_ROLES: i64 = 0x00FF_FFFF_FFFF_FF81;
 /// Shares issued to a corporation's founder.
-const FOUNDER_SHARES: i32 = 1000;
+const FOUNDER_SHARES: i64 = 1000;
 /// typeCorporationManagement: needed to found a corporation.
 const SKILL_CORPORATION_MANAGEMENT: i32 = 3363;
 /// The skills that raise a CEO's member limit, and by how much per level
@@ -40,11 +42,31 @@ const MEMBER_SKILLS: [(i32, i64); 4] = [(3363, 10), (3731, 50), (3732, 200), (12
 
 const APPLICATION_HEADER: &[&str] =
     &["corporationID", "characterID", "applicationText", "applicationDateTime", "status"];
-const APPLICATION_SELECT: &str = r#"
-    SELECT "corporationID", "characterID", "applicationText", "applicationDateTime", "status"
-      FROM "crpApplications""#;
 
 pub type Refused<T> = std::result::Result<T, Outcome>;
+
+/// A refusal from inside a store write, which undoes the write.
+pub(crate) struct Undone(pub Outcome);
+
+impl From<Outcome> for Undone {
+    fn from(o: Outcome) -> Self {
+        Undone(o)
+    }
+}
+
+impl From<StoreError> for Undone {
+    fn from(e: StoreError) -> Self {
+        Undone(db_failed("writing", e))
+    }
+}
+
+fn int(v: i64) -> store::Value {
+    store::Value::Int(v)
+}
+
+fn text(v: &str) -> store::Value {
+    store::Value::Text(v.into())
+}
 
 /// corpRegistry calls that change who belongs to which corporation.
 pub async fn corp_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
@@ -52,12 +74,12 @@ pub async fn corp_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let status = |i: usize| call.arg_i64(i).unwrap_or(-1) as i16;
     let result = match call.method.as_str() {
         "GetSuggestedTickerNames" => {
-            let tickers = free_tickers(ctx, r#"SELECT "tickerName" FROM "corporation""#, &text_arg(0)).await;
+            let tickers = free_tickers(ctx, "corporation", "tickerName", &text_arg(0)).await;
             Ok(rowset(&["tickerName"], tickers.into_iter().map(|t| Value::List(vec![Value::text(t)])).collect()))
         }
         "AddCorporation" => add_corporation(ctx, call).await,
-        "GetMyApplications" => Ok(my_applications(ctx).await),
-        "GetApplications" => Ok(corp_applications(ctx).await),
+        "GetMyApplications" => Ok(my_applications(ctx)),
+        "GetApplications" => Ok(corp_applications(ctx)),
         "InsertApplication" => insert_application(ctx, call.arg_id(0), &text_arg(1)).await,
         "UpdateApplication" => answer_offer(ctx, call.arg_id(0), &text_arg(1), status(2)).await,
         "UpdateApplicationOffer" => make_offer(ctx, call.arg_id(0), &text_arg(1), status(2)).await,
@@ -68,7 +90,7 @@ pub async fn corp_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             update_member(ctx, call.arg_id(0), call.arg_text(1), &roles).await
         }
         "UpdateMembers" => update_members(ctx, call.args.first()).await,
-        "CanBeKickedOut" => Ok(Value::Bool(can_be_kicked_out(ctx, call.arg_id(0)).await)),
+        "CanBeKickedOut" => Ok(Value::Bool(can_be_kicked_out(ctx, call.arg_id(0)))),
         "UpdateDivisionNames" => crate::svc::corphangar::update_division_names(ctx, &call.args).await.map_err(Outcome::custom),
         "UpdateCorporation" => crate::svc::corphangar::update_corporation(ctx, &call.args).await.map_err(Outcome::custom),
         _ => return None,
@@ -89,7 +111,7 @@ async fn add_corporation(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     let description = call.arg_text(2).unwrap_or_default();
     let url = call.arg_text(3).unwrap_or_default();
     let tax_rate = call.args.get(4).and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
-    let opt_int = |i: usize| call.arg_i64(i).map(|v| v as i32);
+    let opt_int = |i: usize| call.arg_i64(i).map_or(store::Value::Null, int);
     let typeface = call.arg_text(11);
 
     if let Some(key) = name_error("Corp", &name) {
@@ -98,11 +120,12 @@ async fn add_corporation(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     if !ticker_ok(&ticker) {
         return Err(message("CorpTickerNameInvalid"));
     }
-    if is_ceo(ctx.db, char_id).await? {
+    if ctx.store.read(|db| is_ceo(db, char_id))? {
         return Err(message("CEOCannotCreateCorporation"));
     }
-    let levels = skills::levels(ctx.db, char_id, &MEMBER_SKILLS.map(|(s, _)| s))
-        .await
+    let levels = ctx
+        .store
+        .read(|db| skills::levels(db, char_id, &MEMBER_SKILLS.map(|(s, _)| s)))
         .map_err(|e| db_failed("reading corporation skills", e))?;
     if levels.get(&SKILL_CORPORATION_MANAGEMENT).copied().unwrap_or(0) < 1 {
         return Err(Outcome::UserError {
@@ -112,80 +135,100 @@ async fn add_corporation(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     }
     let member_limit: i64 = MEMBER_SKILLS.iter().map(|(s, per)| levels.get(s).copied().unwrap_or(0) * per).sum();
 
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let tx = client.transaction().await.map_err(|e| db_failed("BEGIN", e))?;
-    if exists(&tx, r#"SELECT 1 FROM "corporation" WHERE lower("corporationName") = lower($1)"#, &name).await? {
-        return Err(message("CorpNameInvalidTaken"));
-    }
-    if exists(&tx, r#"SELECT 1 FROM "corporation" WHERE lower("tickerName") = lower($1)"#, &ticker).await? {
-        return Err(message("CorpTickerNameInvalidTaken"));
-    }
+    let (balance, corp_id, left) = ctx
+        .store
+        .write(|tx| -> Result<_, Undone> {
+            if exists(tx.db(), "corporation", "corporationName", &name) {
+                return Err(message("CorpNameInvalidTaken").into());
+            }
+            if exists(tx.db(), "corporation", "tickerName", &ticker) {
+                return Err(message("CorpTickerNameInvalidTaken").into());
+            }
 
-    let entry = Entry {
-        ref_type: REF_CORPORATION_REGISTRATION_FEE,
-        payer: char_id,
-        payee: 0,
-        arg_id1: "",
-        reason: "",
-    };
-    let balance = wallet::post(&tx, char_id, -STARTUP_COST, &entry).await.map_err(transfer_refused)?;
+            let entry = Entry {
+                ref_type: REF_CORPORATION_REGISTRATION_FEE,
+                payer: char_id,
+                payee: 0,
+                arg_id1: "",
+                reason: "",
+            };
+            let balance = wallet::post(tx, char_id, -STARTUP_COST, &entry).map_err(transfer_refused)?;
 
-    let now = crate::bulkdata::filetime_now();
-    let corp_id: i32 = tx
-        .query_one(
-            r#"INSERT INTO "corporation"
-                   ("corporationName", "tickerName", "description", "url", "taxRate",
-                    "creatorID", "ceoID", "stationID", "raceID", "memberLimit",
-                    "shape1", "shape2", "shape3", "color1", "color2", "color3", "typeface")
-               SELECT $1, $2, $3, $4, $5, $6, $6, $7, c."raceID", $8, $9, $10, $11, $12, $13, $14, $15
-                 FROM "character_" c WHERE c."characterID" = $6
-               RETURNING "corporationID""#,
-            &[
-                &name, &ticker, &description, &url, &tax_rate, &(char_id as i32), &(station_id as i32),
-                &(member_limit as i32), &opt_int(5), &opt_int(6), &opt_int(7), &opt_int(8), &opt_int(9),
-                &opt_int(10), &typeface,
-            ],
-        )
-        .await
-        .map_err(|e| db_failed("inserting the corporation", e))?
-        .get(0);
-    tx.execute(
-        r#"INSERT INTO "crpCharShares" ("characterID", "corporationID", "shares") VALUES ($1, $2, $3)"#,
-        &[&(char_id as i32), &corp_id, &FOUNDER_SHARES],
-    )
-    .await
-    .map_err(|e| db_failed("issuing the founder's shares", e))?;
-    tx.execute(r#"UPDATE "corporation" SET "shares" = $2 WHERE "corporationID" = $1"#, &[&corp_id, &i64::from(FOUNDER_SHARES)])
-        .await
-        .map_err(|e| db_failed("recording the shares", e))?;
-    let left = change_corporation(&tx, char_id, i64::from(corp_id), ALL_ROLES, now).await?;
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
-    member_moved(ctx.world, char_id, left, i64::from(corp_id));
+            let now = crate::bulkdata::filetime_now();
+            // The founder's race is the corporation's.
+            let race = tx.table("character_").get_id(char_id).map(|c| c.value("raceID").clone()).ok_or_else(|| {
+                db_failed("inserting the corporation", StoreError { code: store::DATA_EXCEPTION, message: format!("no character {char_id}") })
+            })?;
+            let row = tx
+                .insert(
+                    "corporation",
+                    &[
+                        ("corporationName", text(&name)),
+                        ("tickerName", text(&ticker)),
+                        ("description", text(&description)),
+                        ("url", text(&url)),
+                        ("taxRate", store::Value::Float(tax_rate)),
+                        ("creatorID", int(char_id)),
+                        ("ceoID", int(char_id)),
+                        ("stationID", int(station_id)),
+                        ("raceID", race),
+                        ("memberLimit", int(member_limit)),
+                        ("shape1", opt_int(5)),
+                        ("shape2", opt_int(6)),
+                        ("shape3", opt_int(7)),
+                        ("color1", opt_int(8)),
+                        ("color2", opt_int(9)),
+                        ("color3", opt_int(10)),
+                        ("typeface", typeface.as_deref().map_or(store::Value::Null, text)),
+                    ],
+                )
+                .map_err(|e| db_failed("inserting the corporation", e))?;
+            let corp_id = tx.table("corporation").row(row).and_then(|c| c.int("corporationID")).unwrap_or(0);
+            tx.insert(
+                "crpCharShares",
+                &[("characterID", int(char_id)), ("corporationID", int(corp_id)), ("shares", int(FOUNDER_SHARES))],
+            )
+            .map_err(|e| db_failed("issuing the founder's shares", e))?;
+            tx.update("corporation", row, &[("shares", int(FOUNDER_SHARES))]).map_err(|e| db_failed("recording the shares", e))?;
+            let left = change_corporation(tx, char_id, corp_id, ALL_ROLES, now)?;
+            Ok((balance, corp_id, left))
+        })
+        .map_err(|Undone(o)| o)?;
+    member_moved(ctx.world, char_id, left, corp_id);
 
     info!("founded corporation {name:?} [{ticker}] ({corp_id}) at station {station_id}, member limit {member_limit}");
     let world = ctx.world.lock();
     let cash = Value::Tuple(vec![Value::bytes("cash"), Value::Int(char_id), Value::Double(balance)]);
     world.notify(&world.clients_of(char_id), "OnAccountChange", cash);
     world.reaffiliate(&[], &[char_id]);
-    Ok(Value::Int(i64::from(corp_id)))
+    Ok(Value::Int(corp_id))
 }
 
 // ---- applications ----------------------------------------------------------------------
 
-async fn my_applications(ctx: &Ctx<'_>) -> Value {
-    let char_id = ctx.session.char_id.unwrap_or(0) as i32;
-    let sql = format!(r#"{APPLICATION_SELECT} WHERE "characterID" = $1 AND "deleted" = 0"#);
-    rowset(APPLICATION_HEADER, lines(&ctx.query(&sql, &[&char_id]).await))
+/// The applications (not deleted) with `column` equal to `id`.
+fn applications<'a>(db: &'a Db, column: &str, id: i64) -> impl Iterator<Item = Row<'a>> + 'a {
+    db.table("crpApplications").find(&[column], &[int(id)]).filter(|r| r.int("deleted") == Some(0))
+}
+
+fn my_applications(ctx: &Ctx<'_>) -> Value {
+    let char_id = ctx.session.char_id.unwrap_or(0);
+    ctx.store.read(|db| {
+        rowset(APPLICATION_HEADER, applications(db, "characterID", char_id).map(|r| Value::List(r.line(APPLICATION_HEADER))).collect())
+    })
 }
 
 /// The applications to the caller's corporation, for its personnel managers.
-async fn corp_applications(ctx: &Ctx<'_>) -> Value {
+fn corp_applications(ctx: &Ctx<'_>) -> Value {
     if !may_manage_personnel(ctx) {
         return index_rowset(APPLICATION_HEADER, "characterID", Vec::new());
     }
-    let corp = ctx.session.corp_id.unwrap_or(0) as i32;
-    let sql = format!(r#"{APPLICATION_SELECT} WHERE "corporationID" = $1 AND "deleted" = 0"#);
-    let items = ctx.query(&sql, &[&corp]).await.iter().map(|r| (Value::Int(int(r, 1).unwrap_or(0)), Value::List(line(r)))).collect();
+    let corp = ctx.session.corp_id.unwrap_or(0);
+    let items = ctx.store.read(|db| {
+        applications(db, "corporationID", corp)
+            .map(|r| (Value::Int(r.int("characterID").unwrap_or(0)), Value::List(r.line(APPLICATION_HEADER))))
+            .collect()
+    });
     index_rowset(APPLICATION_HEADER, "characterID", items)
 }
 
@@ -195,24 +238,26 @@ async fn insert_application(ctx: &Ctx<'_>, corp_id: i64, note: &str) -> Refused<
     if ctx.session.corp_id == Some(corp_id) {
         return Err(Outcome::custom("You are already a member of that corporation."));
     }
-    if !is_player_corp(ctx.db, corp_id).await? {
+    if !ctx.store.read(|db| is_player_corp(db, corp_id))? {
         return Err(Outcome::custom("That corporation does not take applications."));
     }
-    if application(ctx.db, corp_id, char_id).await?.is_some() {
+    if ctx.store.read(|db| application(db, corp_id, char_id))?.is_some() {
         return Err(message("CrpApplicationAlreadyExists"));
     }
     let now = crate::bulkdata::filetime_now();
-    ctx.db
-        .execute(
-            r#"INSERT INTO "crpApplications"
-                   ("corporationID", "characterID", "applicationText", "applicationDateTime", "status", "deleted")
-               VALUES ($1, $2, $3, $4, $5, 0)
-               ON CONFLICT ("corporationID", "characterID") DO UPDATE
-                  SET "applicationText" = $3, "applicationDateTime" = $4, "status" = $5,
-                      "corporationText" = '', "deleted" = 0"#,
-            &[&(corp_id as i32), &(char_id as i32), &note, &now, &APPLIED_BY_CHARACTER],
-        )
-        .await
+    ctx.store
+        .write(|tx| {
+            let filed = [
+                ("applicationText", text(note)),
+                ("applicationDateTime", int(now)),
+                ("status", int(APPLIED_BY_CHARACTER.into())),
+                ("corporationText", text("")),
+                ("deleted", int(0)),
+            ];
+            let mut sets = vec![("corporationID", int(corp_id)), ("characterID", int(char_id))];
+            sets.extend(filed.iter().cloned());
+            tx.upsert("crpApplications", &["corporationID", "characterID"], &sets, &filed)
+        })
         .map_err(|e| db_failed("filing the application", e))?;
     let new = application_line(corp_id, char_id, note, now, APPLIED_BY_CHARACTER);
     info!("{char_id} applied to join corporation {corp_id}");
@@ -226,7 +271,7 @@ async fn make_offer(ctx: &Ctx<'_>, char_id: i64, note: &str, status: i16) -> Ref
     if !may_manage_personnel(ctx) {
         return Err(access_denied("you do not hold the Personnel Manager role"));
     }
-    let Some(old) = application(ctx.db, corp_id, char_id).await? else {
+    let Some(old) = ctx.store.read(|db| application(db, corp_id, char_id))? else {
         return Err(Outcome::custom("That application no longer exists."));
     };
     let allowed: &[i16] = match application_status(&old) {
@@ -239,7 +284,7 @@ async fn make_offer(ctx: &Ctx<'_>, char_id: i64, note: &str, status: i16) -> Ref
     if !allowed.contains(&status) {
         return Err(Outcome::custom("The application cannot be moved to that state now."));
     }
-    let new = set_application(ctx.db, &old, note, status).await?;
+    let new = ctx.store.write(|tx| set_application(tx, &old, note, status).map_err(Undone)).map_err(|Undone(o)| o)?;
     info!("corporation {corp_id} answered {char_id}'s application with status {status}");
     tell_application(ctx, corp_id, char_id, change(APPLICATION_HEADER, Some(&old), Some(&new)));
     Ok(Value::None)
@@ -249,7 +294,7 @@ async fn make_offer(ctx: &Ctx<'_>, char_id: i64, note: &str, status: i16) -> Ref
 /// corporation; accepting its offer makes them a member.
 async fn answer_offer(ctx: &Ctx<'_>, corp_id: i64, note: &str, status: i16) -> Refused<Value> {
     let char_id = ctx.session.char_id.ok_or_else(|| Outcome::custom("Select a character first."))?;
-    let Some(old) = application(ctx.db, corp_id, char_id).await? else {
+    let Some(old) = ctx.store.read(|db| application(db, corp_id, char_id))? else {
         return Err(Outcome::custom("That application no longer exists."));
     };
     let allowed: &[i16] = match application_status(&old) {
@@ -262,7 +307,7 @@ async fn answer_offer(ctx: &Ctx<'_>, corp_id: i64, note: &str, status: i16) -> R
         return Err(Outcome::custom("The application cannot be moved to that state now."));
     }
     if status != ACCEPTED_BY_CHARACTER {
-        let new = set_application(ctx.db, &old, note, status).await?;
+        let new = ctx.store.write(|tx| set_application(tx, &old, note, status).map_err(Undone)).map_err(|Undone(o)| o)?;
         tell_application(ctx, corp_id, char_id, change(APPLICATION_HEADER, Some(&old), Some(&new)));
         return Ok(Value::None);
     }
@@ -270,43 +315,39 @@ async fn answer_offer(ctx: &Ctx<'_>, corp_id: i64, note: &str, status: i16) -> R
     if ctx.session.station_id.is_none() {
         return Err(message("CrpCanNotChangeCorpInSpace"));
     }
-    if is_ceo(ctx.db, char_id).await? {
-        let names = ctx
-            .query_one(
-                r#"SELECT o."corporationName", n."corporationName"
-                     FROM "character_" c
-                     JOIN "corporation" o ON o."corporationID" = c."corporationID"
-                     JOIN "corporation" n ON n."corporationID" = $2
-                    WHERE c."characterID" = $1"#,
-                &[&(char_id as i32), &(corp_id as i32)],
-            )
-            .await;
-        let name = |i: usize| Value::text(names.as_ref().and_then(|r| text(r, i)).unwrap_or_default());
+    if ctx.store.read(|db| is_ceo(db, char_id))? {
+        let names = ctx.store.read(|db| {
+            let corps = db.table("corporation");
+            let old = corps.get_id(db.table("character_").get_id(char_id)?.int("corporationID")?)?;
+            let new = corps.get_id(corp_id)?;
+            Some([old.text("corporationName"), new.text("corporationName")].map(|n| n.unwrap_or_default().to_string()))
+        });
+        let name = |i: usize| Value::text(names.as_ref().map(|n| n[i].clone()).unwrap_or_default());
         return Err(Outcome::UserError {
             msg: "CeoCanNotJoinACorp".into(),
             args: vec![("CEOsCorporation".into(), name(0)), ("otherCorporation".into(), name(1))],
         });
     }
 
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let tx = client.transaction().await.map_err(|e| db_failed("BEGIN", e))?;
-    let room = tx
-        .query_one(
-            r#"SELECT "memberCount", "memberLimit" FROM "corporation" WHERE "corporationID" = $1 FOR UPDATE"#,
-            &[&(corp_id as i32)],
-        )
-        .await
-        .map_err(|e| db_failed("reading the member limit", e))?;
-    let (count, limit) = (int(&room, 0).unwrap_or(0), int(&room, 1).unwrap_or(0));
-    if count >= limit {
-        return Err(Outcome::UserError {
-            msg: "CorporationMembershipFull".into(),
-            args: vec![("limit".into(), Value::Int(limit)), ("count".into(), Value::Int(count))],
-        });
-    }
-    let new = set_application(&tx, &old, note, status).await?;
-    let left = change_corporation(&tx, char_id, corp_id, 0, crate::bulkdata::filetime_now()).await?;
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    let (new, left) = ctx
+        .store
+        .write(|tx| -> Result<_, Undone> {
+            let room = tx.table("corporation").get_id(corp_id).map(|c| (c.int("memberCount").unwrap_or(0), c.int("memberLimit").unwrap_or(0)));
+            let (count, limit) = room.ok_or_else(|| {
+                db_failed("reading the member limit", StoreError { code: store::DATA_EXCEPTION, message: format!("no corporation {corp_id}") })
+            })?;
+            if count >= limit {
+                return Err(Outcome::UserError {
+                    msg: "CorporationMembershipFull".into(),
+                    args: vec![("limit".into(), Value::Int(limit)), ("count".into(), Value::Int(count))],
+                }
+                .into());
+            }
+            let new = set_application(tx, &old, note, status)?;
+            let left = change_corporation(tx, char_id, corp_id, 0, crate::bulkdata::filetime_now())?;
+            Ok((new, left))
+        })
+        .map_err(|Undone(o)| o)?;
 
     info!("{char_id} left corporation {left} and joined {corp_id}");
     member_moved(ctx.world, char_id, left, corp_id);
@@ -323,13 +364,9 @@ async fn delete_application(ctx: &Ctx<'_>, corp_id: i64, char_id: i64) -> Refuse
     if !own && !corp_side {
         return Err(access_denied("that application is not yours to delete"));
     }
-    let Some(old) = application(ctx.db, corp_id, char_id).await? else { return Ok(Value::None) };
-    ctx.db
-        .execute(
-            r#"DELETE FROM "crpApplications" WHERE "corporationID" = $1 AND "characterID" = $2"#,
-            &[&(corp_id as i32), &(char_id as i32)],
-        )
-        .await
+    let Some(old) = ctx.store.read(|db| application(db, corp_id, char_id))? else { return Ok(Value::None) };
+    ctx.store
+        .write(|tx| tx.delete_where("crpApplications", &["corporationID", "characterID"], &[int(corp_id), int(char_id)]))
         .map_err(|e| db_failed("deleting the application", e))?;
     tell_application(ctx, corp_id, char_id, change(APPLICATION_HEADER, Some(&old), None));
     Ok(Value::None)
@@ -347,12 +384,9 @@ fn tell_application(ctx: &Ctx<'_>, corp_id: i64, char_id: i64, change: Value) {
     world.notify(&clients, "OnCorporationApplicationChanged", event);
 }
 
-async fn application(db: &impl GenericClient, corp_id: i64, char_id: i64) -> Refused<Option<Vec<Value>>> {
-    let sql = format!(r#"{APPLICATION_SELECT} WHERE "corporationID" = $1 AND "characterID" = $2 AND "deleted" = 0"#);
-    db.query_opt(sql.as_str(), &[&(corp_id as i32), &(char_id as i32)])
-        .await
-        .map(|r| r.as_ref().map(line))
-        .map_err(|e| db_failed("reading the application", e))
+fn application(db: &Db, corp_id: i64, char_id: i64) -> Refused<Option<Vec<Value>>> {
+    let found = db.table("crpApplications").get(&[int(corp_id), int(char_id)]).filter(|r| r.int("deleted") == Some(0));
+    Ok(found.map(|r| r.line(APPLICATION_HEADER)))
 }
 
 fn application_status(line: &[Value]) -> i16 {
@@ -364,16 +398,13 @@ fn application_line(corp_id: i64, char_id: i64, note: &str, when: i64, status: i
 }
 
 /// Moves an application to `status` with new text; returns its new line.
-async fn set_application(db: &impl GenericClient, old: &[Value], note: &str, status: i16) -> Refused<Vec<Value>> {
+fn set_application(tx: &mut Tx<'_>, old: &[Value], note: &str, status: i16) -> Refused<Vec<Value>> {
     let id = |i: usize| old.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
     let (corp_id, char_id) = (id(0), id(1));
-    db.execute(
-        r#"UPDATE "crpApplications" SET "applicationText" = $3, "status" = $4
-            WHERE "corporationID" = $1 AND "characterID" = $2"#,
-        &[&(corp_id as i32), &(char_id as i32), &note, &status],
-    )
-    .await
-    .map_err(|e| db_failed("updating the application", e))?;
+    if let Some(row) = tx.table("crpApplications").get(&[int(corp_id), int(char_id)]).map(|r| r.id) {
+        tx.update("crpApplications", row, &[("applicationText", text(note)), ("status", int(status.into()))])
+            .map_err(|e| db_failed("updating the application", e))?;
+    }
     let when = old.get(3).and_then(|v| v.as_i64()).unwrap_or(0);
     Ok(application_line(corp_id, char_id, note, when, status))
 }
@@ -389,16 +420,9 @@ pub async fn kick_out(ctx: &Ctx<'_>, char_id: i64) -> Refused<Value> {
     if !own && !ctx.session.has_corp_role(CORP_ROLE_DIRECTOR) {
         return Err(access_denied("only directors may kick members out"));
     }
-    let member = ctx
-        .query_one(
-            r#"SELECT c."corporationID", co."ceoID" FROM "character_" c
-                 JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                WHERE c."characterID" = $1"#,
-            &[&(char_id as i32)],
-        )
-        .await;
-    let Some(member) = member.filter(|r| int(r, 0) == Some(corp_id)) else { return Err(message("CrpCharNotInThisCorp")) };
-    if int(&member, 1) == Some(char_id) {
+    let member = ctx.store.read(|db| member_of(db, char_id));
+    let Some((_, ceo, _)) = member.filter(|m| m.0 == Some(corp_id)) else { return Err(message("CrpCharNotInThisCorp")) };
+    if ceo == Some(char_id) {
         return Err(access_denied("the CEO cannot leave the corporation"));
     }
     let in_space = if own { ctx.session.station_id.is_none() } else { ctx.world.lock().is_in_space(char_id) };
@@ -406,22 +430,22 @@ pub async fn kick_out(ctx: &Ctx<'_>, char_id: i64) -> Refused<Value> {
         return Err(message(if own { "CrpCanNotChangeCorpInSpace" } else { "CrpCanNotKickMemberInSpace" }));
     }
 
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let tx = client.transaction().await.map_err(|e| db_failed("BEGIN", e))?;
-    let home = tx
-        .query_opt(
-            r#"SELECT e."corporationID" FROM "chrEmployment" e
-                 JOIN "crpNPCCorporations" n ON n."corporationID" = e."corporationID"
-                WHERE e."characterID" = $1
-                ORDER BY e."startDate" DESC LIMIT 1"#,
-            &[&(char_id as i32)],
-        )
-        .await
-        .map_err(|e| db_failed("finding the NPC corporation to return to", e))?
-        .and_then(|r| int(&r, 0))
-        .ok_or_else(|| Outcome::custom("There is no NPC corporation for them to go back to."))?;
-    change_corporation(&tx, char_id, home, 0, crate::bulkdata::filetime_now()).await?;
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    let home = ctx
+        .store
+        .write(|tx| -> Result<_, Undone> {
+            // The NPC corporation they joined last.
+            let home = tx
+                .table("chrEmployment")
+                .find(&["characterID"], &[int(char_id)])
+                .filter(|e| e.int("corporationID").is_some_and(|c| npc_corporations().contains(&c)))
+                .filter_map(|e| Some((e.int("startDate")?, e.int("corporationID")?)))
+                .max_by_key(|(start, _)| *start)
+                .map(|(_, corp)| corp)
+                .ok_or_else(|| Outcome::custom("There is no NPC corporation for them to go back to."))?;
+            change_corporation(tx, char_id, home, 0, crate::bulkdata::filetime_now())?;
+            Ok(home)
+        })
+        .map_err(|Undone(o)| o)?;
     member_moved(ctx.world, char_id, corp_id, home);
 
     if own {
@@ -450,19 +474,12 @@ const ROLE_COLUMNS: [&str; 8] = [
 async fn update_member(ctx: &Ctx<'_>, char_id: i64, title: Option<String>, roles: &[Option<i64>]) -> Refused<Value> {
     let corp_id = ctx.session.corp_id.unwrap_or(0);
     let me = ctx.session.char_id.unwrap_or(0);
-    let r = ctx
-        .query_one(
-            r#"SELECT c."corporationID", co."ceoID", COALESCE(r."rolesAtAll", 0)
-                 FROM "character_" c
-                 JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                 LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
-                WHERE c."characterID" = $1"#,
-            &[&(char_id as i32)],
-        )
-        .await
-        .filter(|r| int(r, 0) == Some(corp_id))
+    let (_, ceo, held) = ctx
+        .store
+        .read(|db| member_of(db, char_id))
+        .filter(|m| m.0 == Some(corp_id))
         .ok_or_else(|| message("CrpCharNotInThisCorp"))?;
-    let (ceo, held) = (int(&r, 1).unwrap_or(0), int(&r, 2).unwrap_or(0));
+    let (ceo, held) = (ceo.unwrap_or(0), held);
     let caller_is_ceo = me == ceo;
     if !caller_is_ceo && !ctx.session.has_corp_role(CORP_ROLE_DIRECTOR) {
         return Err(access_denied("only the CEO and directors may change members"));
@@ -476,26 +493,27 @@ async fn update_member(ctx: &Ctx<'_>, char_id: i64, title: Option<String>, roles
     }
 
     if let Some(title) = &title {
-        ctx.db
-            .execute(r#"UPDATE "character_" SET "title" = $2 WHERE "characterID" = $1"#, &[&(char_id as i32), title])
-            .await
+        ctx.store
+            .write(|tx| match tx.table("character_").get_id(char_id).map(|c| c.id) {
+                Some(row) => tx.update("character_", row, &[("title", text(title))]),
+                None => Ok(()),
+            })
             .map_err(|e| db_failed("setting the title", e))?;
     }
     if roles.iter().any(Option::is_some) {
         // A member without a roles row starts from none; what is not given stays.
-        let id = char_id as i32;
-        ctx.db
-            .execute(r#"INSERT INTO "chrCorporationRoles" ("characterID") VALUES ($1) ON CONFLICT ("characterID") DO NOTHING"#, &[&id])
-            .await
-            .map_err(|e| db_failed("adding the roles", e))?;
-        let set: Vec<String> =
-            ROLE_COLUMNS.iter().enumerate().map(|(i, c)| format!(r#""{c}" = COALESCE(${}, "{c}")"#, i + 2)).collect();
-        let sql = format!(r#"UPDATE "chrCorporationRoles" SET {} WHERE "characterID" = $1"#, set.join(", "));
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id];
-        for r in roles.iter().take(ROLE_COLUMNS.len()) {
-            params.push(r);
-        }
-        ctx.db.execute(sql.as_str(), &params).await.map_err(|e| db_failed("setting the roles", e))?;
+        ctx.store
+            .write(|tx| -> Result<_, Undone> {
+                tx.insert_or_ignore("chrCorporationRoles", &[("characterID", int(char_id))])
+                    .map_err(|e| db_failed("adding the roles", e))?;
+                let set: Vec<(&str, store::Value)> =
+                    ROLE_COLUMNS.iter().zip(roles).filter_map(|(c, r)| r.map(|r| (*c, int(r)))).collect();
+                if let Some(row) = tx.table("chrCorporationRoles").get_id(char_id).map(|r| r.id) {
+                    tx.update("chrCorporationRoles", row, &set).map_err(|e| db_failed("setting the roles", e))?;
+                }
+                Ok(())
+            })
+            .map_err(|Undone(o)| o)?;
         if roles.first().copied().flatten().is_some_and(director) {
             info!("{me} made {char_id} a director of {corp_id}");
         }
@@ -525,15 +543,20 @@ async fn update_members(ctx: &Ctx<'_>, rows: Option<&Value>) -> Refused<Value> {
     Ok(Value::None)
 }
 
-async fn can_be_kicked_out(ctx: &Ctx<'_>, char_id: i64) -> bool {
-    let corp_id = ctx.session.corp_id.unwrap_or(0) as i32;
-    ctx.query_one(
-        r#"SELECT 1 FROM "character_" c JOIN "corporation" co ON co."corporationID" = c."corporationID"
-            WHERE c."characterID" = $1 AND c."corporationID" = $2 AND co."ceoID" <> $1"#,
-        &[&(char_id as i32), &corp_id],
-    )
-    .await
-    .is_some()
+fn can_be_kicked_out(ctx: &Ctx<'_>, char_id: i64) -> bool {
+    let corp_id = ctx.session.corp_id.unwrap_or(0);
+    ctx.store
+        .read(|db| member_of(db, char_id))
+        .is_some_and(|(corp, ceo, _)| corp == Some(corp_id) && ceo.is_some_and(|ceo| ceo != char_id))
+}
+
+/// A character's corporation, its CEO, and the character's roles (0 without
+/// a roles row); None for a character without a corporation that exists.
+fn member_of(db: &Db, char_id: i64) -> Option<(Option<i64>, Option<i64>, i64)> {
+    let corp = db.table("character_").get_id(char_id)?.int("corporationID");
+    let ceo = db.table("corporation").get_id(corp?)?.int("ceoID");
+    let roles = db.table("chrCorporationRoles").get_id(char_id).and_then(|r| r.int("rolesAtAll")).unwrap_or(0);
+    Some((corp, ceo, roles))
 }
 
 // ---- shared ----------------------------------------------------------------------------
@@ -541,44 +564,44 @@ async fn can_be_kicked_out(ctx: &Ctx<'_>, char_id: i64) -> bool {
 /// Moves a character into `corp_id` with `roles`, inside the caller's
 /// transaction: membership counts, the employment record and the roles.
 /// Returns the corporation they left.
-pub async fn change_corporation(tx: &Transaction<'_>, char_id: i64, corp_id: i64, roles: i64, now: i64) -> Refused<i64> {
-    let char32 = char_id as i32;
-    let old = tx
-        .query_one(
-            r#"UPDATE "character_" n SET "corporationID" = $2, "corporationDateTime" = $3
-                 FROM "character_" o
-                WHERE n."characterID" = $1 AND o."characterID" = $1
-               RETURNING o."corporationID""#,
-            &[&char32, &(corp_id as i32), &now],
-        )
-        .await
+pub fn change_corporation(tx: &mut Tx<'_>, char_id: i64, corp_id: i64, roles: i64, now: i64) -> Refused<i64> {
+    let (row, old_corp) = tx
+        .table("character_")
+        .get_id(char_id)
+        .map(|c| (c.id, c.int("corporationID").unwrap_or(0)))
+        .ok_or_else(|| db_failed("moving the character", StoreError { code: store::DATA_EXCEPTION, message: format!("no character {char_id}") }))?;
+    tx.update("character_", row, &[("corporationID", int(corp_id)), ("corporationDateTime", int(now))])
         .map_err(|e| db_failed("moving the character", e))?;
-    let old_corp = int(&old, 0).unwrap_or(0);
-    let counts = [(old_corp, -1i32), (corp_id, 1)];
+    let counts = [(old_corp, -1), (corp_id, 1)];
     for (corp, delta) in counts {
-        tx.execute(
-            r#"UPDATE "corporation" SET "memberCount" = GREATEST(0, "memberCount" + $2) WHERE "corporationID" = $1"#,
-            &[&(corp as i32), &delta],
-        )
-        .await
-        .map_err(|e| db_failed("counting members", e))?;
+        let Some((row, count)) = tx.table("corporation").get_id(corp).map(|c| (c.id, c.int("memberCount").unwrap_or(0))) else { continue };
+        tx.update("corporation", row, &[("memberCount", int((count + delta).max(0)))]).map_err(|e| db_failed("counting members", e))?;
     }
-    tx.execute(
-        r#"INSERT INTO "chrEmployment" ("characterID", "corporationID", "startDate", "deleted") VALUES ($1, $2, $3, 0)"#,
-        &[&char32, &(corp_id as i32), &now],
+    tx.insert(
+        "chrEmployment",
+        &[("characterID", int(char_id)), ("corporationID", int(corp_id)), ("startDate", int(now)), ("deleted", int(0))],
     )
-    .await
     .map_err(|e| db_failed("recording the employment", e))?;
-    tx.execute(
-        r#"INSERT INTO "chrCorporationRoles" ("characterID", "rolesAtAll", "grantableRoles")
-           VALUES ($1, $2, $2)
-           ON CONFLICT ("characterID") DO UPDATE
-              SET "corprole" = 0, "rolesAtAll" = $2, "rolesAtBase" = 0, "rolesAtHQ" = 0,
-                  "rolesAtOther" = 0, "grantableRoles" = $2, "grantableRolesAtHQ" = 0,
-                  "grantableRolesAtBase" = 0, "grantableRolesAtOther" = 0"#,
-        &[&char32, &roles],
+    let reset: Vec<(&str, store::Value)> = [
+        ("corprole", 0),
+        ("rolesAtAll", roles),
+        ("rolesAtBase", 0),
+        ("rolesAtHQ", 0),
+        ("rolesAtOther", 0),
+        ("grantableRoles", roles),
+        ("grantableRolesAtHQ", 0),
+        ("grantableRolesAtBase", 0),
+        ("grantableRolesAtOther", 0),
+    ]
+    .into_iter()
+    .map(|(c, v)| (c, int(v)))
+    .collect();
+    tx.upsert(
+        "chrCorporationRoles",
+        &["characterID"],
+        &[("characterID", int(char_id)), ("rolesAtAll", int(roles)), ("grantableRoles", int(roles))],
+        &reset,
     )
-    .await
     .map_err(|e| db_failed("setting the roles", e))?;
     Ok(old_corp)
 }
@@ -596,34 +619,28 @@ pub fn member_moved(world: &crate::world::World, char_id: i64, old_corp: i64, ne
     w.notify(&clients, "OnCorporationMemberChanged", Value::Tuple(vec![Value::Int(char_id), change]));
 }
 
+/// The NPC corporations (crpNPCCorporations), which no player runs.
+fn npc_corporations() -> &'static HashSet<i64> {
+    static IDS: std::sync::OnceLock<HashSet<i64>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| crate::sde::table("crpNPCCorporations").rows().filter_map(|r| r.int("corporationID")).collect())
+}
+
 /// Whether the character is the CEO of a player corporation.
-pub async fn is_ceo(db: &impl GenericClient, char_id: i64) -> Refused<bool> {
-    db.query_opt(
-        r#"SELECT 1 FROM "corporation" co
-            WHERE co."ceoID" = $1
-              AND NOT EXISTS (SELECT 1 FROM "crpNPCCorporations" n WHERE n."corporationID" = co."corporationID")"#,
-        &[&(char_id as i32)],
-    )
-    .await
-    .map(|r| r.is_some())
-    .map_err(|e| db_failed("checking for a CEO", e))
+pub fn is_ceo(db: &Db, char_id: i64) -> Refused<bool> {
+    let ceo_of = db.table("corporation").find(&["ceoID"], &[int(char_id)]);
+    Ok(ceo_of.filter_map(|co| co.int("corporationID")).any(|id| !npc_corporations().contains(&id)))
 }
 
-pub async fn is_player_corp(db: &impl GenericClient, corp_id: i64) -> Refused<bool> {
-    db.query_opt(
-        r#"SELECT 1 FROM "corporation" co
-            WHERE co."corporationID" = $1 AND co."deleted" = 0
-              AND NOT EXISTS (SELECT 1 FROM "crpNPCCorporations" n WHERE n."corporationID" = co."corporationID")"#,
-        &[&(corp_id as i32)],
-    )
-    .await
-    .map(|r| r.is_some())
-    .map_err(|e| db_failed("reading the corporation", e))
+pub fn is_player_corp(db: &Db, corp_id: i64) -> Refused<bool> {
+    let corp = db.table("corporation").get_id(corp_id).filter(|co| co.int("deleted") == Some(0));
+    Ok(corp.is_some() && !npc_corporations().contains(&corp_id))
 }
 
-/// Whether `sql` (taking one text parameter) finds a row: a name in use.
-pub async fn exists(db: &impl GenericClient, sql: &str, value: &str) -> Refused<bool> {
-    db.query_opt(sql, &[&value]).await.map(|r| r.is_some()).map_err(|e| db_failed("checking a name", e))
+/// Whether a row of `table` has `value` in `column`, ignoring case (as
+/// SQL's `lower()` compares): a name in use.
+pub fn exists(db: &Db, table: &str, column: &str, value: &str) -> bool {
+    let value = value.to_lowercase();
+    db.table(table).rows().any(|r| r.text(column).is_some_and(|t| t.to_lowercase() == value))
 }
 
 fn may_manage_personnel(ctx: &Ctx<'_>) -> bool {
@@ -658,12 +675,11 @@ pub fn ticker_ok(ticker: &str) -> bool {
 }
 
 /// Tickers made from a name: its initials, its first letters, then those
-/// with a digit; the ones `taken_sql` (a query of the names in use) does
-/// not list.
-pub async fn free_tickers(ctx: &Ctx<'_>, taken_sql: &str, name: &str) -> Vec<String> {
+/// with a digit; the ones no row of `table` holds in `column` (the tickers
+/// in use, compared in upper case).
+pub async fn free_tickers(ctx: &Ctx<'_>, table: &str, column: &str, name: &str) -> Vec<String> {
     let candidates = ticker_candidates(name);
-    let sql = format!(r#"SELECT upper(t) FROM ({taken_sql}) AS used(t) WHERE upper(t) = ANY($1)"#);
-    let taken: Vec<String> = ctx.query(&sql, &[&candidates]).await.iter().filter_map(|r| text(r, 0)).collect();
+    let taken: HashSet<String> = ctx.store.read(|db| db.table(table).rows().filter_map(|r| r.text(column)).map(str::to_uppercase).collect());
     candidates.into_iter().filter(|c| !taken.contains(c)).take(8).collect()
 }
 
@@ -704,7 +720,7 @@ pub fn access_denied(reason: &str) -> Outcome {
     Outcome::UserError { msg: "CrpAccessDenied".into(), args: vec![("reason".into(), Value::text(reason))] }
 }
 
-pub fn db_failed(what: &str, e: tokio_postgres::Error) -> Outcome {
+pub fn db_failed(what: &str, e: StoreError) -> Outcome {
     error!("{what}: {}", crate::logging::chain(&e));
     Outcome::custom("The corporation registry could not do that just now.")
 }

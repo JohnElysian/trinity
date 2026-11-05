@@ -17,13 +17,13 @@
 //! the corporation if nobody else is left.
 
 use eve_marshal::Value;
-use tokio_postgres::{Client, GenericClient};
 use tracing::{error, info};
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::CORP_ROLE_DIRECTOR;
+use crate::store::{self, Db, Row, Store, StoreError, Tx};
 use crate::svc::membership::{access_denied, db_failed, message, Refused};
-use crate::svc::rows::{change, index_rowset, int, line, text};
+use crate::svc::rows::{change, index_rowset};
 use crate::world::World;
 
 /// eveConstants vote*.
@@ -38,20 +38,58 @@ const ACT_WITHIN: i64 = 7 * 24 * 3_600 * 10_000_000;
 
 const CASE_HEADER: &[&str] =
     &["voteCaseID", "corporationID", "voteType", "voteCaseText", "description", "startDateTime", "endDateTime"];
-const CASE_SELECT: &str = r#"SELECT "voteCaseID", "corporationID", "voteType", "voteCaseText", "description",
-                                    "startDateTime", "endDateTime" FROM "crpVoteCases""#;
 const OPTION_HEADER: &[&str] = &["voteCaseID", "optionID", "optionText", "parameter", "parameter1", "parameter2", "votesFor"];
 const VOTE_HEADER: &[&str] = &["voteCaseID", "characterID", "optionID"];
 const SANCTION_HEADER: &[&str] = &[
     "voteCaseID", "corporationID", "voteType", "optionID", "parameter", "parameter1", "parameter2",
     "expires", "actedUpon", "inEffect", "timeActedUpon", "timeRescended", "reason",
 ];
-const SANCTION_SELECT: &str = r#"
-    SELECT s."voteCaseID", s."corporationID", c."voteType", s."optionID", o."parameter", o."parameter1", o."parameter2",
-           s."expires", s."actedUpon", s."inEffect", s."timeActedUpon", s."timeRescended", s."reason"
-      FROM "crpSanctionedActions" s
-      JOIN "crpVoteCases" c ON c."voteCaseID" = s."voteCaseID"
-      LEFT JOIN "crpVoteOptions" o ON o."voteCaseID" = s."voteCaseID" AND o."optionID" = s."optionID""#;
+
+/// A refusal from inside a store write, which undoes the write.
+struct Failed(Outcome);
+
+impl From<Outcome> for Failed {
+    fn from(o: Outcome) -> Self {
+        Failed(o)
+    }
+}
+
+impl From<StoreError> for Failed {
+    fn from(e: StoreError) -> Self {
+        Failed(db_failed("writing", e))
+    }
+}
+
+fn int(v: i64) -> store::Value {
+    store::Value::Int(v)
+}
+
+/// A sanctioned action as the client is sent it: with its vote's type and
+/// the chosen option's parameters (None where the option is gone). None if
+/// its vote is gone.
+fn sanction_line(db: &Db, s: &Row) -> Option<Vec<Value>> {
+    let case = s.value("voteCaseID").clone();
+    let c = db.table("crpVoteCases").get(std::slice::from_ref(&case))?;
+    let o = s.int("optionID").and_then(|option| db.table("crpVoteOptions").get(&[case, int(option)]));
+    let option = |col: &str| o.map_or(Value::None, |o| o.cell(col));
+    Some(vec![
+        s.cell("voteCaseID"), s.cell("corporationID"), c.cell("voteType"), s.cell("optionID"),
+        option("parameter"), option("parameter1"), option("parameter2"),
+        s.cell("expires"), s.cell("actedUpon"), s.cell("inEffect"), s.cell("timeActedUpon"), s.cell("timeRescended"), s.cell("reason"),
+    ])
+}
+
+/// The shares behind one option of a vote: what each who chose it holds in
+/// the vote's corporation.
+fn votes_for(db: &Db, case: i64, corp: i64, option: i64) -> i64 {
+    let shares = db.table("crpCharShares");
+    db.table("crpVotes")
+        .find(&["voteCaseID"], &[int(case)])
+        .filter(|v| v.int("optionID") == Some(option))
+        .filter_map(|v| shares.get(&[v.value("characterID").clone(), int(corp)]))
+        .filter_map(|sh| sh.int("shares"))
+        .sum()
+}
 
 pub async fn corp_registry(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let corp = call.arg_id(0);
@@ -88,53 +126,63 @@ async fn viewer(ctx: &Ctx<'_>, corp: i64) -> Refused<()> {
     if ctx.session.corp_id == Some(corp) && ctx.session.has_corp_role(CORP_ROLE_DIRECTOR) {
         return Ok(());
     }
-    if shares_of(ctx.db, corp, ctx.session.char_id.unwrap_or(0)).await > 0 {
+    if ctx.store.read(|db| shares_of(db, corp, ctx.session.char_id.unwrap_or(0))) > 0 {
         return Ok(());
     }
     Err(access_denied("you must be the CEO, a director or a shareholder"))
 }
 
-async fn shares_of(db: &impl GenericClient, corp: i64, char_id: i64) -> i64 {
-    let sql = r#"SELECT COALESCE(sum("shares"), 0)::bigint FROM "crpCharShares" WHERE "corporationID" = $1 AND "characterID" = $2"#;
-    db.query_opt(sql, &[&(corp as i32), &(char_id as i32)]).await.ok().flatten().map_or(0, |r| r.get(0))
+fn shares_of(db: &Db, corp: i64, char_id: i64) -> i64 {
+    db.table("crpCharShares").get(&[int(char_id), int(corp)]).and_then(|r| r.int("shares")).unwrap_or(0)
 }
 
 async fn cases(ctx: &Ctx<'_>, corp: i64) -> Value {
-    let sql = format!(r#"{CASE_SELECT} WHERE "corporationID" = $1 ORDER BY "voteCaseID""#);
-    keyed(ctx, CASE_HEADER, &sql, corp, 0).await
+    let lines = ctx.store.read(|db| {
+        let mut rows: Vec<Row> = db.table("crpVoteCases").find(&["corporationID"], &[int(corp)]).collect();
+        rows.sort_by_key(|r| r.int("voteCaseID"));
+        rows.iter().map(|r| r.line(CASE_HEADER)).collect()
+    });
+    keyed(CASE_HEADER, lines, 0)
 }
 
 /// The options, with the shares behind each so far.
 async fn options(ctx: &Ctx<'_>, case: i64) -> Value {
-    let sql = r#"SELECT o."voteCaseID", o."optionID", o."optionText", o."parameter", o."parameter1", o."parameter2",
-                        COALESCE((SELECT sum(sh."shares") FROM "crpVotes" v
-                                    JOIN "crpVoteCases" c ON c."voteCaseID" = v."voteCaseID"
-                                    JOIN "crpCharShares" sh ON sh."characterID" = v."characterID" AND sh."corporationID" = c."corporationID"
-                                   WHERE v."voteCaseID" = o."voteCaseID" AND v."optionID" = o."optionID"), 0)::integer
-                   FROM "crpVoteOptions" o WHERE o."voteCaseID" = $1 ORDER BY o."optionID""#;
-    keyed(ctx, OPTION_HEADER, sql, case, 1).await
+    let lines = ctx.store.read(|db| {
+        let corp = db.table("crpVoteCases").get_id(case).and_then(|c| c.int("corporationID"));
+        let mut rows: Vec<Row> = db.table("crpVoteOptions").find(&["voteCaseID"], &[int(case)]).collect();
+        rows.sort_by_key(|r| r.int("optionID"));
+        rows.iter()
+            .map(|r| {
+                let mut l = r.line(&OPTION_HEADER[..6]);
+                let shares = corp.zip(r.int("optionID")).map_or(0, |(corp, option)| votes_for(db, case, corp, option));
+                l.push(Value::Int(shares));
+                l
+            })
+            .collect()
+    });
+    keyed(OPTION_HEADER, lines, 1)
 }
 
 async fn votes(ctx: &Ctx<'_>, case: i64) -> Value {
-    let sql = r#"SELECT "voteCaseID", "characterID", "optionID" FROM "crpVotes" WHERE "voteCaseID" = $1 ORDER BY "characterID""#;
-    keyed(ctx, VOTE_HEADER, sql, case, 1).await
+    let lines = ctx.store.read(|db| {
+        let mut rows: Vec<Row> = db.table("crpVotes").find(&["voteCaseID"], &[int(case)]).collect();
+        rows.sort_by_key(|r| r.int("characterID"));
+        rows.iter().map(|r| r.line(VOTE_HEADER)).collect()
+    });
+    keyed(VOTE_HEADER, lines, 1)
 }
 
 async fn sanctions(ctx: &Ctx<'_>, corp: i64) -> Value {
-    let sql = format!(r#"{SANCTION_SELECT} WHERE s."corporationID" = $1 ORDER BY s."voteCaseID""#);
-    keyed(ctx, SANCTION_HEADER, &sql, corp, 0).await
+    let lines = ctx.store.read(|db| {
+        let mut rows: Vec<Row> = db.table("crpSanctionedActions").find(&["corporationID"], &[int(corp)]).collect();
+        rows.sort_by_key(|r| r.int("voteCaseID"));
+        rows.iter().filter_map(|r| sanction_line(db, r)).collect()
+    });
+    keyed(SANCTION_HEADER, lines, 0)
 }
 
-async fn keyed(ctx: &Ctx<'_>, header: &[&str], sql: &str, id: i64, key: usize) -> Value {
-    let items = ctx
-        .query(sql, &[&(id as i32)])
-        .await
-        .iter()
-        .map(|r| {
-            let l = line(r);
-            (l[key].clone(), Value::List(l))
-        })
-        .collect();
+fn keyed(header: &[&str], lines: Vec<Vec<Value>>, key: usize) -> Value {
+    let items = lines.into_iter().map(|l| (l[key].clone(), Value::List(l))).collect();
     index_rowset(header, header[key], items)
 }
 
@@ -151,7 +199,7 @@ async fn propose(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
         if ctx.session.corp_id != Some(corp) || !ctx.session.has_corp_role(CORP_ROLE_DIRECTOR) {
             return Err(message("CrpOnlyDirectorsCanProposeVotes"));
         }
-        if ceo_vote_open(ctx.db, corp).await {
+        if ctx.store.read(|db| ceo_vote_open(db, corp)) {
             return Err(message("CEOCantAddVoteInCEOVotePeriod"));
         }
     }
@@ -167,34 +215,48 @@ async fn propose(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     if vote_type == VOTE_CEO && !lines.iter().all(|l| matches!(l.get(1).and_then(|v| v.as_i64()), Some(0) | None) || l.get(1).and_then(|v| v.as_i64()) == Some(me)) {
         return Err(message("CantRunForCEOAtTheMoment"));
     }
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let tx = client.transaction().await.map_err(|e| db_failed("BEGIN", e))?;
-    let case: i32 = tx
-        .query_one(
-            r#"INSERT INTO "crpVoteCases" ("voteCaseID", "corporationID", "voteType", "voteCaseText", "description", "startDateTime", "endDateTime")
-               VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, $5, $6) RETURNING "voteCaseID""#,
-            &[&(corp as i32), &(vote_type as i16), &text, &description, &start, &end],
-        )
-        .await
-        .map_err(|e| db_failed("recording the vote", e))?
-        .get(0);
-    for (i, l) in lines.iter().enumerate() {
-        let param = |k: usize| l.get(k).and_then(|v| v.as_i64()).map(|v| v as i32);
-        tx.execute(
-            r#"INSERT INTO "crpVoteOptions" ("voteCaseID", "optionID", "optionText", "parameter", "parameter1", "parameter2")
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
-            &[&case, &(i as i32 + 1), &l.first().and_then(|v| v.as_string()).unwrap_or_default(), &param(1), &param(2), &param(3)],
-        )
-        .await
-        .map_err(|e| db_failed("recording an option", e))?;
-    }
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    let case = ctx
+        .store
+        .write(|tx| -> Result<i64, Failed> {
+            let case = tx.nextval("dyn_id_seq")?;
+            tx.insert(
+                "crpVoteCases",
+                &[
+                    ("voteCaseID", int(case)),
+                    ("corporationID", int(corp)),
+                    ("voteType", int(vote_type)),
+                    ("voteCaseText", store::Value::Text(text.as_str().into())),
+                    ("description", store::Value::Text(description.as_str().into())),
+                    ("startDateTime", int(start)),
+                    ("endDateTime", int(end)),
+                ],
+            )
+            .map_err(|e| db_failed("recording the vote", e))?;
+            for (i, l) in lines.iter().enumerate() {
+                let param = |k: usize| l.get(k).and_then(|v| v.as_i64()).map_or(store::Value::Null, int);
+                let option_text = l.first().and_then(|v| v.as_string()).unwrap_or_default();
+                tx.insert(
+                    "crpVoteOptions",
+                    &[
+                        ("voteCaseID", int(case)),
+                        ("optionID", int(i as i64 + 1)),
+                        ("optionText", store::Value::Text(option_text.into())),
+                        ("parameter", param(1)),
+                        ("parameter1", param(2)),
+                        ("parameter2", param(3)),
+                    ],
+                )
+                .map_err(|e| db_failed("recording an option", e))?;
+            }
+            Ok(case)
+        })
+        .map_err(|Failed(o)| o)?;
     let new = vec![
-        Value::Int(case.into()), Value::Int(corp), Value::Int(vote_type), Value::text(&text), Value::text(&description),
+        Value::Int(case), Value::Int(corp), Value::Int(vote_type), Value::text(&text), Value::text(&description),
         Value::Long(start), Value::Long(end),
     ];
     info!("corporation {corp} put vote {case} ({text:?}) to its shareholders");
-    tell(ctx.world, corp, "OnCorporationVoteCaseChanged", vec![Value::Int(corp), Value::Int(case.into()), change(CASE_HEADER, None, Some(&new))]);
+    tell(ctx.world, corp, "OnCorporationVoteCaseChanged", vec![Value::Int(corp), Value::Int(case), change(CASE_HEADER, None, Some(&new))]);
     Ok(Value::None)
 }
 
@@ -213,31 +275,28 @@ fn rowset_lines(v: Option<&Value>) -> Vec<Vec<Value>> {
 /// while the vote is open.
 async fn vote(ctx: &Ctx<'_>, corp: i64, case: i64, option: i64) -> Refused<Value> {
     let char_id = ctx.session.char_id.unwrap_or(0);
-    if shares_of(ctx.db, corp, char_id).await <= 0 {
+    if ctx.store.read(|db| shares_of(db, corp, char_id)) <= 0 {
         return Err(access_denied("only shareholders may vote"));
     }
     let now = crate::bulkdata::filetime_now();
-    let open = ctx
-        .query_one(
-            r#"SELECT 1 FROM "crpVoteCases" c JOIN "crpVoteOptions" o ON o."voteCaseID" = c."voteCaseID"
-                WHERE c."voteCaseID" = $1 AND c."corporationID" = $2 AND o."optionID" = $3
-                  AND c."startDateTime" <= $4 AND c."endDateTime" > $4"#,
-            &[&(case as i32), &(corp as i32), &(option as i32), &now],
-        )
-        .await
-        .is_some();
+    let open = ctx.store.read(|db| {
+        let case_open = db.table("crpVoteCases").get_id(case).is_some_and(|c| {
+            c.int("corporationID") == Some(corp)
+                && c.int("startDateTime").is_some_and(|s| s <= now)
+                && c.int("endDateTime").is_some_and(|e| e > now)
+        });
+        case_open && db.table("crpVoteOptions").get(&[int(case), int(option)]).is_some()
+    });
     if !open {
         return Err(Outcome::custom("That vote is not open."));
     }
     let added = ctx
-        .db
-        .execute(
-            r#"INSERT INTO "crpVotes" ("voteCaseID", "characterID", "optionID") VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"#,
-            &[&(case as i32), &(char_id as i32), &(option as i32)],
-        )
-        .await
+        .store
+        .write(|tx| {
+            tx.insert_or_ignore("crpVotes", &[("voteCaseID", int(case)), ("characterID", int(char_id)), ("optionID", int(option))])
+        })
         .map_err(|e| db_failed("recording the vote", e))?;
-    if added == 0 {
+    if added.is_none() {
         return Err(message("CrpAlreadyVoted"));
     }
     let new = vec![Value::Int(case), Value::Int(char_id), Value::Int(option)];
@@ -249,18 +308,18 @@ async fn vote(ctx: &Ctx<'_>, corp: i64, case: i64, option: i64) -> Refused<Value
 /// sanctioned action into effect, or rescinds it.
 async fn act(ctx: &Ctx<'_>, case: i64, in_effect: bool, reason: &str) -> Refused<Value> {
     let corp = ctx.session.corp_id.unwrap_or(0);
-    let ceo = ctx
-        .query_one(r#"SELECT "ceoID" FROM "corporation" WHERE "corporationID" = $1"#, &[&(corp as i32)])
-        .await
-        .and_then(|r| int(&r, 0));
+    let ceo = ctx.store.read(|db| ceo_of(db, corp));
     if ceo != ctx.session.char_id {
         return Err(access_denied("only the CEO may act on what the shareholders sanctioned"));
     }
-    let sql = format!(r#"{SANCTION_SELECT} WHERE s."voteCaseID" = $1 AND s."corporationID" = $2"#);
     let old = ctx
-        .query_one(&sql, &[&(case as i32), &(corp as i32)])
-        .await
-        .map(|r| line(&r))
+        .store
+        .read(|db| {
+            db.table("crpSanctionedActions")
+                .get_id(case)
+                .filter(|s| s.int("corporationID") == Some(corp))
+                .and_then(|s| sanction_line(db, &s))
+        })
         .ok_or_else(|| Outcome::custom("There is no such sanctioned action."))?;
     let at = |i: usize| old[i].as_i64();
     let now = crate::bulkdata::filetime_now();
@@ -277,17 +336,20 @@ async fn act(ctx: &Ctx<'_>, case: i64, in_effect: bool, reason: &str) -> Refused
         }
         carry_out(ctx, corp, vote_type, parameter, at(5), at(6)).await?;
     }
-    let saved = ctx
-        .db
-        .execute(
-            r#"UPDATE "crpSanctionedActions"
-                  SET "inEffect" = $2, "actedUpon" = 1, "reason" = $3,
-                      "timeActedUpon" = CASE WHEN $2 = 1 THEN $4 ELSE "timeActedUpon" END,
-                      "timeRescended" = CASE WHEN $2 = 0 THEN $4 ELSE "timeRescended" END
-                WHERE "voteCaseID" = $1"#,
-            &[&(case as i32), &i16::from(in_effect), &reason, &now],
+    let saved = ctx.store.write(|tx| {
+        let Some(row) = tx.table("crpSanctionedActions").get_id(case).map(|s| s.id) else { return Ok(()) };
+        let when = if in_effect { "timeActedUpon" } else { "timeRescended" };
+        tx.update(
+            "crpSanctionedActions",
+            row,
+            &[
+                ("inEffect", int(in_effect.into())),
+                ("actedUpon", int(1)),
+                ("reason", store::Value::Text(reason.into())),
+                (when, int(now)),
+            ],
         )
-        .await;
+    });
     saved.map_err(|e| db_failed("recording the action", e))?;
     let mut new = old.clone();
     new[8] = Value::Int(1);
@@ -310,25 +372,32 @@ async fn carry_out(ctx: &Ctx<'_>, corp: i64, vote_type: i64, parameter: i64, typ
         }
         VOTE_KICK_MEMBER => crate::svc::membership::kick_out(ctx, parameter).await.map(|_| ()),
         VOTE_SHARES => ctx
-            .db
-            .execute(r#"UPDATE "corporation" SET "shares" = "shares" + $2 WHERE "corporationID" = $1"#, &[&(corp as i32), &parameter])
-            .await
-            .map(|_| ())
+            .store
+            .write(|tx| {
+                let Some((row, shares)) = tx.table("corporation").get_id(corp).map(|c| (c.id, c.int("shares").unwrap_or(0))) else { return Ok(()) };
+                tx.update("corporation", row, &[("shares", int(shares + parameter))])
+            })
             .map_err(|e| db_failed("creating shares", e)),
         VOTE_ITEM_LOCKDOWN => ctx
-            .db
-            .execute(
-                r#"INSERT INTO "crpItemLocks" ("corporationID", "itemID", "locationID", "typeID", "lockedAt") VALUES ($1, $2, $3, $4, $5)"#,
-                &[&(corp as i32), &(parameter as i32), &location.map(|l| l as i32), &type_id.map(|t| t as i32), &crate::bulkdata::filetime_now()],
-            )
-            .await
-            .map(|_| ())
+            .store
+            .write(|tx| {
+                let optional = |v: Option<i64>| v.map_or(store::Value::Null, int);
+                tx.insert(
+                    "crpItemLocks",
+                    &[
+                        ("corporationID", int(corp)),
+                        ("itemID", int(parameter)),
+                        ("locationID", optional(location)),
+                        ("typeID", optional(type_id)),
+                        ("lockedAt", int(crate::bulkdata::filetime_now())),
+                    ],
+                )
+                .map(|_| ())
+            })
             .map_err(|e| db_failed("locking the item", e)),
         VOTE_ITEM_UNLOCK => ctx
-            .db
-            .execute(r#"DELETE FROM "crpItemLocks" WHERE "corporationID" = $1 AND "itemID" = $2"#, &[&(corp as i32), &(parameter as i32)])
-            .await
-            .map(|_| ())
+            .store
+            .write(|tx| tx.delete_where("crpItemLocks", &["corporationID", "itemID"], &[int(corp), int(parameter)]).map(|_| ()))
             .map_err(|e| db_failed("unlocking the item", e)),
         _ => Ok(()),
     }
@@ -340,16 +409,14 @@ async fn carry_out(ctx: &Ctx<'_>, corp: i64, vote_type: i64, parameter: i64, typ
 /// is not its CEO, has Corporation Management, and no election is open.
 async fn can_run(ctx: &Ctx<'_>) -> Refused<()> {
     let (corp, me) = (ctx.session.corp_id.unwrap_or(0), ctx.session.char_id.unwrap_or(0));
-    let ceo = ctx
-        .query_one(r#"SELECT "ceoID" FROM "corporation" WHERE "corporationID" = $1"#, &[&(corp as i32)])
-        .await
-        .and_then(|r| int(&r, 0));
-    let player = crate::svc::membership::is_player_corp(ctx.db, corp).await.unwrap_or(false);
-    let skilled = crate::svc::skills::levels(ctx.db, me, &[SKILL_CORPORATION_MANAGEMENT])
-        .await
-        .map(|l| l.get(&SKILL_CORPORATION_MANAGEMENT).copied().unwrap_or(0) > 0)
-        .unwrap_or(false);
-    if !player || ceo == Some(me) || !skilled || ceo_vote_open(ctx.db, corp).await {
+    let (ceo, player, skilled, open) = ctx.store.read(|db| {
+        let player = crate::svc::membership::is_player_corp(db, corp).unwrap_or(false);
+        let skilled = crate::svc::skills::levels(db, me, &[SKILL_CORPORATION_MANAGEMENT])
+            .map(|l| l.get(&SKILL_CORPORATION_MANAGEMENT).copied().unwrap_or(0) > 0)
+            .unwrap_or(false);
+        (ceo_of(db, corp), player, skilled, ceo_vote_open(db, corp))
+    });
+    if !player || ceo == Some(me) || !skilled || open {
         return Err(message("CantRunForCEOAtTheMoment"));
     }
     Ok(())
@@ -358,9 +425,16 @@ async fn can_run(ctx: &Ctx<'_>) -> Refused<()> {
 /// typeCorporationManagement.
 const SKILL_CORPORATION_MANAGEMENT: i32 = 3363;
 
-async fn ceo_vote_open(db: &impl GenericClient, corp: i64) -> bool {
-    let sql = r#"SELECT 1 FROM "crpVoteCases" WHERE "corporationID" = $1 AND "voteType" = $2 AND "endDateTime" > $3"#;
-    db.query_opt(sql, &[&(corp as i32), &(VOTE_CEO as i16), &crate::bulkdata::filetime_now()]).await.ok().flatten().is_some()
+fn ceo_vote_open(db: &Db, corp: i64) -> bool {
+    let now = crate::bulkdata::filetime_now();
+    db.table("crpVoteCases")
+        .find(&["corporationID"], &[int(corp)])
+        .any(|c| c.int("voteType") == Some(VOTE_CEO) && c.int("endDateTime").is_some_and(|e| e > now))
+}
+
+/// A corporation's CEO.
+fn ceo_of(db: &Db, corp: i64) -> Option<i64> {
+    db.table("corporation").get_id(corp).and_then(|c| c.int("ceoID"))
 }
 
 /// ResignFromCEO(newCeoID=None): without a successor, the members to choose
@@ -368,27 +442,21 @@ async fn ceo_vote_open(db: &impl GenericClient, corp: i64) -> bool {
 /// take over.
 async fn resign(ctx: &Ctx<'_>, successor: Option<i64>) -> Refused<Value> {
     let (corp, me) = (ctx.session.corp_id.unwrap_or(0), ctx.session.char_id.unwrap_or(0));
-    let ceo = ctx
-        .query_one(r#"SELECT "ceoID" FROM "corporation" WHERE "corporationID" = $1"#, &[&(corp as i32)])
-        .await
-        .and_then(|r| int(&r, 0));
+    let ceo = ctx.store.read(|db| ceo_of(db, corp));
     if ceo != Some(me) {
         return Err(message("OnlyCEOCanResign"));
     }
     if ctx.session.station_id.is_none() {
         return Err(message("CrpCanNotChangeCorpInSpace"));
     }
-    let others: Vec<i64> = ctx
-        .query(r#"SELECT "characterID" FROM "character_" WHERE "corporationID" = $1 AND "characterID" <> $2"#, &[&(corp as i32), &(me as i32)])
-        .await
-        .iter()
-        .filter_map(|r| int(r, 0))
-        .collect();
+    let others: Vec<i64> = ctx.store.read(|db| {
+        db.table("character_").find(&["corporationID"], &[int(corp)]).filter_map(|r| r.int("characterID")).filter(|id| *id != me).collect()
+    });
     match successor {
         None if others.is_empty() => close(ctx, corp, me).await.map(|_| Value::None),
         None => Ok(Value::List(others.into_iter().map(Value::Int).collect())),
         Some(next) if others.contains(&next) => {
-            hand_over(ctx.db, ctx.world, corp, me, next).await?;
+            ctx.store.write(|tx| hand_over(tx, ctx.world, corp, me, next).map_err(Failed)).map_err(|Failed(o)| o)?;
             announce_resignation(ctx, corp, me, next).await;
             Ok(Value::None)
         }
@@ -397,17 +465,17 @@ async fn resign(ctx: &Ctx<'_>, successor: Option<i64>) -> Refused<Value> {
 }
 
 /// A new CEO takes over: they get every role, and both sessions are told.
-pub async fn hand_over(db: &impl GenericClient, world: &World, corp: i64, old: i64, new: i64) -> Refused<()> {
-    db.execute(r#"UPDATE "corporation" SET "ceoID" = $2 WHERE "corporationID" = $1"#, &[&(corp as i32), &(new as i32)])
-        .await
-        .map_err(|e| db_failed("changing the CEO", e))?;
-    let all = crate::svc::membership::ALL_ROLES;
-    db.execute(
-        r#"INSERT INTO "chrCorporationRoles" ("characterID", "rolesAtAll", "grantableRoles") VALUES ($1, $2, $2)
-           ON CONFLICT ("characterID") DO UPDATE SET "rolesAtAll" = $2, "grantableRoles" = $2"#,
-        &[&(new as i32), &all],
+pub fn hand_over(tx: &mut Tx<'_>, world: &World, corp: i64, old: i64, new: i64) -> Refused<()> {
+    if let Some(row) = tx.table("corporation").get_id(corp).map(|c| c.id) {
+        tx.update("corporation", row, &[("ceoID", int(new))]).map_err(|e| db_failed("changing the CEO", e))?;
+    }
+    let all = int(crate::svc::membership::ALL_ROLES);
+    tx.upsert(
+        "chrCorporationRoles",
+        &["characterID"],
+        &[("characterID", int(new)), ("rolesAtAll", all.clone()), ("grantableRoles", all.clone())],
+        &[("rolesAtAll", all.clone()), ("grantableRoles", all)],
     )
-    .await
     .map_err(|e| db_failed("giving the CEO their roles", e))?;
     info!("{new} is the new CEO of corporation {corp}, after {old}");
     let c = Value::Dict(vec![(Value::bytes("ceoID"), Value::Tuple(vec![Value::Int(old), Value::Int(new)]))]);
@@ -419,14 +487,14 @@ pub async fn hand_over(db: &impl GenericClient, world: &World, corp: i64, old: i
 /// A mail to the corporation's mailbox, from the outgoing CEO, naming who
 /// takes over.
 async fn announce_resignation(ctx: &Ctx<'_>, corp: i64, old: i64, new: i64) {
-    let sql = r#"SELECT (SELECT "characterName" FROM "character_" WHERE "characterID" = $1),
-                        (SELECT "characterName" FROM "character_" WHERE "characterID" = $2),
-                        (SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $3)"#;
-    let Some(r) = ctx.query_one(sql, &[&(old as i32), &(new as i32), &(corp as i32)]).await else { return };
-    let name = |i| text(&r, i).unwrap_or_default();
+    let names = ctx.store.read(|db| {
+        let name = |table: &str, id: i64, col: &str| db.table(table).get_id(id).and_then(|r| r.text(col)).unwrap_or_default().to_string();
+        [name("character_", old, "characterName"), name("character_", new, "characterName"), name("corporation", corp, "corporationName")]
+    });
+    let name = |i: usize| names[i].as_str();
     let subject = format!("{} has resigned as CEO", name(0));
     let body = format!("{} has resigned as CEO of {}.<br>{} is the new CEO.", name(0), name(2), name(1));
-    if let Err(e) = crate::svc::chat::deliver(ctx.db, ctx.world, old, &[corp], &subject, &body).await {
+    if let Err(e) = ctx.store.write(|tx| crate::svc::chat::deliver(tx, ctx.world, old, &[corp], &subject, &body)) {
         error!("mailing corporation {corp} about its new CEO: {}", crate::logging::chain(&e));
     }
 }
@@ -437,24 +505,28 @@ async fn close(ctx: &Ctx<'_>, corp: i64, me: i64) -> Refused<()> {
     if ctx.session.alliance_id.is_some() {
         return Err(message("CanNotDestroyCorpInAlliance"));
     }
-    let mut client = crate::db::connect(ctx.db_url).await.map_err(|e| db_failed("connecting", e))?;
-    let tx = client.transaction().await.map_err(|e| db_failed("BEGIN", e))?;
-    let home = tx
-        .query_opt(
-            r#"SELECT e."corporationID" FROM "chrEmployment" e
-                 JOIN "crpNPCCorporations" n ON n."corporationID" = e."corporationID"
-                WHERE e."characterID" = $1 ORDER BY e."startDate" DESC LIMIT 1"#,
-            &[&(me as i32)],
-        )
-        .await
-        .map_err(|e| db_failed("finding the NPC corporation", e))?
-        .and_then(|r| int(&r, 0))
-        .ok_or_else(|| Outcome::custom("There is no NPC corporation for you to go back to."))?;
-    crate::svc::membership::change_corporation(&tx, me, home, 0, crate::bulkdata::filetime_now()).await?;
-    tx.execute(r#"UPDATE "corporation" SET "deleted" = 1, "ceoID" = 0 WHERE "corporationID" = $1"#, &[&(corp as i32)])
-        .await
-        .map_err(|e| db_failed("closing the corporation", e))?;
-    tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    let npc_corporations: Vec<i64> = crate::sde::table("crpNPCCorporations").rows().filter_map(|n| n.int("corporationID")).collect();
+    let home = ctx
+        .store
+        .write(|tx| -> Result<i64, Failed> {
+            // The NPC corporation they were in most recently.
+            let home = tx
+                .table("chrEmployment")
+                .find(&["characterID"], &[int(me)])
+                .filter(|e| e.int("corporationID").is_some_and(|c| npc_corporations.contains(&c)))
+                .fold(None, |best: Option<(i64, i64)>, e| {
+                    let (Some(corp), Some(start)) = (e.int("corporationID"), e.int("startDate")) else { return best };
+                    if best.is_some_and(|(_, at)| at >= start) { best } else { Some((corp, start)) }
+                })
+                .map(|(corp, _)| corp)
+                .ok_or_else(|| Outcome::custom("There is no NPC corporation for you to go back to."))?;
+            crate::svc::membership::change_corporation(tx, me, home, 0, crate::bulkdata::filetime_now())?;
+            if let Some(row) = tx.table("corporation").get_id(corp).map(|c| c.id) {
+                tx.update("corporation", row, &[("deleted", int(1)), ("ceoID", int(0))]).map_err(|e| db_failed("closing the corporation", e))?;
+            }
+            Ok(home)
+        })
+        .map_err(|Failed(o)| o)?;
     crate::svc::membership::member_moved(ctx.world, me, corp, home);
     info!("{me} resigned as the last member of corporation {corp}, which is closed");
     ctx.world.lock().reaffiliate(&[], &[me]);
@@ -463,88 +535,98 @@ async fn close(ctx: &Ctx<'_>, corp: i64, me: i64) -> Refused<()> {
 
 /// Votes past their end: the option with the most shares behind it wins (the
 /// first, on a tie) and becomes a sanctioned action. Run by the heartbeat.
-pub async fn close_votes(world: &World, db: &Client) {
+pub async fn close_votes(world: &World, store: &Store) {
     let now = crate::bulkdata::filetime_now();
-    let sql = r#"SELECT c."voteCaseID", c."corporationID", c."endDateTime",
-                        (SELECT o."optionID" FROM "crpVoteOptions" o
-                          WHERE o."voteCaseID" = c."voteCaseID"
-                          ORDER BY COALESCE((SELECT sum(sh."shares") FROM "crpVotes" v
-                                               JOIN "crpCharShares" sh ON sh."characterID" = v."characterID" AND sh."corporationID" = c."corporationID"
-                                              WHERE v."voteCaseID" = c."voteCaseID" AND v."optionID" = o."optionID"), 0) DESC,
-                                   o."optionID"
-                          LIMIT 1)
-                   FROM "crpVoteCases" c
-                  WHERE c."endDateTime" <= $1
-                    AND NOT EXISTS (SELECT 1 FROM "crpSanctionedActions" s WHERE s."voteCaseID" = c."voteCaseID")"#;
-    let closed = match db.query(sql, &[&now]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("reading the votes to close: {}", crate::logging::chain(&e));
-            return;
-        }
-    };
-    for r in closed {
-        let (case, corp, end, option) = (int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0), int(&r, 2).unwrap_or(now), int(&r, 3));
-        let saved = db
-            .execute(
-                r#"INSERT INTO "crpSanctionedActions" ("voteCaseID", "corporationID", "timeActioned", "actedUpon", "inEffect", "optionID", "expires")
-                   VALUES ($1, $2, $3, 0, 0, $4, $5)"#,
-                &[&(case as i32), &(corp as i32), &now, &option.map(|o| o as i32), &(end + ACT_WITHIN)],
+    let closed: Vec<(i64, i64, i64, Option<i64>)> = store.read(|db| {
+        let sanctioned = db.table("crpSanctionedActions");
+        db.table("crpVoteCases")
+            .rows()
+            .filter(|c| c.int("endDateTime").is_some_and(|e| e <= now) && sanctioned.get(std::slice::from_ref(c.value("voteCaseID"))).is_none())
+            .map(|c| {
+                let (case, corp) = (c.int("voteCaseID").unwrap_or(0), c.int("corporationID").unwrap_or(0));
+                // The most shares behind it, then the first.
+                let option = db
+                    .table("crpVoteOptions")
+                    .find(&["voteCaseID"], &[int(case)])
+                    .filter_map(|o| o.int("optionID"))
+                    .map(|option| (std::cmp::Reverse(votes_for(db, case, corp, option)), option))
+                    .min()
+                    .map(|(_, option)| option);
+                (case, corp, c.int("endDateTime").unwrap_or(now), option)
+            })
+            .collect()
+    });
+    for (case, corp, end, option) in closed {
+        let saved = store.write(|tx| {
+            tx.insert(
+                "crpSanctionedActions",
+                &[
+                    ("voteCaseID", int(case)),
+                    ("corporationID", int(corp)),
+                    ("timeActioned", int(now)),
+                    ("actedUpon", int(0)),
+                    ("inEffect", int(0)),
+                    ("optionID", option.map_or(store::Value::Null, int)),
+                    ("expires", int(end + ACT_WITHIN)),
+                ],
             )
-            .await;
+        });
         if let Err(e) = saved {
             error!("closing vote {case}: {}", crate::logging::chain(&e));
             continue;
         }
         info!("vote {case} of corporation {corp} closed: option {option:?}");
-        elect(world, db, case, corp).await;
-        let sql = format!(r#"{SANCTION_SELECT} WHERE s."voteCaseID" = $1"#);
-        if let Ok(Some(row)) = db.query_opt(sql.as_str(), &[&(case as i32)]).await {
-            let new = line(&row);
+        elect(world, store, case, corp).await;
+        if let Some(new) = store.read(|db| db.table("crpSanctionedActions").get_id(case).and_then(|s| sanction_line(db, &s))) {
             tell(world, corp, "OnSanctionedActionChanged", vec![Value::Int(corp), Value::Int(case), change(SANCTION_HEADER, None, Some(&new))]);
         }
     }
 }
 
 /// A CEO vote the candidate won takes effect as it closes.
-async fn elect(world: &World, db: &Client, case: i64, corp: i64) {
-    let sql = r#"SELECT o."parameter", co."ceoID"
-                   FROM "crpSanctionedActions" s
-                   JOIN "crpVoteCases" c ON c."voteCaseID" = s."voteCaseID"
-                   JOIN "crpVoteOptions" o ON o."voteCaseID" = s."voteCaseID" AND o."optionID" = s."optionID"
-                   JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                  WHERE s."voteCaseID" = $1 AND c."voteType" = $2"#;
-    let Ok(Some(r)) = db.query_opt(sql, &[&(case as i32), &(VOTE_CEO as i16)]).await else { return };
-    let (Some(winner), old) = (int(&r, 0).filter(|w| *w != 0), int(&r, 1).unwrap_or(0)) else { return };
-    let member = db
-        .query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID" = $1 AND "corporationID" = $2"#, &[&(winner as i32), &(corp as i32)])
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+async fn elect(world: &World, store: &Store, case: i64, corp: i64) {
+    let found = store.read(|db| {
+        let s = db.table("crpSanctionedActions").get_id(case)?;
+        let c = db.table("crpVoteCases").get_id(case).filter(|c| c.int("voteType") == Some(VOTE_CEO))?;
+        let o = db.table("crpVoteOptions").get(&[int(case), s.int("optionID").map_or(store::Value::Null, int)])?;
+        let co = db.table("corporation").get_id(c.int("corporationID")?)?;
+        let winner = o.int("parameter").filter(|w| *w != 0);
+        let member = winner.is_some_and(|w| db.table("character_").get_id(w).is_some_and(|ch| ch.int("corporationID") == Some(corp)));
+        Some((winner, co.int("ceoID").unwrap_or(0), member))
+    });
+    let Some((Some(winner), old, member)) = found else { return };
     if !member || winner == old {
         return;
     }
-    if hand_over(db, world, corp, old, winner).await.is_ok() {
+    if store.write(|tx| hand_over(tx, world, corp, old, winner).map_err(Failed)).is_ok() {
         let now = crate::bulkdata::filetime_now();
-        let done = r#"UPDATE "crpSanctionedActions" SET "actedUpon" = 1, "inEffect" = 1, "timeActedUpon" = $2 WHERE "voteCaseID" = $1"#;
-        if let Err(e) = db.execute(done, &[&(case as i32), &now]).await {
+        let done = store.write(|tx| {
+            let Some(row) = tx.table("crpSanctionedActions").get_id(case).map(|s| s.id) else { return Ok(()) };
+            tx.update("crpSanctionedActions", row, &[("actedUpon", int(1)), ("inEffect", int(1)), ("timeActedUpon", int(now))])
+        });
+        if let Err(e) = done {
             error!("recording the election {case}: {}", crate::logging::chain(&e));
         }
     }
 }
 
 /// Whether an item is locked down by its corporation's vote.
-pub async fn locked(db: &impl GenericClient, item: i64) -> bool {
-    let sql = r#"SELECT 1 FROM "crpItemLocks" WHERE "itemID" = $1"#;
-    db.query_opt(sql, &[&(item as i32)]).await.ok().flatten().is_some()
+pub fn locked(db: &Db, item: i64) -> bool {
+    db.table("crpItemLocks").find(&["itemID"], &[int(item)]).next().is_some()
 }
 
 /// The stations where a corporation has items locked down.
 pub async fn locked_locations(ctx: &Ctx<'_>) -> Value {
-    let corp = ctx.session.corp_id.unwrap_or(0) as i32;
-    let sql = r#"SELECT DISTINCT "locationID" FROM "crpItemLocks" WHERE "corporationID" = $1 AND "locationID" IS NOT NULL"#;
-    Value::List(ctx.query(sql, &[&corp]).await.iter().filter_map(|r| int(r, 0)).map(Value::Int).collect())
+    let corp = ctx.session.corp_id.unwrap_or(0);
+    let mut locations: Vec<i64> = Vec::new();
+    ctx.store.read(|db| {
+        for location in db.table("crpItemLocks").find(&["corporationID"], &[int(corp)]).filter_map(|r| r.int("locationID")) {
+            if !locations.contains(&location) {
+                locations.push(location);
+            }
+        }
+    });
+    Value::List(locations.into_iter().map(Value::Int).collect())
 }
 
 fn tell(world: &World, corp: i64, event: &'static str, args: Vec<Value>) {

@@ -27,6 +27,7 @@ use crate::ballpark::{Command, Park, Ship};
 use crate::combat::{self, Lock};
 use crate::heartbeat::{Job, Out};
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::Db;
 use crate::svc::space::{self, entry};
 use crate::world::World;
 
@@ -191,26 +192,20 @@ fn is_theft(char_id: i64, corp_id: i64, owner_id: i64, owner_corp: i64) -> bool 
 }
 
 /// The corporation of a character, or 0.
-async fn corp_of(db: &tokio_postgres::Client, char_id: i64) -> i64 {
-    match db.query_opt(r#"SELECT "corporationID" FROM character_ WHERE "characterID" = $1"#, &[&(char_id as i32)]).await {
-        Ok(row) => row.map_or(0, |r| r.get::<_, i32>(0) as i64),
-        Err(e) => {
-            tracing::error!("reading the corporation of {char_id}: {}", crate::logging::chain(&e));
-            0
-        }
-    }
+fn corp_of(db: &Db, char_id: i64) -> i64 {
+    db.table("character_").get_id(char_id).and_then(|r| r.int("corporationID")).unwrap_or(0)
 }
 
 /// Items left `origins`: each that is another pilot's can in `system` makes
 /// the taker a thief, and the system is told who may now shoot them.
-pub async fn took_from(db: &tokio_postgres::Client, world: &World, system: i64, char_id: i64, corp_id: i64, origins: &[i64]) {
+pub fn took_from(db: &Db, world: &World, system: i64, char_id: i64, corp_id: i64, origins: &[i64]) {
     let cans: Vec<(i64, i64)> = {
         let w = world.lock();
         let Some(park) = w.parks.get(&system) else { return };
         origins.iter().filter_map(|id| park.cans.get(id)).map(|c| (c.id, c.owner_id)).collect()
     };
     for (can_id, owner_id) in cans {
-        let owner_corp = corp_of(db, owner_id).await;
+        let owner_corp = corp_of(db, owner_id);
         if !is_theft(char_id, corp_id, owner_id, owner_corp) {
             continue;
         }
@@ -241,7 +236,7 @@ pub async fn aggression_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             };
             let owner = ctx.world.lock().parks.get(&system).and_then(|p| p.cans.get(&can_id)).map(|c| c.owner_id);
             let Some(owner_id) = owner else { return Some(Outcome::Value(Value::Bool(true))) };
-            let owner_corp = corp_of(ctx.db, owner_id).await;
+            let owner_corp = ctx.store.read(|db| corp_of(db, owner_id));
             let corp_id = ctx.session.corp_id.unwrap_or(0);
             Some(Outcome::Value(Value::Bool(!is_theft(char_id, corp_id, owner_id, owner_corp))))
         }

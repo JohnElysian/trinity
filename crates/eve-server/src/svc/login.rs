@@ -6,6 +6,7 @@ use eve_marshal::Value;
 use tracing::info;
 
 use crate::services::{Call, Ctx, Outcome};
+use crate::store::{self, Db, Row, StoreError};
 
 pub async fn object_caching(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     if call.method != "GetCachableObject" {
@@ -41,9 +42,16 @@ pub async fn character(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "GetCharacterToSelect" => character_to_select(ctx, char_id).await,
         "PrepareCharacterForDelete" => prepare_for_delete(ctx, char_id).await,
         "CancelCharacterDeletePrepare" => {
-            let sql = r#"UPDATE "character_" SET "deletePrepareDateTime" = NULL
-                          WHERE "characterID" = $1 AND "accountID" = $2"#;
-            ctx.execute(sql, &[&(char_id as i32), &account(ctx)]).await;
+            let account = account(ctx);
+            let result = ctx.store.write(|tx| {
+                if let Some(id) = own_character(tx.db(), char_id, account).map(|r| r.id) {
+                    tx.update("character_", id, &[("deletePrepareDateTime", store::Value::Null)])?;
+                }
+                Ok::<_, StoreError>(())
+            });
+            if let Err(e) = result {
+                tracing::error!("statement failed: {}", crate::logging::chain(&e));
+            }
             Value::None
         }
         "DeleteCharacter" => delete_character(ctx, char_id).await,
@@ -58,8 +66,13 @@ const FILETIME_PER_SECOND: i64 = 10_000_000;
 /// The client only displays it; the length is the server's choice.
 const BIOMASS_DELAY: i64 = 60 * 60 * FILETIME_PER_SECOND;
 
-fn account(ctx: &Ctx<'_>) -> i32 {
-    ctx.session.user_id.unwrap_or(0) as i32
+fn account(ctx: &Ctx<'_>) -> i64 {
+    ctx.session.user_id.unwrap_or(0)
+}
+
+/// The character `char_id` if it is on `account`.
+fn own_character(db: &Db, char_id: i64, account: i64) -> Option<Row<'_>> {
+    db.table("character_").get_id(char_id).filter(|c| c.int("accountID") == Some(account))
 }
 
 async fn characters_to_select(ctx: &Ctx<'_>) -> Value {
@@ -72,16 +85,13 @@ async fn characters_to_select(ctx: &Ctx<'_>) -> Value {
         "morph2w", "morph3e", "morph3n", "morph3s", "morph3w", "morph4e", "morph4n", "morph4s",
         "morph4w",
     ];
-    let sql = r#"SELECT "characterID","characterName","deletePrepareDateTime",
-                        "gender","accessoryID","beardID","costumeID","decoID","eyebrowsID",
-                        "eyesID","hairID","lipstickID","makeupID","skinID","backgroundID",
-                        "lightID","headRotation1","headRotation2","headRotation3",
-                        "eyeRotation1","eyeRotation2","eyeRotation3","camPos1","camPos2","camPos3",
-                        "morph1e","morph1n","morph1s","morph1w","morph2e","morph2n","morph2s",
-                        "morph2w","morph3e","morph3n","morph3s","morph3w","morph4e","morph4n",
-                        "morph4s","morph4w"
-                   FROM "character_" WHERE "accountID" = $1 ORDER BY "characterID""#;
-    ctx.rowset(HEADER, sql, &[&account(ctx)]).await
+    let account = account(ctx);
+    let lines = ctx.store.read(|db| {
+        let mut characters: Vec<Row> = db.table("character_").find(&["accountID"], &[store::Value::Int(account)]).collect();
+        characters.sort_by_key(|c| c.int("characterID"));
+        characters.iter().map(|c| Value::List(c.line(HEADER))).collect()
+    });
+    crate::svc::rows::rowset(HEADER, lines)
 }
 
 async fn character_to_select(ctx: &Ctx<'_>, char_id: i64) -> Value {
@@ -93,37 +103,56 @@ async fn character_to_select(ctx: &Ctx<'_>, char_id: i64) -> Value {
         // its corporation's alliance (ticker and join date).
         "createDateTime", "allianceID", "shortName", "startDate",
     ];
-    let sql = r#"SELECT c."characterID",c."petitionMessage",c."gender",c."bloodlineID",c."stationID",
-                        c."solarSystemID",c."constellationID",c."regionID",c."startDateTime",
-                        c."corporationID",c."bounty",c."securityRating",c."title",c."balance",
-                        c."createDateTime", NULLIF(co."allianceID", 0), s."shortName", m."startDate"
-                   FROM "character_" c
-                   LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                   LEFT JOIN "alliance_shortnames" s ON s."allianceID" = co."allianceID"
-                   LEFT JOIN "allianceMembers" m ON m."corporationID" = c."corporationID"
-                                                AND m."allianceID" = co."allianceID"
-                  WHERE c."characterID" = $1 AND c."accountID" = $2"#;
-    ctx.rowset(HEADER, sql, &[&(char_id as i32), &account(ctx)]).await
+    /// The columns read from the character's own row.
+    const OWN: usize = 15;
+    let account = account(ctx);
+    let lines = ctx.store.read(|db| {
+        let Some(c) = own_character(db, char_id, account) else { return Vec::new() };
+        let mut line = c.line(&HEADER[..OWN]);
+        let corp = db.table("corporation").get(std::slice::from_ref(c.value("corporationID")));
+        let alliance = corp.map_or(store::Value::Null, |co| co.value("allianceID").clone());
+        // NULLIF(allianceID, 0): a corporation outside any alliance has none.
+        line.push(match corp {
+            Some(co) if co.int("allianceID") != Some(0) => co.cell("allianceID"),
+            _ => Value::None,
+        });
+        let short = db.table("alliance_shortnames").find_one(&["allianceID"], std::slice::from_ref(&alliance));
+        line.push(short.map_or(Value::None, |s| s.cell("shortName")));
+        let member = db
+            .table("allianceMembers")
+            .find_one(&["corporationID"], std::slice::from_ref(c.value("corporationID")))
+            .filter(|m| !alliance.is_null() && m.value("allianceID") == &alliance);
+        line.push(member.map_or(Value::None, |m| m.cell("startDate")));
+        vec![Value::List(line)]
+    });
+    crate::svc::rows::rowset(HEADER, lines)
 }
 
 /// Queues the character for deletion and returns when that becomes possible
 /// (charsel.Terminate shows the wait), or None if it is not the caller's.
 async fn prepare_for_delete(ctx: &Ctx<'_>, char_id: i64) -> Value {
     let when = crate::bulkdata::filetime_now() + BIOMASS_DELAY;
-    let sql = r#"UPDATE "character_" SET "deletePrepareDateTime" = $3
-                  WHERE "characterID" = $1 AND "accountID" = $2
-              RETURNING "deletePrepareDateTime""#;
-    match ctx.query_one(sql, &[&(char_id as i32), &account(ctx), &when]).await {
-        Some(_) => {
+    let account = account(ctx);
+    let queued = ctx.store.write(|tx| {
+        let Some(id) = own_character(tx.db(), char_id, account).map(|r| r.id) else { return Ok(false) };
+        tx.update("character_", id, &[("deletePrepareDateTime", store::Value::Int(when))])?;
+        Ok::<_, StoreError>(true)
+    });
+    match queued {
+        Ok(true) => {
             info!("character {char_id} queued for deletion");
             Value::Long(when)
         }
-        None => Value::None,
+        Ok(false) => Value::None,
+        Err(e) => {
+            tracing::error!("query failed: {}", crate::logging::chain(&e));
+            Value::None
+        }
     }
 }
 
 /// Deletes a queued character whose wait is over, with everything that belongs
-/// only to it, in one statement. Shared history (kill logs, the market journal,
+/// only to it, in one transaction. Shared history (kill logs, the market journal,
 /// votes) stays. Returns None, or a (message, args) error the client shows.
 async fn delete_character(ctx: &Ctx<'_>, char_id: i64) -> Value {
     match delete_character_checked(ctx,char_id).await {
@@ -132,106 +161,122 @@ async fn delete_character(ctx: &Ctx<'_>, char_id: i64) -> Value {
     }
 }
 
-/// Contract creation/acceptance and biomass share this lock. Unlike a wallet
-/// row lock it can be acquired before contract rows without changing their
-/// existing contract-to-wallet lock order.
-pub(crate) async fn lock_character_lifecycle(tx:&tokio_postgres::Transaction<'_>,char_id:i32)->Result<bool,tokio_postgres::Error> {
-    const NAMESPACE:i32=0x434852;
-    tx.query_one("SELECT pg_advisory_xact_lock($1,$2)",&[&NAMESPACE,&char_id]).await?;
-    Ok(tx.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1"#,&[&char_id]).await?.is_some())
+/// Whether the character still exists. Contract creation and acceptance,
+/// biomass and the other changes to a character's lifecycle check it in the
+/// transaction that makes them, so none acts on a character another removed.
+pub(crate) fn lock_character_lifecycle(db:&Db,char_id:i64)->Result<bool,StoreError> {
+    Ok(db.table("character_").get_id(char_id).is_some())
 }
+
+/// Why a deletion did not happen: a refusal the player sees, or a failed
+/// change.
+enum Refusal {
+    Refused(String),
+    Db(StoreError),
+}
+
+impl From<StoreError> for Refusal {
+    fn from(e:StoreError)->Self {Refusal::Db(e)}
+}
+
+/// Whether the character has a contract obligation biomass would orphan: an
+/// open contract it issued, goods it borrowed or carries, or a winning bid.
+fn contract_obligation(db:&Db,char_id:i64)->bool {
+    let bids=db.table("contract_bids");
+    let items=db.table("contract_items");
+    let entity=db.table("entity");
+    db.table("contracts").rows().filter(|c|c.bool("deleted")==Some(false)).any(|c| {
+        let kind=c.int("type").unwrap_or(0);
+        let status=c.int("status").unwrap_or(0);
+        let contract=std::slice::from_ref(c.value("contractID"));
+        (c.bool("forCorp")==Some(false) && c.int("issuerID")==Some(char_id) && matches!(status,0|1|3))
+        || (c.bool("acceptorCorp")==Some(false) && c.int("acceptorID")==Some(char_id) && matches!(kind,3|4|5) && matches!(status,1|3))
+        || (kind==2 && matches!(status,0|2) && bids.find(&["contractID"],contract).max_by_key(|b|b.int("id"))
+            .is_some_and(|b|b.int("bidderID")==Some(char_id) && b.bool("forCorp")==Some(false)))
+        || (matches!(kind,3|4) && matches!(status,1|3) && items.find(&["contractID"],contract)
+            .any(|ci|ci.bool("inCrate")==Some(true) && ci.int("itemID").and_then(|i|entity.get_id(i)).is_some_and(|e|e.int("ownerID")==Some(char_id))))
+    })
+}
+
+/// The tables whose rows belong only to a character, by the column naming it.
+const OWN_ROWS:&[(&str,&str)]=&[
+    ("eveStaticOwners","ownerID"),("eveNames","itemID"),("bookmarks","ownerID"),("chrNotes","characterID"),
+    ("chrOwnerNote","ownerID"),("chrStandings","characterID"),("chrNPCStandings","characterID"),
+    ("chrCorporationRoles","characterID"),("chrEmployment","characterID"),("chrMissionState","characterID"),
+    ("chrOffers","characterID"),("chrAgentLoyalty","characterID"),("chrAgentResearch","characterID"),
+    ("crpCharShares","characterID"),("crpApplications","characterID"),("chrJumpClones","ownerID"),
+    ("chrLoyaltyPoints","characterID"),("chrSystemVisits","characterID"),("chrTutorialState","characterID"),
+    ("insuranceContracts","ownerID"),("channelChars","charID"),
+];
 
 async fn delete_character_checked(ctx:&Ctx<'_>,char_id:i64)->Result<(),String> {
     let invalid="That character is not on this account or is not ready for deletion.";
     if char_id<=0 || char_id>i32::MAX as i64 {return Err(invalid.into());}
-    let failed=|e:tokio_postgres::Error| {tracing::error!("deleting character {char_id}: {}",crate::logging::chain(&e));"The character could not be deleted.".to_string()};
-    let mut client=crate::db::connect(ctx.db_url).await.map_err(failed)?;
-    let tx=client.transaction().await.map_err(failed)?;
-    if !lock_character_lifecycle(&tx,char_id as i32).await.map_err(failed)? {return Err(invalid.into());}
-    let now=crate::bulkdata::filetime_now();
-    let eligible=tx.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 AND "accountID"=$2 AND "deletePrepareDateTime" IS NOT NULL AND "deletePrepareDateTime" <= $3 FOR UPDATE"#,&[&(char_id as i32),&account(ctx),&now]).await.map_err(failed)?;
-    if eligible.is_none() {return Err(invalid.into());}
-    // This account-level RPC has no selected character for the connection's
-    // arrival guard. Preserve the durable final-snapshot/loss obligation until
-    // recovery resolves it; deleting its hull would cascade away the marker.
-    // A derelict loss does not block normal play, but biomass would also erase
-    // that unoccupied hull and its outstanding loss/insurance obligation.
-    let unsettled_owned_loss=ctx.world.lock().pending_ship_losses.values().any(|loss|loss.char_id==char_id);
-    if unsettled_owned_loss || crate::travel::blocked_character_in_memory(ctx.world,char_id)
-        || crate::svc::jumps::portal::blocked_character_in_memory(ctx.world,char_id)
-        || crate::conn::logout::blocked_character_in_memory(ctx.world,char_id)
-        || tx.query_one(r#"SELECT EXISTS(SELECT 1 FROM "pendingShipLosses" WHERE "characterID"=$1)"#,
-        &[&(char_id as i32)]).await.map_err(failed)?.get::<_,bool>(0)
-        || crate::losses::pending::blocked_character(&tx,char_id).await.map_err(failed)? {
-        return Err("This character's station arrival or ship loss must finish before deletion.".into());
-    }
-    {
-        let world=ctx.world.lock();
-        if !world.clients_of(char_id).is_empty() {return Err("Log out of that character before deleting it.".into());}
-        if world.retained_logouts.values().any(|(pilot,_)|*pilot==char_id) {return Err("Your ship's active cycle or pending travel must finish before deleting this character.".into());}
-        if world.trades.values().any(|trade|trade.traders.contains(&char_id)) {return Err("Finish or cancel that character's trade before deleting it.".into());}
-    }
-    if tx.query_opt(r#"SELECT 1 FROM corporation WHERE "ceoID"=$1 LIMIT 1"#,&[&(char_id as i32)]).await.map_err(failed)?.is_some() {
-        return Err("Appoint another corporation CEO before deleting this character.".into());
-    }
-    // Read these rows without taking locks: settlement locks contract then
-    // wallet, whereas deletion already owns the character wallet row.
-    let obligations=r#"SELECT 1 FROM contracts c WHERE NOT c.deleted AND (
-        (NOT c."forCorp" AND c."issuerID"=$1 AND c.status IN (0,1,3))
-        OR (NOT c."acceptorCorp" AND c."acceptorID"=$1 AND c.type IN (3,4,5) AND c.status IN (1,3))
-        OR (c.type=2 AND c.status IN (0,2) AND EXISTS (
-            SELECT 1 FROM contract_bids b WHERE b.id=(SELECT latest.id FROM contract_bids latest WHERE latest."contractID"=c."contractID" ORDER BY latest.id DESC LIMIT 1)
-                AND b."bidderID"=$1 AND NOT b."forCorp"))
-        OR (c.type IN (3,4) AND c.status IN (1,3) AND EXISTS (
-            SELECT 1 FROM contract_items ci JOIN entity e ON e."itemID"=ci."itemID"
-                WHERE ci."contractID"=c."contractID" AND ci."inCrate" AND e."ownerID"=$1))
-    ) LIMIT 1"#;
-    if tx.query_opt(obligations,&[&(char_id as i32)]).await.map_err(failed)?.is_some() {
-        return Err("Settle or cancel this character's outstanding contracts before deleting it.".into());
-    }
-    let sql = r#"
-        WITH target AS (
-            SELECT "characterID" AS id, "corporationID" AS corp FROM "character_"
-             WHERE "characterID" = $1 AND "accountID" = $2
-               AND "deletePrepareDateTime" IS NOT NULL AND "deletePrepareDateTime" <= $3 FOR UPDATE),
-        items AS (
-            DELETE FROM entity WHERE "ownerID" IN (SELECT id FROM target)
-                                  OR "itemID"  IN (SELECT id FROM target)
-            RETURNING "itemID"),
-        attributes AS (DELETE FROM entity_attributes WHERE "itemID" IN (SELECT "itemID" FROM items)),
-        owner      AS (DELETE FROM "eveStaticOwners"     WHERE "ownerID"     IN (SELECT id FROM target)),
-        names      AS (DELETE FROM "eveNames"            WHERE "itemID"      IN (SELECT id FROM target)),
-        bookmarks  AS (DELETE FROM bookmarks             WHERE "ownerID"     IN (SELECT id FROM target)),
-        notes      AS (DELETE FROM "chrNotes"            WHERE "characterID" IN (SELECT id FROM target)),
-        ownernotes AS (DELETE FROM "chrOwnerNote"        WHERE "ownerID"     IN (SELECT id FROM target)),
-        standings  AS (DELETE FROM "chrStandings"        WHERE "characterID" IN (SELECT id FROM target)),
-        npcstand   AS (DELETE FROM "chrNPCStandings"     WHERE "characterID" IN (SELECT id FROM target)),
-        roles      AS (DELETE FROM "chrCorporationRoles" WHERE "characterID" IN (SELECT id FROM target)),
-        employment AS (DELETE FROM "chrEmployment"       WHERE "characterID" IN (SELECT id FROM target)),
-        missions   AS (DELETE FROM "chrMissionState"     WHERE "characterID" IN (SELECT id FROM target)),
-        offers     AS (DELETE FROM "chrOffers"           WHERE "characterID" IN (SELECT id FROM target)),
-        loyalty    AS (DELETE FROM "chrAgentLoyalty"     WHERE "characterID" IN (SELECT id FROM target)),
-        research   AS (DELETE FROM "chrAgentResearch"    WHERE "characterID" IN (SELECT id FROM target)),
-        shares     AS (DELETE FROM "crpCharShares"       WHERE "characterID" IN (SELECT id FROM target)),
-        applies    AS (DELETE FROM "crpApplications"     WHERE "characterID" IN (SELECT id FROM target)),
-        orders     AS (DELETE FROM market_orders         WHERE "charID"      IN (SELECT id FROM target)
-                                                           AND COALESCE("walletOwnerID","charID")="charID"),
-        jumps      AS (DELETE FROM "chrJumpClones"       WHERE "ownerID"     IN (SELECT id FROM target)),
-        points     AS (DELETE FROM "chrLoyaltyPoints"    WHERE "characterID" IN (SELECT id FROM target)),
-        visits     AS (DELETE FROM "chrSystemVisits"     WHERE "characterID" IN (SELECT id FROM target)),
-        tutorials  AS (DELETE FROM "chrTutorialState"    WHERE "characterID" IN (SELECT id FROM target)),
-        insurance  AS (DELETE FROM "insuranceContracts"  WHERE "ownerID"     IN (SELECT id FROM target)),
-        channels   AS (DELETE FROM "channelChars"        WHERE "charID"      IN (SELECT id FROM target)),
-        members    AS (UPDATE corporation SET "memberCount" = GREATEST("memberCount" - 1, 0)
-                        WHERE "corporationID" IN (SELECT corp FROM target))
-        DELETE FROM "character_" WHERE "characterID" IN (SELECT id FROM target)
-        RETURNING "characterName",(SELECT COALESCE(array_agg("itemID"),ARRAY[]::integer[]) FROM items)"#;
-    let Some(deleted)=tx.query_opt(sql, &[&(char_id as i32), &account(ctx), &now]).await.map_err(failed)? else {return Err(invalid.into());};
-    let removed:std::collections::HashSet<i64>=deleted.get::<_,Vec<i32>>(1).into_iter().map(i64::from).collect();
-    tx.commit().await.map_err(failed)?;
-    // SQL rechecks ownership after waiting for a claimed hull's row lock.
-    // Only its actual DELETE result may remove live balls: a pre-delete owner
-    // snapshot could otherwise erase a ship that another pilot just acquired.
+    let failed=|e:StoreError| {tracing::error!("deleting character {char_id}: {}",crate::logging::chain(&e));"The character could not be deleted.".to_string()};
+    let refuse=|reason:&str|Err(Refusal::Refused(reason.into()));
+    let account=account(ctx);
+    let deleted=ctx.store.write(|tx| {
+        if !lock_character_lifecycle(tx.db(),char_id)? {return refuse(invalid);}
+        let now=crate::bulkdata::filetime_now();
+        let eligible=own_character(tx.db(),char_id,account).filter(|c|c.int("deletePrepareDateTime").is_some_and(|t|t<=now));
+        let Some(corp)=eligible.map(|c|c.int("corporationID")) else {return refuse(invalid);};
+        // This account-level RPC has no selected character for the connection's
+        // arrival guard. Preserve the durable final-snapshot/loss obligation until
+        // recovery resolves it; deleting its hull would cascade away the marker.
+        // A derelict loss does not block normal play, but biomass would also erase
+        // that unoccupied hull and its outstanding loss/insurance obligation.
+        let unsettled_owned_loss=ctx.world.lock().pending_ship_losses.values().any(|loss|loss.char_id==char_id);
+        if unsettled_owned_loss || crate::travel::blocked_character_in_memory(ctx.world,char_id)
+            || crate::svc::jumps::portal::blocked_character_in_memory(ctx.world,char_id)
+            || crate::conn::logout::blocked_character_in_memory(ctx.world,char_id)
+            || tx.table("pendingShipLosses").find(&["characterID"],&[store::Value::Int(char_id)]).next().is_some()
+            || crate::losses::pending::blocked_character(tx.db(),char_id)? {
+            return refuse("This character's station arrival or ship loss must finish before deletion.");
+        }
+        {
+            let world=ctx.world.lock();
+            if !world.clients_of(char_id).is_empty() {return refuse("Log out of that character before deleting it.");}
+            if world.retained_logouts.values().any(|(pilot,_)|*pilot==char_id) {return refuse("Your ship's active cycle or pending travel must finish before deleting this character.");}
+            if world.trades.values().any(|trade|trade.traders.contains(&char_id)) {return refuse("Finish or cancel that character's trade before deleting it.");}
+        }
+        if tx.table("corporation").find(&["ceoID"],&[store::Value::Int(char_id)]).next().is_some() {
+            return refuse("Appoint another corporation CEO before deleting this character.");
+        }
+        if contract_obligation(tx.db(),char_id) {
+            return refuse("Settle or cancel this character's outstanding contracts before deleting it.");
+        }
+        let me=store::Value::Int(char_id);
+        // Its items, and the character's own item row, with their attributes.
+        let entity=tx.table("entity");
+        let mut items:Vec<(store::RowId,i64)>=entity.find(&["ownerID"],std::slice::from_ref(&me)).filter_map(|e|Some((e.id,e.int("itemID")?))).collect();
+        if let Some(e)=entity.get_id(char_id).filter(|e|e.int("ownerID")!=Some(char_id)) {items.push((e.id,char_id));}
+        for (row,item) in &items {
+            tx.delete_where("entity_attributes",&["itemID"],&[store::Value::Int(*item)])?;
+            tx.delete("entity",*row)?;
+        }
+        for (table,column) in OWN_ROWS {
+            tx.delete_where(table,&[*column],std::slice::from_ref(&me))?;
+        }
+        // Orders it placed for itself; those for its corporation's wallet stay.
+        let orders:Vec<store::RowId>=tx.table("market_orders").find(&["charID"],std::slice::from_ref(&me))
+            .filter(|o|o.int("walletOwnerID").is_none_or(|w|w==char_id)).map(|o|o.id).collect();
+        for id in orders {tx.delete("market_orders",id)?;}
+        if let Some(c)=corp.and_then(|corp|tx.table("corporation").get_id(corp)) {
+            let members=(c.int("memberCount").unwrap_or(0)-1).max(0);
+            tx.update("corporation",c.id,&[("memberCount",store::Value::Int(members))])?;
+        }
+        let Some(row)=tx.table("character_").get_id(char_id).map(|c|c.id) else {return refuse(invalid);};
+        tx.delete("character_",row)?;
+        Ok(items.into_iter().map(|(_,item)|item).collect::<std::collections::HashSet<i64>>())
+    });
+    let removed=match deleted {
+        Ok(removed)=>removed,
+        Err(Refusal::Refused(reason))=>return Err(reason),
+        Err(Refusal::Db(e))=>return Err(failed(e)),
+    };
+    // Only the hulls the deletion actually removed may lose their live balls:
+    // a pre-delete owner snapshot could otherwise erase a ship that another
+    // pilot had acquired first.
     let mut world=ctx.world.lock();
     let empty_hulls:Vec<_>=world.parks.iter().flat_map(|(system,park)|park.ships.values()
         .filter(|ship|ship.unpiloted && ship.pilot.char_id==char_id && removed.contains(&ship.id))
@@ -244,165 +289,169 @@ async fn delete_character_checked(ctx:&Ctx<'_>,char_id:i64)->Result<(),String> {
 #[cfg(test)]
 mod deletion_tests {
     use super::*;
+    use crate::store::{Store,Value as V};
     use crate::{session::Session,test_support::Database};
 
-    async fn pilot(db:&Database,account:i32)->Session {
-        let id=db.id().await;
-        db.db.execute(r#"INSERT INTO "character_" ("characterID","accountID","characterName",balance,"deletePrepareDateTime") VALUES ($1,$2,$3,10000000,1)"#,&[&id,&account,&format!("Deletion fixture {id}")]).await.unwrap();
-        Session {char_id:Some(id as i64),user_id:Some(account as i64),station_id:Some(60000004),..Default::default()}
+    fn write(store:&Store,f:impl FnOnce(&mut crate::store::Tx)->Result<(),StoreError>) {store.write(f).unwrap()}
+    fn exists(store:&Store,table:&str,id:i64)->bool {store.read(|db|db.table(table).get_id(id).is_some())}
+    fn set(store:&Store,table:&str,id:i64,sets:&[(&str,V)]) {
+        write(store,|tx|{let row=tx.table(table).get_id(id).unwrap().id;tx.update(table,row,sets)})
     }
-    async fn contract(db:&Database,issuer:i32,kind:i32,status:i32,acceptor:i32)->i32 {
+
+    async fn pilot(db:&Database,account:i64)->Session {
+        let id=db.id().await as i64;
+        write(&db.store,|tx|{tx.insert("character_",&[("characterID",V::Int(id)),("accountID",V::Int(account)),("characterName",V::Text(format!("Deletion fixture {id}").into())),
+            ("balance",V::Float(10_000_000.0)),("deletePrepareDateTime",V::Int(1))])?;Ok(())});
+        Session {char_id:Some(id),user_id:Some(account),station_id:Some(60000004),..Default::default()}
+    }
+    fn contract(db:&Database,issuer:i64,kind:i64,status:i64,acceptor:i64)->i64 {
         let now=crate::bulkdata::filetime_now();
-        db.db.query_one(r#"INSERT INTO contracts (type,"issuerID","issuerCorpID","forCorp",availability,"assigneeID","acceptorID","dateIssued","dateExpired","numDays","startStationID","startSolarSystemID","startRegionID","endStationID","endSolarSystemID","endRegionID",price,reward,collateral,title,description,"sourceLocation","sourceFlag",status)
-            VALUES ($1,$2,1000002,false,0,0,$3,$4,$5,1,60000004,30000142,10000002,0,0,0,0,0,0,'Deletion fixture','',60000004,4,$6) RETURNING "contractID""#,&[&kind,&issuer,&acceptor,&now,&(now+864_000_000_000),&status]).await.unwrap().get(0)
+        db.store.write(|tx|{
+            let row=tx.insert("contracts",&[("type",V::Int(kind)),("issuerID",V::Int(issuer)),("issuerCorpID",V::Int(1000002)),("forCorp",V::Bool(false)),
+                ("availability",V::Int(0)),("assigneeID",V::Int(0)),("acceptorID",V::Int(acceptor)),("dateIssued",V::Int(now)),("dateExpired",V::Int(now+864_000_000_000)),
+                ("numDays",V::Int(1)),("startStationID",V::Int(60000004)),("startSolarSystemID",V::Int(30000142)),("startRegionID",V::Int(10000002)),
+                ("endStationID",V::Int(0)),("endSolarSystemID",V::Int(0)),("endRegionID",V::Int(0)),("price",V::Float(0.0)),("reward",V::Float(0.0)),
+                ("collateral",V::Float(0.0)),("title",V::Text("Deletion fixture".into())),("description",V::Text("".into())),
+                ("sourceLocation",V::Int(60000004)),("sourceFlag",V::Int(4)),("status",V::Int(status))])?;
+            Ok::<_,StoreError>(tx.table("contracts").row(row).unwrap().int("contractID").unwrap())
+        }).unwrap()
     }
-    async fn escrow_item(db:&Database,contract:i32,owner:i32)->i32 {
-        let item=db.db.query_one(r#"INSERT INTO entity ("typeID","ownerID","locationID",flag,quantity) VALUES (34,$1,$2,0,3) RETURNING "itemID""#,&[&owner,&contract]).await.unwrap().get::<_,i32>(0);
-        db.db.execute(r#"INSERT INTO contract_items ("contractID","itemID","typeID",quantity,"inCrate") VALUES ($1,$2,34,3,true)"#,&[&contract,&item]).await.unwrap();
-        item
+    fn escrow_item(db:&Database,contract:i64,owner:i64)->i64 {
+        db.store.write(|tx|{
+            let row=tx.insert("entity",&[("typeID",V::Int(34)),("ownerID",V::Int(owner)),("locationID",V::Int(contract)),("flag",V::Int(0)),("quantity",V::Int(3))])?;
+            let item=tx.table("entity").row(row).unwrap().int("itemID").unwrap();
+            tx.insert("contract_items",&[("contractID",V::Int(contract)),("itemID",V::Int(item)),("typeID",V::Int(34)),("quantity",V::Int(3)),("inCrate",V::Bool(true))])?;
+            Ok::<_,StoreError>(item)
+        }).unwrap()
+    }
+    fn hull(db:&Database,id:i64,owner:i64,location:i64,flag:i64) {
+        write(&db.store,|tx|{tx.insert("entity",&[("itemID",V::Int(id)),("typeID",V::Int(587)),("ownerID",V::Int(owner)),("locationID",V::Int(location)),
+            ("flag",V::Int(flag)),("quantity",V::Int(1)),("singleton",V::Int(1))])?;Ok(())});
+    }
+    fn bid(db:&Database,contract:i64,bidder:i64,amount:f64,when:i64) {
+        write(&db.store,|tx|{tx.insert("contract_bids",&[("contractID",V::Int(contract)),("bidderID",V::Int(bidder)),("amount",V::Float(amount)),
+            ("dateBid",V::Int(when)),("forCorp",V::Bool(false))])?;Ok(())});
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn deletion_preserves_pending_derelict_losses_in_memory_and_after_restart() {
-        let db=Database::load().await;let account=db.id().await;
-        let target=pilot(&db,account).await;let me=target.char_id.unwrap() as i32;
-        let hull=db.id().await;let system=30004971i32;
-        db.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-            VALUES($1,587,$2,$3,0,1,1)"#,&[&hull,&me,&system]).await.unwrap();
-        let loss=crate::losses::Loss {client_id:0,char_id:me as i64,ship_id:hull as i64,ship_type:587,system:system as i64,
+        let db=Database::load().await;let account=db.id().await as i64;
+        let target=pilot(&db,account).await;let me=target.char_id.unwrap();
+        let hull_id=db.id().await as i64;let system=30004971;
+        hull(&db,hull_id,me,system,0);
+        let loss=crate::losses::Loss {client_id:0,char_id:me,ship_id:hull_id,ship_type:587,system,
             pos:crate::ballpark::Vec3::ZERO,arrival_custody:None,capsule:false,unpiloted:true,final_blow:None,attackers:vec![],items:vec![]};
-        let caller=Session {user_id:Some(account as i64),..Default::default()};let ctx=db.ctx(&caller);
-        db.world.lock().pending_ship_losses.insert(hull as i64,loss.clone());
-        assert!(!crate::losses::journal::blocked_character_in_memory(&db.world,me as i64),"a derelict loss does not immobilize its owner's current ship");
-        assert!(delete_character_checked(&ctx,me as i64).await.is_err(),"biomass must still retain its owner's outstanding hull loss");
-        assert!(db.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&hull]).await.unwrap().is_some());
-        let mut writer=crate::db::connect(&db.url).await.unwrap();let tx=writer.transaction().await.unwrap();
-        assert!(lock_character_lifecycle(&tx,me).await.unwrap());
-        tx.query_one(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1 FOR UPDATE"#,&[&me]).await.unwrap();
-        assert!(crate::losses::journal::stage(&tx,&loss).await.unwrap());tx.commit().await.unwrap();
+        let caller=Session {user_id:Some(account),..Default::default()};let ctx=db.ctx(&caller);
+        db.world.lock().pending_ship_losses.insert(hull_id,loss.clone());
+        assert!(!crate::losses::journal::blocked_character_in_memory(&db.world,me),"a derelict loss does not immobilize its owner's current ship");
+        assert!(delete_character_checked(&ctx,me).await.is_err(),"biomass must still retain its owner's outstanding hull loss");
+        assert!(exists(&db.store,"entity",hull_id));
+        assert!(db.store.write(|tx|{
+            assert!(lock_character_lifecycle(tx.db(),me)?);
+            crate::losses::journal::stage(tx,&loss)
+        }).unwrap());
         db.world.lock().pending_ship_losses.clear();
-        assert!(!crate::losses::pending::blocked_character(&db.db,me as i64).await.unwrap(),"normal RPC quarantine remains occupied-only");
-        assert!(delete_character_checked(&ctx,me as i64).await.is_err(),"restart cannot erase a durable derelict loss");
-        assert!(!db.db.query_one(r#"SELECT occupied FROM "pendingShipLosses" WHERE "shipID"=$1"#,&[&hull]).await.unwrap().get::<_,bool>(0));
-        assert!(db.db.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1"#,&[&me]).await.unwrap().is_some());
-        db.db.execute(r#"DELETE FROM "pendingShipLosses" WHERE "shipID"=$1"#,&[&hull]).await.unwrap();
-        delete_character_checked(&ctx,me as i64).await.unwrap();
-        assert!(db.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&hull]).await.unwrap().is_none());
+        assert!(!db.store.read(|db|crate::losses::pending::blocked_character(db,me)).unwrap(),"normal RPC quarantine remains occupied-only");
+        assert!(delete_character_checked(&ctx,me).await.is_err(),"restart cannot erase a durable derelict loss");
+        assert_eq!(db.store.read(|db|db.table("pendingShipLosses").get_id(hull_id).unwrap().bool("occupied")),Some(false));
+        assert!(exists(&db.store,"character_",me));
+        write(&db.store,|tx|tx.delete_where("pendingShipLosses",&["shipID"],&[V::Int(hull_id)]).map(drop));
+        delete_character_checked(&ctx,me).await.unwrap();
+        assert!(!exists(&db.store,"entity",hull_id));
     }
 
+    // Once committed, an arrival marker refuses biomass, whichever order the
+    // two were asked for in: the store runs one write at a time.
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn deletion_preserves_pending_arrival_even_when_marker_commits_while_deletion_waits() {
-        let db=Database::load().await;let account=db.id().await;
-        let target=pilot(&db,account).await;let me=target.char_id.unwrap() as i32;
-        let hull=db.id().await;let station=60014659i32;let source=30004971i32;
-        db.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-            VALUES($1,587,$2,$3,4,1,1)"#,&[&hull,&me,&station]).await.unwrap();
-        let caller=Session {user_id:Some(account as i64),..Default::default()};
+    async fn deletion_preserves_pending_arrival_committed_before_it() {
+        let db=Database::load().await;let account=db.id().await as i64;
+        let target=pilot(&db,account).await;let me=target.char_id.unwrap();
+        let hull_id=db.id().await as i64;let station=60014659;let source=30004971;
+        hull(&db,hull_id,me,station,4);
+        let caller=Session {user_id:Some(account),..Default::default()};
         let ctx=db.ctx(&caller);
-        let mut arrival_db=crate::db::connect(&db.url).await.unwrap();
-        let arrival=arrival_db.transaction().await.unwrap();
-        assert!(lock_character_lifecycle(&arrival,me).await.unwrap());
-        arrival.execute(r#"UPDATE "character_" SET "shipID"=$2,"stationID"=$3 WHERE "characterID"=$1"#,&[&me,&hull,&station]).await.unwrap();
-        let marker=crate::losses::pending::begin(&arrival,me as i64,hull as i64,station as i64,source as i64).await.unwrap();
-        let blocker:i32=arrival.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        let release=async {
-            tokio::time::timeout(std::time::Duration::from_secs(10),async {loop {
-                if db.db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",&[&blocker]).await.unwrap().get::<_,bool>(0) {break;}
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }}).await.expect("deletion waits for the accepted arrival transaction");
-            arrival.commit().await.unwrap();
-        };
-        let (deleted,())=tokio::join!(delete_character_checked(&ctx,me as i64),release);
-        assert!(deleted.unwrap_err().contains("station arrival"));
-        assert!(crate::losses::pending::blocked_character(&db.db,me as i64).await.unwrap());
-        assert!(db.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&hull]).await.unwrap().is_some());
+        let marker=db.store.write(|tx|{
+            assert!(lock_character_lifecycle(tx.db(),me)?);
+            let row=tx.table("character_").get_id(me).unwrap().id;
+            tx.update("character_",row,&[("shipID",V::Int(hull_id)),("stationID",V::Int(station))])?;
+            crate::losses::pending::begin(tx,me,hull_id,station,source)
+        }).unwrap();
+        assert!(delete_character_checked(&ctx,me).await.unwrap_err().contains("station arrival"));
+        assert!(db.store.read(|db|crate::losses::pending::blocked_character(db,me)).unwrap());
+        assert!(exists(&db.store,"entity",hull_id));
         // Both an unknown final snapshot and an unreadable recorded loss stay
         // quarantined; biomass must not choose a survival or death outcome.
-        db.db.execute(r#"UPDATE "pendingStationArrivals" SET loss='{}' WHERE "shipID"=$1 AND generation=$2"#,&[&hull,&marker.generation]).await.unwrap();
-        assert!(delete_character_checked(&ctx,me as i64).await.unwrap_err().contains("station arrival"));
-        let foreign=Session {user_id:Some(account as i64+1),..Default::default()};
-        assert!(delete_character_checked(&db.ctx(&foreign),me as i64).await.unwrap_err().contains("not on this account"));
-        db.db.execute(r#"DELETE FROM "pendingStationArrivals" WHERE "shipID"=$1"#,&[&hull]).await.unwrap();
-        delete_character_checked(&ctx,me as i64).await.unwrap();
-        assert!(db.db.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1"#,&[&me]).await.unwrap().is_none());
-        assert!(db.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&hull]).await.unwrap().is_none());
+        write(&db.store,|tx|{
+            let row=tx.table("pendingStationArrivals").find(&["shipID"],&[V::Int(hull_id)]).find(|r|r.int("generation")==Some(marker.generation)).unwrap().id;
+            tx.update("pendingStationArrivals",row,&[("loss",V::Text("{}".into()))])
+        });
+        assert!(delete_character_checked(&ctx,me).await.unwrap_err().contains("station arrival"));
+        let foreign=Session {user_id:Some(account+1),..Default::default()};
+        assert!(delete_character_checked(&db.ctx(&foreign),me).await.unwrap_err().contains("not on this account"));
+        write(&db.store,|tx|tx.delete_where("pendingStationArrivals",&["shipID"],&[V::Int(hull_id)]).map(drop));
+        delete_character_checked(&ctx,me).await.unwrap();
+        assert!(!exists(&db.store,"character_",me));
+        assert!(!exists(&db.store,"entity",hull_id));
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn deletion_removes_empty_hulls_but_keeps_a_hull_claimed_while_sql_waits() {
+    async fn deletion_removes_empty_hulls_but_keeps_a_hull_claimed_before_it() {
         use crate::ballpark::{Park,Pilot,Ship,ShipStats,Vec3};
         let db=Database::load().await;
-        let account=db.id().await;
+        let account=db.id().await as i64;
         let target=pilot(&db,account).await;
-        let other=pilot(&db,account).await.char_id.unwrap() as i32;
-        let owner=target.char_id.unwrap() as i32;
-        let ghost=db.id().await;
-        let claimed=db.id().await;
-        let foreign=db.id().await;
-        let observer=db.id().await;
-        let system=30000142i32;
-        let mut park=Park::new(system as i64,vec![],crate::destiny::tick_now());
+        let other=pilot(&db,account).await.char_id.unwrap();
+        let owner=target.char_id.unwrap();
+        let ghost=db.id().await as i64;
+        let claimed=db.id().await as i64;
+        let foreign=db.id().await as i64;
+        let observer=db.id().await as i64;
+        let system=30000142;
+        let mut park=Park::new(system,vec![],crate::destiny::tick_now());
         for (id,property_owner,unpiloted) in [(ghost,owner,true),(claimed,owner,true),(foreign,other,true),(observer,other,false)] {
-            db.db.execute(r#"INSERT INTO entity("itemID","typeID","ownerID","locationID",flag,quantity,singleton)
-                VALUES($1,587,$2,$3,0,1,1)"#,&[&id,&property_owner,&system]).await.unwrap();
-            let mut ship=Ship::new(id as i64,if unpiloted {0} else {9},ShipStats::new(37.0,1.1e6,3.1,320.0,2.0),
-                Pilot{type_id:587,group_id:25,name:"Biomass hull".into(),char_id:property_owner as i64,
+            hull(&db,id,property_owner,system,0);
+            let mut ship=Ship::new(id,if unpiloted {0} else {9},ShipStats::new(37.0,1.1e6,3.1,320.0,2.0),
+                Pilot{type_id:587,group_id:25,name:"Biomass hull".into(),char_id:property_owner,
                     corp_id:1000002,alliance_id:None,security:0.0,bounty:0.0},Vec3::ZERO,Vec3::ZERO);
             ship.unpiloted=unpiloted;
-            park.ships.insert(id as i64,ship);
+            park.ships.insert(id,ship);
         }
         let kind=crate::npc::NpcType::with(3634,53,1.0,1.0,&[]);
         let mut fighter=crate::npc::entity_fighter(&kind,10000.0,1,100.0,crate::combat::now_ms());
-        fighter.locks.insert(ghost as i64,crate::combat::Lock::Locked);
-        fighter.locks.insert(claimed as i64,crate::combat::Lock::Locked);
-        park.ships.get_mut(&(observer as i64)).unwrap().fight=Some(fighter);
+        fighter.locks.insert(ghost,crate::combat::Lock::Locked);
+        fighter.locks.insert(claimed,crate::combat::Lock::Locked);
+        park.ships.get_mut(&observer).unwrap().fight=Some(fighter);
         let mut receiver={
             let mut world=db.world.lock();
             let rx=world.connect(9);
-            world.set_presence(9,Some(crate::world::Presence{char_id:other as i64,corp_id:1000002,
-                solar_system_id:system as i64,docked:false,station_id:None,role:0}));
-            world.sees(9,system as i64);
-            world.parks.insert(system as i64,park);
+            world.set_presence(9,Some(crate::world::Presence{char_id:other,corp_id:1000002,
+                solar_system_id:system,docked:false,station_id:None,role:0}));
+            world.sees(9,system);
+            world.parks.insert(system,park);
             rx
         };
-        let caller=Session{user_id:Some(account as i64),..Default::default()};
+        let caller=Session{user_id:Some(account),..Default::default()};
         let ctx=db.ctx(&caller);
-        let wrong=Session{user_id:Some(account as i64+1),..Default::default()};
-        assert!(delete_character_checked(&db.ctx(&wrong),owner as i64).await.is_err());
-        assert!(db.world.lock().parks[&(system as i64)].ships.contains_key(&(ghost as i64)));
+        let wrong=Session{user_id:Some(account+1),..Default::default()};
+        assert!(delete_character_checked(&db.ctx(&wrong),owner).await.is_err());
+        assert!(db.world.lock().parks[&system].ships.contains_key(&ghost));
         assert!(receiver.try_recv().is_err(),"refused deletion cannot remove live ships");
 
-        let mut claiming_db=crate::db::connect(&db.url).await.unwrap();
-        let claim=claiming_db.transaction().await.unwrap();
-        let blocker:i32=claim.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        claim.execute(r#"UPDATE entity SET "ownerID"=$2 WHERE "itemID"=$1"#,&[&claimed,&other]).await.unwrap();
-        let release=async {
-            tokio::time::timeout(std::time::Duration::from_secs(10),async {
-                loop {
-                    let blocked:bool=db.db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE $1=ANY(pg_blocking_pids(a.pid)))",&[&blocker]).await.unwrap().get(0);
-                    if blocked {break;}
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            }).await.expect("biomass deletion waits on the claiming transaction");
-            assert!(db.world.lock().parks[&(system as i64)].ships.contains_key(&(ghost as i64)),"no live mutation before commit");
-            claim.commit().await.unwrap();
-        };
-        let (deleted,())=tokio::join!(delete_character_checked(&ctx,owner as i64),release);
-        deleted.unwrap();
-        assert!(db.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&ghost]).await.unwrap().is_none());
-        assert_eq!(db.db.query_one(r#"SELECT "ownerID" FROM entity WHERE "itemID"=$1"#,&[&claimed]).await.unwrap().get::<_,i32>(0),other);
+        // Another pilot claims one of the hulls while the park still shows
+        // the old owner.
+        set(&db.store,"entity",claimed,&[("ownerID",V::Int(other))]);
+        delete_character_checked(&ctx,owner).await.unwrap();
+        assert!(!exists(&db.store,"entity",ghost));
+        assert_eq!(db.store.read(|db|db.table("entity").get_id(claimed).unwrap().int("ownerID")),Some(other));
         {
             let world=db.world.lock();
-            let park=&world.parks[&(system as i64)];
-            assert!(!park.ships.contains_key(&(ghost as i64)));
-            assert!(park.ships.contains_key(&(claimed as i64)),"stale live ownership must not erase a hull that SQL retained");
-            assert!(park.ships.contains_key(&(foreign as i64)));
-            let locks=&park.ships[&(observer as i64)].fight.as_ref().unwrap().locks;
-            assert!(!locks.contains_key(&(ghost as i64)),"normal departure bookkeeping clears locks");
-            assert!(locks.contains_key(&(claimed as i64)));
+            let park=&world.parks[&system];
+            assert!(!park.ships.contains_key(&ghost));
+            assert!(park.ships.contains_key(&claimed),"stale live ownership must not erase a hull the store retained");
+            assert!(park.ships.contains_key(&foreign));
+            let locks=&park.ships[&observer].fight.as_ref().unwrap().locks;
+            assert!(!locks.contains_key(&ghost),"normal departure bookkeeping clears locks");
+            assert!(locks.contains_key(&claimed));
         }
         let mut removed=Vec::new();
         while let Ok(crate::world::Push::Notify(notification))=receiver.try_recv() {
@@ -414,66 +463,64 @@ mod deletion_tests {
                 }
             }
         }
-        assert_eq!(removed,vec![ghost as i64],"observers lose only the hull actually deleted");
+        assert_eq!(removed,vec![ghost],"observers lose only the hull actually deleted");
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn deletion_preserves_ceos_contract_debtors_and_winning_bidders() {
-        let db=Database::load().await;let account=db.id().await;let target=pilot(&db,account).await;
-        let me=target.char_id.unwrap() as i32;let caller=Session {user_id:Some(account as i64),..Default::default()};let ctx=db.ctx(&caller);
-        let corp=db.id().await;
-        db.db.execute(r#"INSERT INTO corporation ("corporationID","corporationName","ceoID") VALUES ($1,$2,$3)"#,&[&corp,&format!("CEO fixture {corp}"),&me]).await.unwrap();
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        db.db.execute(r#"UPDATE corporation SET "ceoID"=0 WHERE "corporationID"=$1"#,&[&corp]).await.unwrap();
-        let offered=contract(&db,me,1,0,0).await;
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        db.db.execute("UPDATE contracts SET status=4 WHERE \"contractID\"=$1",&[&offered]).await.unwrap();
-        let borrowed=contract(&db,1,4,1,me).await;
-        let item=escrow_item(&db,borrowed,me).await;
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        db.db.execute(r#"UPDATE contracts SET "acceptorID"=2 WHERE "contractID"=$1"#,&[&borrowed]).await.unwrap();
+        let db=Database::load().await;let account=db.id().await as i64;let target=pilot(&db,account).await;
+        let me=target.char_id.unwrap();let caller=Session {user_id:Some(account),..Default::default()};let ctx=db.ctx(&caller);
+        let corp=db.id().await as i64;
+        write(&db.store,|tx|{tx.insert("corporation",&[("corporationID",V::Int(corp)),("corporationName",V::Text(format!("CEO fixture {corp}").into())),("ceoID",V::Int(me))])?;Ok(())});
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        set(&db.store,"corporation",corp,&[("ceoID",V::Int(0))]);
+        let offered=contract(&db,me,1,0,0);
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        set(&db.store,"contracts",offered,&[("status",V::Int(4))]);
+        let borrowed=contract(&db,1,4,1,me);
+        let item=escrow_item(&db,borrowed,me);
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        set(&db.store,"contracts",borrowed,&[("acceptorID",V::Int(2))]);
         // Borrowed goods still belong to a live obligation even when passed on.
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        assert!(db.db.query_opt(r#"SELECT 1 FROM entity WHERE "itemID"=$1"#,&[&item]).await.unwrap().is_some());
-        db.db.execute("UPDATE contracts SET status=7 WHERE \"contractID\"=$1",&[&borrowed]).await.unwrap();
-        let auction=contract(&db,1,2,0,0).await;
-        db.db.execute(r#"INSERT INTO contract_bids ("contractID","bidderID",amount,"dateBid","forCorp") VALUES ($1,$2,1000,1,false)"#,&[&auction,&me]).await.unwrap();
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        db.db.execute("UPDATE contracts SET status=2 WHERE \"contractID\"=$1",&[&auction]).await.unwrap();
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        db.db.execute(r#"INSERT INTO contract_bids ("contractID","bidderID",amount,"dateBid","forCorp") VALUES ($1,2,2000,2,false)"#,&[&auction]).await.unwrap();
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        assert!(exists(&db.store,"entity",item));
+        set(&db.store,"contracts",borrowed,&[("status",V::Int(7))]);
+        let auction=contract(&db,1,2,0,0);
+        bid(&db,auction,me,1000.0,1);
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        set(&db.store,"contracts",auction,&[("status",V::Int(2))]);
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        bid(&db,auction,2,2000.0,2);
         // An already-paid auction issuer and a corporation's former acting
         // issuer have no personal obligation left to block deletion.
-        contract(&db,me,2,2,2).await;
-        let corp_contract=contract(&db,me,1,0,0).await;
-        db.db.execute(r#"UPDATE contracts SET "forCorp"=true,"issuerCorpID"=$2 WHERE "contractID"=$1"#,&[&corp_contract,&corp]).await.unwrap();
-        let foreign=Session {user_id:Some((account+1) as i64),..Default::default()};
-        assert!(!matches!(delete_character(&db.ctx(&foreign),me as i64).await,Value::None));
-        db.db.execute(r#"UPDATE "character_" SET "deletePrepareDateTime"=$2 WHERE "characterID"=$1"#,&[&me,&(crate::bulkdata::filetime_now()+864_000_000_000)]).await.unwrap();
-        assert!(!matches!(delete_character(&ctx,me as i64).await,Value::None));
-        db.db.execute(r#"UPDATE "character_" SET "deletePrepareDateTime"=1 WHERE "characterID"=$1"#,&[&me]).await.unwrap();
-        assert!(matches!(delete_character(&ctx,me as i64).await,Value::None));
-        assert!(db.db.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1"#,&[&me]).await.unwrap().is_none());
+        contract(&db,me,2,2,2);
+        let corp_contract=contract(&db,me,1,0,0);
+        set(&db.store,"contracts",corp_contract,&[("forCorp",V::Bool(true)),("issuerCorpID",V::Int(corp))]);
+        let foreign=Session {user_id:Some(account+1),..Default::default()};
+        assert!(!matches!(delete_character(&db.ctx(&foreign),me).await,Value::None));
+        set(&db.store,"character_",me,&[("deletePrepareDateTime",V::Int(crate::bulkdata::filetime_now()+864_000_000_000))]);
+        assert!(!matches!(delete_character(&ctx,me).await,Value::None));
+        set(&db.store,"character_",me,&[("deletePrepareDateTime",V::Int(1))]);
+        assert!(matches!(delete_character(&ctx,me).await,Value::None));
+        assert!(!exists(&db.store,"character_",me));
     }
 
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn deletion_and_zero_value_loan_acceptance_cannot_orphan_goods() {
-        let db=Database::load().await;let account=db.id().await;
+        let db=Database::load().await;let account=db.id().await as i64;
         let issuer=pilot(&db,account).await;
         for _ in 0..4 {
-            let borrower=pilot(&db,account).await;let me=borrower.char_id.unwrap() as i32;
-            let contract=contract(&db,issuer.char_id.unwrap() as i32,4,0,0).await;
-            let item=escrow_item(&db,contract,1).await;
-            let caller=Session {user_id:Some(account as i64),..Default::default()};
+            let borrower=pilot(&db,account).await;let me=borrower.char_id.unwrap();
+            let contract=contract(&db,issuer.char_id.unwrap(),4,0,0);
+            let item=escrow_item(&db,contract,1);
+            let caller=Session {user_id:Some(account),..Default::default()};
             let deletion=db.ctx(&caller);let acceptance=db.ctx(&borrower);
-            let call=Call {service:"contractMgr".into(),method:"AcceptContract".into(),args:vec![Value::Int(contract as i64),Value::Bool(false)],kwargs:vec![]};
-            let (deleted,accepted)=tokio::join!(delete_character(&deletion,me as i64),crate::svc::contracts::contract_mgr(&call,&acceptance));
-            let owner:i32=db.db.query_one(r#"SELECT "ownerID" FROM entity WHERE "itemID"=$1"#,&[&item]).await.unwrap().get(0);
-            let exists=db.db.query_opt(r#"SELECT 1 FROM "character_" WHERE "characterID"=$1"#,&[&me]).await.unwrap().is_some();
-            if matches!(accepted,Some(Outcome::Value(_))) {assert!(exists);assert_eq!(owner,me);assert!(!matches!(deleted,Value::None));}
-            else {assert!(!exists);assert_eq!(owner,1);assert!(matches!(deleted,Value::None));}
+            let call=Call {service:"contractMgr".into(),method:"AcceptContract".into(),args:vec![Value::Int(contract),Value::Bool(false)],kwargs:vec![]};
+            let (deleted,accepted)=tokio::join!(delete_character(&deletion,me),crate::svc::contracts::contract_mgr(&call,&acceptance));
+            let owner=db.store.read(|db|db.table("entity").get_id(item).unwrap().int("ownerID"));
+            let exists=exists(&db.store,"character_",me);
+            if matches!(accepted,Some(Outcome::Value(_))) {assert!(exists);assert_eq!(owner,Some(me));assert!(!matches!(deleted,Value::None));}
+            else {assert!(!exists);assert_eq!(owner,Some(1));assert!(matches!(deleted,Value::None));}
         }
     }
 }

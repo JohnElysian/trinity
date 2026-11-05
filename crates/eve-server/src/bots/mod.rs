@@ -41,14 +41,14 @@ pub use relations::{stance, Stance};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio_postgres::Client;
 use tracing::{error, info, warn};
 
 use crate::combat::Rng;
 use crate::conn::Server;
+use crate::store::{Db, Store, StoreError, Value};
 use behaviour::{Atlas, Bot, Ctx};
 use presence::{Identity, Presence};
 
@@ -72,7 +72,6 @@ const FIRST_OWNED_CORP: i32 = 2_000_000;
 static RUNNING: AtomicBool = AtomicBool::new(true);
 static CONTROLS: AtomicBool = AtomicBool::new(false);
 static STATUS: Mutex<String> = Mutex::new(String::new());
-static DB_URL: OnceLock<String> = OnceLock::new();
 
 /// /bots on|off.
 pub fn set_running(on: bool) {
@@ -111,77 +110,68 @@ pub fn request(words: &[&str]) -> Result<String, String> {
     Ok(said)
 }
 
-/// The database the bot simulation writes to.
-pub fn db_url() -> String {
-    DB_URL.get().cloned().unwrap_or_default()
-}
-
 pub async fn run(server: Arc<Server>, target: usize, speed: f64, shown: usize) {
     if target == 0 {
         return;
     }
-    let _ = DB_URL.set(server.db_url.clone());
     match start(&server, target).await {
-        Ok((mut db, atlas, mut bots, mut ids)) => {
+        Ok((atlas, mut bots, mut ids)) => {
+            let store = &server.store;
             let mut rng = Rng::seeded(crate::bulkdata::filetime_now() as u64 ^ 0x5eed);
-            let politics = match politics::load(&db, &atlas, 0, speed).await {
+            let politics = match politics::load(store, &atlas, 0, speed).await {
                 Ok(p) if !p.corps.is_empty() => Ok(p),
-                Ok(_) => politics::form(&mut db, &atlas, &mut bots, &mut ids, &mut rng, 0, speed).await,
+                Ok(_) => politics::form(store, &atlas, &mut bots, &mut ids, &mut rng, 0, speed).await,
                 Err(e) => Err(e),
             };
             let mut politics = match politics {
                 Ok(p) => p,
                 Err(e) => return error!("bots: politics: {}", crate::logging::chain(&e)),
             };
-            match sov::establish(&db, &atlas, &politics, &mut rng, server.sov_claim_delay_secs).await {
+            match sov::establish(store, &atlas, &politics, &mut rng, server.sov_claim_delay_secs).await {
                 Ok(news) if !news.is_empty() => {
                     politics.tell(news);
-                    crate::svc::starbase::sovereignty(&db, server.sov_claim_delay_secs).await;
+                    crate::svc::starbase::sovereignty(store, server.sov_claim_delay_secs).await;
                 }
                 Ok(_) => {}
                 Err(e) => error!("bots: settling null-sec: {}", crate::logging::chain(&e)),
             }
-            let (yard, econ) = match markets(&db, &atlas, &mut bots, &ids, &politics).await {
+            let (yard, econ) = match markets(store, &atlas, &mut bots, &ids, &politics).await {
                 Ok(v) => v,
                 Err(e) => return error!("bots: the economy: {}", crate::logging::chain(&e)),
             };
-            let mut presence = Presence::new(presence::hulls(&db, &ids, yard.all().map(i64::from)).await, shown);
+            let (hulls, relations, density, names, types) = store.read(|db| {
+                (presence::hulls(db, &ids, yard.all().map(i64::from)), relations::load(db), read_density(db), panels::names(db), character_types(db))
+            });
+            let mut presence = Presence::new(hulls, shown);
             let yard = Arc::new(yard);
             presence.yard = Some(Arc::clone(&yard));
-            let relations = match relations::load(&db).await {
-                Ok(r) => r,
-                Err(e) => return error!("bots: relations: {}", crate::logging::chain(&e)),
-            };
-            let density = read_density(&db).await;
-            let names = panels::names(&db).await;
-            let types = character_types(&db).await;
-            let sim = Sim::new(server, db, atlas, bots, ids, types, presence, politics, econ, yard, relations, density, names, speed);
+            let sim = Sim::new(server, atlas, bots, ids, types, presence, politics, econ, yard, relations, density, names, speed);
             sim.run().await
         }
         Err(e) => error!("bots: {e}"),
     }
 }
 
-async fn start(server: &Server, target: usize) -> Result<(Client, Atlas, Vec<Bot>, Vec<Identity>), String> {
-    let mut db = crate::db::connect(&server.db_url).await.map_err(|e| crate::logging::chain(&e).to_string())?;
-    schema::ensure(&db).await.map_err(|e| format!("the bots' tables: {}", crate::logging::chain(&e)))?;
+async fn start(server: &Server, target: usize) -> Result<(Atlas, Vec<Bot>, Vec<Identity>), String> {
+    let store = &server.store;
+    store.write(schema::ensure).map_err(|e| format!("the bots' tables: {}", crate::logging::chain(&e)))?;
     let started = Instant::now();
-    let atlas = population::atlas(&db).await?;
+    let atlas = store.read(population::atlas)?;
     info!("bots: map of {} systems, {} stations read in {:.1}s", atlas.systems.len(), atlas.station_system.len(), started.elapsed().as_secs_f64());
-    let have = population::ensure(&mut db, &atlas, target).await?;
-    let (bots, ids) = population::load(&db, &atlas, target).await.map_err(|e| crate::logging::chain(&e).to_string())?;
+    let have = population::ensure(store, &atlas, target).await?;
+    let (bots, ids) = store.read(|db| population::load(db, &atlas, target));
     info!("bots: {} loaded of {have}, in {:.1}s", bots.len(), started.elapsed().as_secs_f64());
-    Ok((db, atlas, bots, ids))
+    Ok((atlas, bots, ids))
 }
 
 /// The ships bots fly and the economy they trade in: hulls and their
 /// prices, each bot's place on its ladder, and the market hubs (the trade
 /// hubs and each null-sec alliance's capital, where most of its pilots live).
-async fn markets(db: &Client, atlas: &Atlas, bots: &mut [Bot], ids: &[Identity], p: &politics::Politics) -> Result<(ships::Shipyard, economy::Economy), tokio_postgres::Error> {
-    let hulls = ships::hull_types(db).await?;
-    let mut econ = economy::load(db, atlas, &hulls).await?;
+async fn markets(store: &Store, atlas: &Atlas, bots: &mut [Bot], ids: &[Identity], p: &politics::Politics) -> Result<(ships::Shipyard, economy::Economy), StoreError> {
+    let hulls = ships::hull_types();
+    let mut econ = store.read(|db| economy::load(db, atlas, &hulls));
     let prices: HashMap<i32, f64> = econ.goods.iter().filter(|(_, g)| g.kind == economy::Kind::Hull).map(|(t, g)| (*t, g.ask)).collect();
-    let yard = ships::Shipyard::load(db, &prices).await?;
+    let yard = ships::Shipyard::load(&prices);
     for (b, id) in bots.iter_mut().zip(ids) {
         b.hull = id.hull as i32;
         b.tier = yard.tier_of(b.role, b.hull);
@@ -196,19 +186,13 @@ async fn markets(db: &Client, atlas: &Atlas, bots: &mut [Bot], ids: &[Identity],
     let capitals = homes.values().filter_map(|h| h.iter().max_by_key(|(s, n)| (**n, Reverse(**s))).map(|(s, _)| *s));
     let hubs: Vec<i32> = atlas.hubs.iter().copied().chain(capitals).collect();
     economy::set_hubs(&mut econ, atlas, hubs, bots);
-    economy::adopt_orders(&mut econ, db, bots).await?;
+    economy::adopt_orders(&mut econ, store, bots).await?;
     info!("bots: {} hulls on the ladders, {} market hubs, {} traders, {} standing orders", yard.hulls.len(), econ.hubs.len(), econ.traders.len(), econ.stats.orders);
     Ok((yard, econ))
 }
 
-async fn read_density(db: &Client) -> HashMap<i32, f32> {
-    match db.query(r#"SELECT "regionID", "factor" FROM "botRegionDensity""#, &[]).await {
-        Ok(rows) => rows.iter().map(|r| (r.get::<_, i32>(0), r.get::<_, f32>(1))).collect(),
-        Err(e) => {
-            error!("bots: reading region density: {}", crate::logging::chain(&e));
-            HashMap::new()
-        }
-    }
+fn read_density(db: &Db) -> HashMap<i32, f32> {
+    db.table("botRegionDensity").rows().map(|r| (r.int("regionID").unwrap_or(0) as i32, r.float("factor").unwrap_or(1.0) as f32)).collect()
 }
 
 /// What a run has done since the last report.
@@ -226,7 +210,6 @@ struct Tally {
 /// Everything the simulation holds while it runs.
 struct Sim {
     server: Arc<Server>,
-    db: Client,
     atlas: Atlas,
     bots: Vec<Bot>,
     ids: Vec<Identity>,
@@ -262,7 +245,6 @@ impl Sim {
     #[allow(clippy::too_many_arguments)]
     fn new(
         server: Arc<Server>,
-        db: Client,
         atlas: Atlas,
         bots: Vec<Bot>,
         ids: Vec<Identity>,
@@ -281,7 +263,6 @@ impl Sim {
         let unix = (crate::bulkdata::filetime_now() / 10_000_000 - 11_644_473_600).max(0);
         Sim {
             server,
-            db,
             atlas,
             bots,
             ids,
@@ -337,7 +318,6 @@ impl Sim {
     }
 
     async fn run(mut self) {
-        let mut reconnect=crate::db::Reconnect::default();
         {
             let ctx = Ctx { atlas: &self.atlas, econ: &mut self.econ, yard: Some(&*self.yard), day0: self.day0, density: &self.density };
             for (i, bot) in self.bots.iter_mut().enumerate() {
@@ -360,15 +340,6 @@ impl Sim {
         info!("bots: running {} at {}x", self.bots.len(), self.speed);
         loop {
             interval.tick().await;
-            if self.db.is_closed() {
-                // Pause bot economic decisions while disconnected; do not
-                // replay an interrupted tick or catch up its elapsed time.
-                last_tick=Instant::now();
-                match reconnect.poll(&self.server.db_url).await {
-                    Some(db)=>self.db=db,
-                    None=>continue,
-                }
-            }
             let elapsed = last_tick.elapsed();
             last_tick = Instant::now();
             let running = RUNNING.load(Ordering::Relaxed);
@@ -403,9 +374,7 @@ impl Sim {
                 self.tally.worst_flush = self.tally.worst_flush.max(took);
                 if last_balances.elapsed() >= BALANCES {
                     last_balances = Instant::now();
-                    if let Err(e) = reload_balances(&self.db, &mut self.bots, &self.by_char).await {
-                        error!("bots: reading wallets back: {}", crate::logging::chain(&e));
-                    }
+                    self.server.store.read(|db| reload_balances(db, &mut self.bots, &self.by_char));
                 }
             }
             if last_report.elapsed() >= REPORT {
@@ -509,10 +478,10 @@ impl Sim {
     /// Every ten minutes of the bots' clock: politics, sovereignty, the
     /// economy's slower half, corporations' applications, and events.
     async fn politics_tick(&mut self, now: u32) {
-        if let Err(e) = politics::tick(&mut self.politics, &self.db, &self.bots, &mut self.ids, &mut self.rng, now, self.speed).await {
+        if let Err(e) = politics::tick(&mut self.politics, &self.server.store, &self.bots, &mut self.ids, &mut self.rng, now, self.speed).await {
             error!("bots: politics: {}", crate::logging::chain(&e));
         }
-        match sov::upkeep(&self.db, &self.atlas, &mut self.politics, self.presence.watched(), &mut self.sieges, &mut self.rng, now, self.server.sov_claim_delay_secs, self.speed).await {
+        match sov::upkeep(&self.server.store, &self.atlas, &mut self.politics, self.presence.watched(), &mut self.sieges, &mut self.rng, now, self.server.sov_claim_delay_secs, self.speed).await {
             Ok(news) => self.politics.tell(news),
             Err(e) => error!("bots: sovereignty: {}", crate::logging::chain(&e)),
         }
@@ -520,13 +489,13 @@ impl Sim {
             let mut r = Rng::seeded(self.rng.below(u32::MAX as usize) as u64);
             move || r.unit()
         };
-        if let Err(e) = economy::tick(&mut self.econ, &self.db, &self.server.db_url, &self.server.world, &self.bots, &mut roll).await {
+        if let Err(e) = economy::tick(&mut self.econ, &self.server.store, &self.server.world, &self.bots, &mut roll).await {
             error!("bots: the economy: {}", crate::logging::chain(&e));
         }
-        if let Err(e) = relations::answer_applications(&self.relations, &self.db, &self.server.world, &self.politics).await {
+        if let Err(e) = relations::answer_applications(&self.relations, &self.server.store, &self.server.world, &self.politics).await {
             error!("bots: applications to bot corporations: {}", crate::logging::chain(&e));
         }
-        match relations::recruit(&self.db, &self.server.world, &self.atlas, &self.politics, &mut self.bots, &mut self.ids, &self.by_char, &mut self.rng).await {
+        match relations::recruit(&self.server.store, &self.server.world, &self.atlas, &self.politics, &mut self.bots, &mut self.ids, &self.by_char, &mut self.rng).await {
             Ok(moved) => {
                 for i in moved {
                     self.touch(i);
@@ -544,7 +513,7 @@ impl Sim {
 
     /// Events, rolled for or asked for; returns how many happened.
     async fn run_events(&mut self, asked: Vec<events::Kind>, roll: bool, now: u32) -> usize {
-        match events::tick(&mut self.events, &self.db, &self.atlas, &mut self.politics, &mut self.bots, &mut self.ids, &mut self.presence, asked, roll, &mut self.rng, now).await {
+        match events::tick(&mut self.events, &self.server.store, &self.atlas, &mut self.politics, &mut self.bots, &mut self.ids, &mut self.presence, asked, roll, &mut self.rng, now).await {
             Ok((news, moved)) => {
                 let happened = news.len();
                 self.politics.tell(news);
@@ -563,24 +532,29 @@ impl Sim {
     /// Alliances' treasuries and prime times, the corporations' taxes, and
     /// each bot's prime time.
     async fn refresh_politics_figures(&mut self) {
-        let alliances: Vec<i32> = self.politics.alliances.keys().copied().collect();
-        let sql = r#"SELECT a."allianceID", co."balance" FROM alliances a JOIN "corporation" co ON co."corporationID" = a."executorCorpID" WHERE a."allianceID" = ANY($1)"#;
-        match self.db.query(sql, &[&alliances]).await {
-            Ok(rows) => self.politics.treasury = rows.iter().map(|r| (r.get::<_, i32>(0), r.get::<_, f64>(1))).collect(),
-            Err(e) => error!("bots: reading the alliances' wallets: {}", crate::logging::chain(&e)),
-        }
-        let sql = r#"SELECT co."corporationID", a."executorCorpID" FROM "corporation" co JOIN alliances a ON a."allianceID" = co."allianceID"
-                      JOIN "botGroups" g ON g."ownerID" = co."corporationID""#;
-        match self.db.query(sql, &[]).await {
-            Ok(rows) => self.econ.executor_of = rows.iter().map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1))).collect(),
-            Err(e) => error!("bots: reading the alliances' executors: {}", crate::logging::chain(&e)),
-        }
         let mut player_corps: Vec<i32> = self.ids.iter().map(|id| id.corp).filter(|c| *c >= FIRST_OWNED_CORP && !self.politics.corps.contains_key(c)).collect();
         player_corps.sort_unstable();
         player_corps.dedup();
-        if let Err(e) = economy::read_tax_rates(&mut self.econ, &self.db, &player_corps).await {
-            error!("bots: reading tax rates: {}", crate::logging::chain(&e));
-        }
+        let (politics, econ) = (&mut self.politics, &mut self.econ);
+        self.server.store.read(|db| {
+            let (alliances, corps) = (db.table("alliances"), db.table("corporation"));
+            let executor = |a: crate::store::Row| corps.get_id(a.int("executorCorpID")?);
+            politics.treasury = politics
+                .alliances
+                .keys()
+                .filter_map(|id| alliances.get_id(i64::from(*id)).and_then(executor).map(|co| (*id, co.float("balance").unwrap_or(0.0))))
+                .collect();
+            econ.executor_of = db
+                .table("botGroups")
+                .rows()
+                .filter_map(|g| corps.get_id(g.int("ownerID")?))
+                .filter_map(|co| {
+                    let exec = alliances.get_id(co.int("allianceID")?)?.int("executorCorpID")?;
+                    Some((co.int("corporationID")? as i32, exec as i32))
+                })
+                .collect();
+            economy::read_tax_rates(econ, db, &player_corps);
+        });
         for (b, id) in self.bots.iter_mut().zip(&self.ids) {
             b.prime = id.alliance.map_or_else(|| behaviour::prime_for(b.id), |a| self.politics.prime_of(a));
         }
@@ -592,12 +566,12 @@ impl Sim {
     async fn sync(&mut self, running: bool) {
         let now = self.clock as u32;
         if running {
-            let mut report = defense::run(&mut self.defenses, &self.server.world, &self.db, &self.atlas, &mut self.bots, &self.ids, &mut self.presence, &self.politics, &mut self.rng, now).await;
+            let mut report = defense::run(&mut self.defenses, &self.server.world, &self.server.store, &self.atlas, &mut self.bots, &self.ids, &mut self.presence, &self.politics, &mut self.rng, now).await;
             if !self.sieges.is_empty() {
                 let fought = battle::run(
                     &mut self.sieges,
                     &self.server.world,
-                    &self.db,
+                    &self.server.store,
                     &self.atlas,
                     &mut self.bots,
                     &self.ids,
@@ -630,8 +604,7 @@ impl Sim {
             let hired = hire::run(
                 &mut self.hires,
                 &self.server.world,
-                &self.db,
-                &self.server.db_url,
+                &self.server.store,
                 &self.atlas,
                 &mut self.bots,
                 &self.ids,
@@ -667,7 +640,7 @@ impl Sim {
             self.relations.killed(kill, b.id, side, &enemies, now);
         }
         self.relations.publish(&self.bots);
-        relations::act(&mut self.relations, &self.db, &self.server.db_url, &self.server.world).await;
+        relations::act(&mut self.relations, &self.server.store, &self.server.world).await;
         let news = std::mem::take(&mut self.relations.news);
         self.politics.tell(news);
         if !self.following.bots.is_empty() {
@@ -686,13 +659,13 @@ impl Sim {
                     }
                 }
                 control::Request::War(a, b) => {
-                    let (x, y) = (self.find_side(&a).await, self.find_side(&b).await);
+                    let (x, y) = (self.find_side(&a), self.find_side(&b));
                     match (x, y) {
                         (Some(x), Some(y)) if x != y && !self.politics.wars.iter().any(|w| (w.a == x && w.b == y) || (w.a == y && w.b == x)) => {
                             let speed = self.speed;
-                            match politics::war_between(&mut self.politics, &self.db, x, y, 7, now, speed).await {
+                            match politics::war_between(&mut self.politics, &self.server.store, x, y, 7, now, speed).await {
                                 Ok(_) => {
-                                    crate::svc::war::refresh(&self.db).await;
+                                    self.server.store.read(crate::svc::war::refresh);
                                     let at = crate::bulkdata::filetime_now();
                                     self.politics.tell(vec![(at, format!("{a} and {b} are at war"))]);
                                     self.say(format!("War between {a} and {b}"));
@@ -705,19 +678,30 @@ impl Sim {
                     }
                 }
                 control::Request::Density(region, factor) => {
-                    let sql = r#"SELECT "regionID", "regionName" FROM "mapRegions" WHERE lower("regionName") = lower($1) OR "regionID"::text = $1"#;
-                    match self.db.query_opt(sql, &[&region]).await {
-                        Ok(Some(row)) => {
-                            let id: i32 = row.get(0);
-                            let name: Option<String> = row.get(1);
+                    // By name, any case, or by number; a request that could
+                    // mean two regions means none.
+                    let wanted = region.to_ascii_lowercase();
+                    let matches: Vec<_> = crate::sde::table("mapRegions")
+                        .rows()
+                        .filter(|r| {
+                            r.text("regionName").is_some_and(|n| n.to_ascii_lowercase() == wanted)
+                                || r.int("regionID").is_some_and(|id| id.to_string() == region)
+                        })
+                        .collect();
+                    match matches[..] {
+                        [row] => {
+                            let id = row.int("regionID").unwrap_or(0) as i32;
+                            let name: Option<String> = row.text("regionName").map(str::to_string);
+                            let key = Value::Int(i64::from(id));
                             let saved = if (factor - 1.0).abs() < 1e-3 {
                                 self.density.remove(&id);
-                                self.db.execute(r#"DELETE FROM "botRegionDensity" WHERE "regionID" = $1"#, &[&id]).await
+                                self.server.store.write(|tx| tx.delete_where("botRegionDensity", &["regionID"], &[key]).map(|_| ()))
                             } else {
                                 self.density.insert(id, factor);
-                                self.db
-                                    .execute(r#"INSERT INTO "botRegionDensity" ("regionID","factor") VALUES ($1,$2) ON CONFLICT ("regionID") DO UPDATE SET "factor" = EXCLUDED."factor""#, &[&id, &factor])
-                                    .await
+                                let value = Value::Float(f64::from(factor));
+                                self.server.store.write(|tx| {
+                                    tx.upsert("botRegionDensity", &["regionID"], &[("regionID", key), ("factor", value.clone())], &[("factor", value)]).map(|_| ())
+                                })
                             };
                             if let Err(e) = saved {
                                 error!("bots: saving region density: {}", crate::logging::chain(&e));
@@ -755,19 +739,24 @@ impl Sim {
     }
 
     /// A bot alliance or corporation by name, ticker or ID.
-    async fn find_side(&self, name: &str) -> Option<i32> {
-        let sql = r#"SELECT "allianceID" FROM alliances WHERE (lower("allianceName") = lower($1) OR lower("shortName") = lower($1) OR "allianceID"::text = $1) AND "deleted" = 0
-                     UNION ALL
-                     SELECT "corporationID" FROM "corporation" WHERE lower("corporationName") = lower($1) OR lower("tickerName") = lower($1) OR "corporationID"::text = $1"#;
-        let rows = self.db.query(sql, &[&name.trim()]).await.ok()?;
-        rows.iter().map(|r| r.get::<_, i32>(0)).find(|id| self.politics.alliances.contains_key(id) || self.politics.corps.contains_key(id))
+    fn find_side(&self, name: &str) -> Option<i32> {
+        let name = name.trim();
+        let wanted = name.to_lowercase();
+        let named = |r: &crate::store::Row, id: &str, columns: [&str; 2]| {
+            columns.iter().any(|c| r.text(c).is_some_and(|t| t.to_lowercase() == wanted)) || r.int(id).is_some_and(|v| v.to_string() == name)
+        };
+        self.server.store.read(|db| {
+            let alliances = db.table("alliances").rows().filter(|r| named(r, "allianceID", ["allianceName", "shortName"]) && r.int("deleted") == Some(0)).filter_map(|r| r.int("allianceID"));
+            let corps = db.table("corporation").rows().filter(|r| named(r, "corporationID", ["corporationName", "tickerName"])).filter_map(|r| r.int("corporationID"));
+            alliances.chain(corps).map(|id| id as i32).find(|id| self.politics.alliances.contains_key(id) || self.politics.corps.contains_key(id))
+        })
     }
 
     /// Every few seconds: the changed bots, the economy, relations and kill
     /// reports saved; the dashboard's windows and the map's counts.
     async fn flush_all(&mut self, running: bool) {
         let rows = self.changed.len();
-        match flush(&self.db, &self.bots, &self.changed).await {
+        match flush(&self.server.store, &self.bots, &self.changed) {
             Ok(()) => {
                 for i in std::mem::take(&mut self.changed) {
                     self.dirty[i as usize] = false;
@@ -780,29 +769,30 @@ impl Sim {
         self.tally.flushed_rows += rows as u64;
         if !self.hulls_changed.is_empty() {
             let list = std::mem::take(&mut self.hulls_changed);
-            if let Err(e) = save_hulls(&self.db, &self.bots, &self.ids, &list).await {
+            if let Err(e) = save_hulls(&self.server.store, &self.bots, &self.ids, &list) {
                 error!("bots: saving new ships: {}", crate::logging::chain(&e));
             }
         }
-        if let Err(e) = economy::flush(&mut self.econ, &self.db).await {
+        if let Err(e) = economy::flush(&mut self.econ, &self.server.store).await {
             error!("bots: saving the economy: {}", crate::logging::chain(&e));
         }
-        if let Err(e) = relations::flush(&mut self.relations, &self.db).await {
+        if let Err(e) = relations::flush(&mut self.relations, &self.server.store).await {
             error!("bots: saving relations: {}", crate::logging::chain(&e));
         }
         let kills = std::mem::take(&mut self.politics.unseen_kills);
-        if let Err(e) = write_kills(&self.db, &kills, &self.bots, &self.ids).await {
+        if let Err(e) = write_kills(&self.server.store, &kills, &self.bots, &self.ids) {
             error!("bots: writing kill reports: {}", crate::logging::chain(&e));
         }
         let mut events = panels::events(&self.events, &self.names);
         events["said"] = serde_json::Value::Array(self.said.iter().rev().map(|(t, l)| serde_json::json!({ "time": t / 10_000 - 11_644_473_600_000, "text": l })).collect());
         events["controls"] = serde_json::Value::Bool(controls_enabled());
-        let panels = crate::world::BotPanels {
-            market: panels::market(&self.econ, &self.names),
-            relations: panels::relations(&self.db, &self.relations, &self.hires, &self.bots, &self.ids).await,
-            followed: panels::followed(&self.db, &self.following, &self.bots, &self.ids, &self.econ, &self.atlas, &self.names).await,
-            events,
-        };
+        let (relations, followed) = self.server.store.read(|db| {
+            (
+                panels::relations(db, &self.relations, &self.hires, &self.bots, &self.ids),
+                panels::followed(db, &self.following, &self.bots, &self.ids, &self.econ, &self.atlas, &self.names),
+            )
+        });
+        let panels = crate::world::BotPanels { market: panels::market(&self.econ, &self.names), relations, followed, events };
         self.server.world.lock().bot_panels = panels;
         publish_counts(&self.server, &self.bots, &self.politics, &self.sieges, running);
     }
@@ -810,49 +800,71 @@ impl Sim {
 
 /// Writes back where the changed bots are, whether they play, what their
 /// wallets gained or lost, and their homes, in one batch.
-async fn flush(db: &Client, bots: &[Bot], changed: &[u32]) -> Result<(), tokio_postgres::Error> {
+fn flush(store: &Store, bots: &[Bot], changed: &[u32]) -> Result<(), StoreError> {
     if changed.is_empty() {
         return Ok(());
     }
-    let pick = |f: &dyn Fn(&Bot) -> i32| changed.iter().map(|i| f(&bots[*i as usize])).collect::<Vec<i32>>();
-    let ids = pick(&|b| b.id);
-    let stations = pick(&|b| b.station);
-    let systems = pick(&|b| b.system);
-    let homes = pick(&|b| b.home);
-    let online: Vec<i16> = changed.iter().map(|i| i16::from(bots[*i as usize].online)).collect();
-    // A change, not a value: what players paid them meanwhile stays.
-    let delta: Vec<f64> = changed.iter().map(|i| bots[*i as usize].isk - bots[*i as usize].isk_saved).collect();
-    let sql = r#"UPDATE "character_" c SET "stationID" = u.station, "solarSystemID" = u.system,
-                        "constellationID" = s."constellationID", "regionID" = s."regionID", "online" = u.online, "balance" = c."balance" + u.delta
-                   FROM unnest($1::int[], $2::int[], $3::int[], $4::smallint[], $5::float8[]) AS u(id, station, system, online, delta)
-                   JOIN "mapSolarSystems" s ON s."solarSystemID" = u.system
-                  WHERE c."characterID" = u.id"#;
-    db.execute(sql, &[&ids, &stations, &systems, &online, &delta]).await?;
-    let sql = r#"UPDATE "bots" b SET "homeStationID" = u.home FROM unnest($1::int[], $2::int[]) AS u(id, home)
-                  WHERE b."characterID" = u.id AND b."homeStationID" <> u.home"#;
-    db.execute(sql, &[&ids, &homes]).await?;
-    Ok(())
+    store.write(|tx| -> Result<(), StoreError> {
+        for i in changed {
+            let b = &bots[*i as usize];
+            let Some(system) = tx.table("mapSolarSystems").get_id(i64::from(b.system)) else { continue };
+            let (constellation, region) = (system.value("constellationID").clone(), system.value("regionID").clone());
+            let Some(c) = tx.table("character_").get_id(i64::from(b.id)) else { continue };
+            // A change, not a value: what players paid them meanwhile stays.
+            let (row, balance) = (c.id, c.float("balance").unwrap_or(0.0) + (b.isk - b.isk_saved));
+            tx.update(
+                "character_",
+                row,
+                &[
+                    ("stationID", Value::Int(i64::from(b.station))),
+                    ("solarSystemID", Value::Int(i64::from(b.system))),
+                    ("constellationID", constellation),
+                    ("regionID", region),
+                    ("online", Value::Int(i64::from(b.online))),
+                    ("balance", Value::Float(balance)),
+                ],
+            )?;
+        }
+        Ok(())
+    })?;
+    store.write(|tx| -> Result<(), StoreError> {
+        for i in changed {
+            let b = &bots[*i as usize];
+            let Some(row) = tx.table("bots").get_id(i64::from(b.id)).filter(|r| r.int("homeStationID") != Some(i64::from(b.home))).map(|r| r.id) else { continue };
+            tx.update("bots", row, &[("homeStationID", Value::Int(i64::from(b.home)))])?;
+        }
+        Ok(())
+    })
 }
 
 /// The bots' new ships: their ship items take the new hull, and their tier
 /// is kept.
-async fn save_hulls(db: &Client, bots: &[Bot], ids: &[Identity], list: &[u32]) -> Result<(), tokio_postgres::Error> {
-    let ships: Vec<i32> = list.iter().map(|i| ids[*i as usize].ship as i32).collect();
-    let hulls: Vec<i32> = list.iter().map(|i| bots[*i as usize].hull).collect();
-    db.execute(r#"UPDATE entity e SET "typeID" = u.hull FROM unnest($1::int[], $2::int[]) AS u(id, hull) WHERE e."itemID" = u.id"#, &[&ships, &hulls]).await?;
-    let chars: Vec<i32> = list.iter().map(|i| bots[*i as usize].id).collect();
-    let tiers: Vec<i16> = list.iter().map(|i| bots[*i as usize].tier as i16).collect();
-    db.execute(r#"UPDATE "bots" b SET "tier" = u.tier FROM unnest($1::int[], $2::smallint[]) AS u(id, tier) WHERE b."characterID" = u.id"#, &[&chars, &tiers]).await?;
-    Ok(())
+fn save_hulls(store: &Store, bots: &[Bot], ids: &[Identity], list: &[u32]) -> Result<(), StoreError> {
+    store.write(|tx| -> Result<(), StoreError> {
+        for i in list {
+            let Some(row) = tx.table("entity").get_id(ids[*i as usize].ship).map(|r| r.id) else { continue };
+            tx.update("entity", row, &[("typeID", Value::Int(i64::from(bots[*i as usize].hull)))])?;
+        }
+        Ok(())
+    })?;
+    store.write(|tx| -> Result<(), StoreError> {
+        for i in list {
+            let b = &bots[*i as usize];
+            let Some(row) = tx.table("bots").get_id(i64::from(b.id)).map(|r| r.id) else { continue };
+            tx.update("bots", row, &[("tier", Value::Int(i64::from(b.tier)))])?;
+        }
+        Ok(())
+    })
 }
 
 /// What players paid the bots (and the market filled) since the wallets were
 /// last read: into each bot's wallet in memory.
-async fn reload_balances(db: &Client, bots: &mut [Bot], by_char: &HashMap<i64, u32>) -> Result<(), tokio_postgres::Error> {
-    let rows = db.query(r#"SELECT c."characterID", c."balance" FROM "bots" b JOIN "character_" c ON c."characterID" = b."characterID""#, &[]).await?;
-    for r in rows {
-        let Some(&i) = by_char.get(&(r.get::<_, i32>(0) as i64)) else { continue };
-        let balance: f64 = r.get(1);
+fn reload_balances(db: &Db, bots: &mut [Bot], by_char: &HashMap<i64, u32>) {
+    let characters = db.table("character_");
+    for b in db.table("bots").rows() {
+        let Some(c) = b.int("characterID").and_then(|id| characters.get_id(id)) else { continue };
+        let Some(&i) = by_char.get(&c.int("characterID").unwrap_or(0)) else { continue };
+        let balance = c.float("balance").unwrap_or(0.0);
         let b = &mut bots[i as usize];
         let outside = balance - b.isk_saved;
         if outside.abs() >= 0.01 {
@@ -860,50 +872,58 @@ async fn reload_balances(db: &Client, bots: &mut [Bot], by_char: &HashMap<i64, u
             b.isk_saved = balance;
         }
     }
-    Ok(())
 }
 
 /// Kill reports for the fights nobody saw: one line each in the kill log,
 /// with the bot that laid the final blow.
-async fn write_kills(db: &Client, kills: &[(u32, u32, i32, i32)], bots: &[Bot], ids: &[Identity]) -> Result<(), tokio_postgres::Error> {
+fn write_kills(store: &Store, kills: &[(u32, u32, i32, i32)], bots: &[Bot], ids: &[Identity]) -> Result<(), StoreError> {
     if kills.is_empty() {
         return Ok(());
     }
-    let numbers: Vec<i64> = db
-        .query(r#"SELECT nextval(pg_get_serial_sequence('"killLog"', 'killID')) FROM generate_series(1, $1)"#, &[&(kills.len() as i32)])
-        .await?
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    let col = |f: &dyn Fn(&(u32, u32, i32, i32)) -> i32| kills.iter().map(f).collect::<Vec<i32>>();
-    let victims = col(&|k| bots[k.0 as usize].id);
-    let victim_corps = col(&|k| ids[k.0 as usize].corp);
-    let victim_alliances = col(&|k| ids[k.0 as usize].alliance.unwrap_or(0));
-    let lost = col(&|k| k.3);
-    let items = col(&|k| ids[k.0 as usize].ship as i32);
-    let systems = col(&|k| k.2);
-    let killers = col(&|k| bots[k.1 as usize].id);
-    let killer_corps = col(&|k| ids[k.1 as usize].corp);
-    let killer_alliances = col(&|k| ids[k.1 as usize].alliance.unwrap_or(0));
-    let killer_ships = col(&|k| bots[k.1 as usize].hull);
     let now = crate::bulkdata::filetime_now();
-    db.execute(
-        r#"INSERT INTO "killLog" ("killID","killTime","victimCharID","victimCorpID","victimAllianceID","victimShipTypeID",
-                                  "victimItemID","solarSystemID","locationID","finalBlowID","totalDamage","isPodKill")
-           SELECT u.id, $8::bigint, u.victim, u.corp, u.alliance, u.lost, u.item, u.system, u.system, u.killer, 1000, 0
-             FROM unnest($1::bigint[], $2::int[], $3::int[], $4::int[], $5::int[], $6::int[], $7::int[], $9::int[])
-                  AS u(id, victim, corp, alliance, lost, item, system, killer)"#,
-        &[&numbers, &victims, &victim_corps, &victim_alliances, &lost, &items, &systems, &now, &killers],
-    )
-    .await?;
-    db.execute(
-        r#"INSERT INTO "killLogParticipants" ("killID","ownerID","corporationID","allianceID","shipTypeID","weaponTypeID","damageDone","finalBlow")
-           SELECT u.id, u.who, u.corp, u.alliance, u.ship, 0, 1000, 1
-             FROM unnest($1::bigint[], $2::int[], $3::int[], $4::int[], $5::int[]) AS u(id, who, corp, alliance, ship)"#,
-        &[&numbers, &killers, &killer_corps, &killer_alliances, &killer_ships],
-    )
-    .await?;
-    Ok(())
+    store.write(|tx| -> Result<(), StoreError> {
+        let mut numbers = Vec::with_capacity(kills.len());
+        for _ in kills {
+            numbers.push(tx.nextval("killLog_killID_seq")?);
+        }
+        for (&(victim, killer, system, lost), &id) in kills.iter().zip(&numbers) {
+            let (v, vid) = (&bots[victim as usize], &ids[victim as usize]);
+            tx.insert(
+                "killLog",
+                &[
+                    ("killID", Value::Int(id)),
+                    ("killTime", Value::Int(now)),
+                    ("victimCharID", Value::Int(i64::from(v.id))),
+                    ("victimCorpID", Value::Int(i64::from(vid.corp))),
+                    ("victimAllianceID", Value::Int(i64::from(vid.alliance.unwrap_or(0)))),
+                    ("victimShipTypeID", Value::Int(i64::from(lost))),
+                    ("victimItemID", Value::Int(vid.ship)),
+                    ("solarSystemID", Value::Int(i64::from(system))),
+                    ("locationID", Value::Int(i64::from(system))),
+                    ("finalBlowID", Value::Int(i64::from(bots[killer as usize].id))),
+                    ("totalDamage", Value::Float(1000.0)),
+                    ("isPodKill", Value::Int(0)),
+                ],
+            )?;
+        }
+        for (&(_, killer, _, _), &id) in kills.iter().zip(&numbers) {
+            let (k, kid) = (&bots[killer as usize], &ids[killer as usize]);
+            tx.insert(
+                "killLogParticipants",
+                &[
+                    ("killID", Value::Int(id)),
+                    ("ownerID", Value::Int(i64::from(k.id))),
+                    ("corporationID", Value::Int(i64::from(kid.corp))),
+                    ("allianceID", Value::Int(i64::from(kid.alliance.unwrap_or(0)))),
+                    ("shipTypeID", Value::Int(i64::from(k.hull))),
+                    ("weaponTypeID", Value::Int(0)),
+                    ("damageDone", Value::Float(1000.0)),
+                    ("finalBlow", Value::Int(1)),
+                ],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// The star map's counts take in the online bots: (in space, docked) by
@@ -995,15 +1015,13 @@ fn roster(bots: &[Bot], ids: &[Identity], types: &HashMap<i32, i64>) -> std::syn
 }
 
 /// The character type (by bloodline) of every bot, for their portraits in Local.
-async fn character_types(db: &Client) -> HashMap<i32, i64> {
-    let sql = r#"SELECT c."characterID", c."typeID" FROM "bots" b JOIN "character_" c ON c."characterID" = b."characterID""#;
-    match db.query(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1) as i64)).collect(),
-        Err(e) => {
-            error!("bots: reading their character types: {}", crate::logging::chain(&e));
-            HashMap::new()
-        }
-    }
+fn character_types(db: &Db) -> HashMap<i32, i64> {
+    let characters = db.table("character_");
+    db.table("bots")
+        .rows()
+        .filter_map(|b| characters.get_id(b.int("characterID")?))
+        .map(|c| (c.int("characterID").unwrap_or(0) as i32, c.int("typeID").unwrap_or(0)))
+        .collect()
 }
 
 fn report(bots: &[Bot], t: &Tally, over: Duration, clock: f64, speed: f64, running: bool) -> String {

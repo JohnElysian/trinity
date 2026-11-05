@@ -373,34 +373,6 @@ function Get-Download([string]$Url, [string]$Name, [string]$Sha256) {
         finally { $client.Cancel(); $client.Dispose() }
     }
 }
-function Expand-PortableZip([string]$Archive, [string]$Destination) {
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [IO.Directory]::CreateDirectory($Destination) | Out-Null
-    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
-    $base = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
-    try {
-        $entries = @($zip.Entries | Where-Object { $_.FullName -match '^pgsql/(bin|lib|share)/' -and $_.Name -ne '' })
-        $completed = 0
-        $watch = [Diagnostics.Stopwatch]::StartNew()
-        Set-PhaseProgress 'EXTRACTING POSTGRESQL' 'Download verified. Extracting PostgreSQL - 0%' 0
-        foreach ($entry in $entries) {
-            Assert-Running
-            # pgAdmin is not needed and contains paths too long for PowerShell 5.1.
-            if ($entry.FullName -notmatch '^pgsql/(bin|lib|share)/') { continue }
-            $output = [IO.Path]::GetFullPath((Join-Path $Destination $entry.FullName))
-            if (-not $output.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { throw 'Archive contains an invalid path.' }
-            if ($entry.Name -eq '') { [IO.Directory]::CreateDirectory($output) | Out-Null; continue }
-            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($output)) | Out-Null
-            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $output, $true)
-            $completed++
-            if ($watch.ElapsedMilliseconds -ge 150 -or $completed -eq $entries.Count) {
-                $percent = [Math]::Floor(100.0 * $completed / $entries.Count)
-                Set-PhaseProgress 'EXTRACTING POSTGRESQL' ('Extracting PostgreSQL - {0}% ({1} / {2} files)' -f $percent,$completed,$entries.Count) $percent
-                $watch.Restart()
-            }
-        }
-    } finally { $zip.Dispose() }
-}
 function Test-FreePort([int]$Port) {
     $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
     $listener.ExclusiveAddressUse = $true
@@ -410,62 +382,17 @@ function Test-Listening([int]$Port) {
     $tcp = New-Object Net.Sockets.TcpClient
     try { $task = $tcp.ConnectAsync('127.0.0.1', $Port); return ($task.Wait(200) -and $tcp.Connected) } catch { return $false } finally { $tcp.Dispose() }
 }
-function Test-OwnedPostgres([string]$DataDirectory, [string]$Executable) {
-    $pidFile = Join-Path $DataDirectory 'postmaster.pid'
-    if (-not (Test-Path -LiteralPath $pidFile)) { return $false }
-    $pidLines = [IO.File]::ReadAllLines($pidFile)
-    $postgresId = 0
-    $startSeconds = [long]0
-    if ($pidLines.Length -lt 3 -or -not [int]::TryParse($pidLines[0], [ref]$postgresId) -or $postgresId -le 0) {
-        throw 'Cannot verify PostgreSQL ownership: invalid postmaster.pid. No process was stopped.'
-    }
-    $pgProcess = Get-Process -Id $postgresId -ErrorAction SilentlyContinue
-    if (-not $pgProcess) { return $false } # PostgreSQL can recover its stale PID file.
-    try {
-        $recordedData = [IO.Path]::GetFullPath($pidLines[1]).TrimEnd('\')
-        $expectedData = [IO.Path]::GetFullPath($DataDirectory).TrimEnd('\')
-        $expectedExecutable = [IO.Path]::GetFullPath($Executable)
-        if (-not [string]::Equals($recordedData, $expectedData, [StringComparison]::OrdinalIgnoreCase) -or
-            -not [string]::Equals($pgProcess.Path, $expectedExecutable, [StringComparison]::OrdinalIgnoreCase) -or
-            -not [long]::TryParse($pidLines[2], [ref]$startSeconds)) {
-            throw 'Cannot verify PostgreSQL ownership: the live PID does not match this database. No process was stopped.'
-        }
-        $epoch = [DateTime]::SpecifyKind([DateTime]'1970-01-01', [DateTimeKind]::Utc)
-        $recordedStart = $epoch.AddSeconds($startSeconds)
-        if ([Math]::Abs(($pgProcess.StartTime.ToUniversalTime() - $recordedStart).TotalSeconds) -gt 3) {
-            throw 'Cannot verify PostgreSQL ownership: the recorded PID has been reused. No process was stopped.'
-        }
-        return $true
-    } finally { $pgProcess.Dispose() }
-}
-function Install-PostgresRuntime([string]$Bin) {
-    $runtimeDlls = @('concrt140.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcruntime140.dll','vcruntime140_1.dll')
-    if (Test-Path -LiteralPath (Join-Path $Bin 'vclibs-installed.ok')) { return }
-    $archive = Get-Download 'https://download.microsoft.com/download/4/7/c/47c6134b-d61f-4024-83bd-b9c9ea951c25/Microsoft.VCLibs.x64.14.00.Desktop.appx' 'Microsoft.VCLibs.x64.14.00.Desktop.appx' 'b56a9101f706f9d95f815f5b7fa6efbac972e86573d378b96a07cff5540c5961'
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
-    try {
-        foreach ($name in $runtimeDlls) {
-            $entry = $zip.GetEntry($name)
-            if (-not $entry) { throw "Microsoft runtime archive is missing $name." }
-            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $Bin $name), $true)
-        }
-    } finally { $zip.Dispose() }
-    [IO.File]::WriteAllText((Join-Path $Bin 'vclibs-installed.ok'), '14.0.33321.0', $Utf8)
-}
 
 function Start-TrinityWorker {
-    $lock = $null; $server = $null; $databaseOwned = $false; $exitCode = 0
-    $gamePort = 26000; $webPort = 18080; $databasePort = 5432
+    $lock = $null; $server = $null; $exitCode = 0
+    $gamePort = 26000; $webPort = 18080
     $checkoutAlias = $null
     $originalTemp = $env:TEMP; $originalTmp = $env:TMP
     $previousOriginalTemp = $env:TRINITY_ORIGINAL_TEMP; $previousOriginalTmp = $env:TRINITY_ORIGINAL_TMP
-    $pgBin = Join-Path $Runtime 'postgres-16.15\pgsql\bin'
-    $data = Join-Path $Runtime 'data'
     try {
         try { $lock = [IO.File]::Open((Join-Path $Runtime 'launcher.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
         catch { Write-Host 'Trinity is already running from this folder. Use its launcher window.'; return 2 }
-        # Native PostgreSQL subprocesses and compiler tools receive short ASCII
+        # Native subprocesses and compiler tools receive short ASCII
         # paths even when the checkout lives under Unicode names or a UNC share.
         $checkoutAlias = New-NativePathAlias -Path $SourceRoot
         $script:Root = $checkoutAlias.Root
@@ -488,8 +415,6 @@ function Start-TrinityWorker {
         [IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
         $env:TRINITY_ORIGINAL_TEMP = $originalTemp; $env:TRINITY_ORIGINAL_TMP = $originalTmp
         $env:TEMP = $temporaryDirectory; $env:TMP = $temporaryDirectory
-        $pgBin = Join-Path $Runtime 'postgres-16.15\pgsql\bin'
-        $data = Join-Path $Runtime 'data'
         if (Test-Path -LiteralPath $StopPath) {
             $request = [IO.File]::ReadAllText($StopPath).Trim()
             $started = [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime()
@@ -498,7 +423,7 @@ function Start-TrinityWorker {
         [IO.File]::WriteAllText($LogPath, ('Trinity launcher - ' + (Get-Date -Format s) + "`r`n"), $Utf8)
         Set-Status 'Preparing' 'Checking Windows and preparing your local server' 2
         if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) { throw 'Trinity requires 64-bit Windows and 64-bit Windows PowerShell.' }
-        foreach ($required in @('Cargo.lock','Cargo.toml','trinity.yml','db\00_shared.sql.gz','crates\eve-server\Cargo.toml')) {
+        foreach ($required in @('Cargo.lock','Cargo.toml','trinity.yml','crates\eve-server\Cargo.toml')) {
             if (-not (Test-Path -LiteralPath (Join-Path $Root $required))) { throw "Missing $required. Keep start.bat in the extracted Trinity repository." }
         }
         $settingsPath = Join-Path $Runtime 'settings.json'
@@ -557,86 +482,61 @@ function Start-TrinityWorker {
             Invoke-Native $rustup @('toolchain','install','1.97.0-x86_64-pc-windows-gnu','--profile','minimal','--no-self-update')
             [IO.File]::WriteAllText($toolchainReady, '1.97.0-x86_64-pc-windows-gnu', $Utf8)
         }
-        Set-Status 'PostgreSQL' 'Preparing portable PostgreSQL 16.15' 20
-        $pgDir = Join-Path $Runtime 'postgres-16.15'
-        if (-not (Test-Path -LiteralPath (Join-Path $pgDir 'installed.ok'))) {
-            $archive = Get-Download 'https://get.enterprisedb.com/postgresql/postgresql-16.15-1-windows-x64-binaries.zip' 'postgresql-16.15-1-windows-x64-binaries.zip' '25e6fcdfb8caec38691bf461125e7564508760666f7b8e5dc6a5f0818f58f81e'
-            Set-Status 'Extracting PostgreSQL' 'Download verified. Preparing the database tools...' 22
-            Expand-PortableZip $archive $pgDir
-            [IO.File]::WriteAllText((Join-Path $pgDir 'installed.ok'), '16.15', $Utf8)
-        }
-        # Install app-local Microsoft runtime DLLs here; no machine-wide installer.
-        Install-PostgresRuntime $pgBin
-        Invoke-Native (Join-Path $pgBin 'postgres.exe') @('--version')
         Set-Status 'Building' 'Compiling Trinity; later launches reuse the build cache' 35
         Invoke-Native $rustup @('run','1.97.0-x86_64-pc-windows-gnu','cargo','build','--release','--locked','-p','eve-server','--bin','eve-server','--target','x86_64-pc-windows-gnu')
 
-        Set-Status 'Database' 'Preparing your private PostgreSQL database' 50
-        $passwordPath = Join-Path $Runtime 'database-password.txt'
-        if (-not (Test-Path -LiteralPath $passwordPath)) {
-            if (Test-Path -LiteralPath (Join-Path $data 'PG_VERSION')) { throw 'Database password file is missing. Restore .trinity/database-password.txt from your backup.' }
-            $random = New-Object byte[] 32
-            $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-            try { $rng.GetBytes($random) } finally { $rng.Dispose() }
-            [IO.File]::WriteAllText($passwordPath, ([BitConverter]::ToString($random).Replace('-','').ToLowerInvariant()), $Utf8)
+        # ONE-TIME MIGRATION from the old PostgreSQL-based launcher. Old versions kept their
+        # cluster in .trinity\data. The server's own data lives in .trinity\world. If world has
+        # no snapshot yet and the old cluster exists, dump it once to .trinity\import.sql for the
+        # server to import. Only the PostgreSQL binaries the old launcher already downloaded are
+        # used; nothing is downloaded. The old cluster is never modified or moved.
+        $data = Join-Path $Runtime 'data'
+        $world = Join-Path $Runtime 'world'
+        $importPath = Join-Path $Runtime 'import.sql'
+        $env:RMR_DATA = $world
+        $env:RMR_IMPORT = $null
+        $hasSnapshot = (Test-Path -LiteralPath $world) -and @(Get-ChildItem -LiteralPath $world -Filter 'snapshot.*.json.gz' -ErrorAction SilentlyContinue).Count -gt 0
+        if (-not $hasSnapshot -and (Test-Path -LiteralPath (Join-Path $data 'PG_VERSION'))) {
+            $pgBin = Join-Path $Runtime 'postgres-16.15\pgsql\bin'
+            $pgCtl = Join-Path $pgBin 'pg_ctl.exe'
+            $pgDump = Join-Path $pgBin 'pg_dump.exe'
+            $passwordPath = Join-Path $Runtime 'database-password.txt'
+            $pgStarted = $false
+            Set-Status 'Migrating' 'Importing your existing universe from the old PostgreSQL database (one time)' 40
+            try {
+                if (-not ((Test-Path -LiteralPath $pgCtl) -and (Test-Path -LiteralPath $pgDump) -and (Test-Path -LiteralPath $passwordPath))) { throw 'The old PostgreSQL tools or database-password.txt are missing.' }
+                if (-not (Test-FreePort 5432)) { throw 'Port 5432 is already in use, so the old PostgreSQL database cannot be opened.' }
+                foreach ($variable in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PG*' })) {
+                    [Environment]::SetEnvironmentVariable($variable.Name, $null, 'Process')
+                }
+                $env:PGPASSWORD = [IO.File]::ReadAllText($passwordPath).Trim()
+                $env:PGCLIENTENCODING = 'UTF8'
+                $env:PGCONNECT_TIMEOUT = '5'
+                $pgStarted = $true
+                Invoke-Native $pgCtl @('start','-D',$data,'-l',(Join-Path $Logs 'postgres.log'),'-o','-h 127.0.0.1 -p 5432','-w','-t','60') -Timeout 90
+                $partial = $importPath + '.part'
+                Invoke-Native $pgDump @('-h','127.0.0.1','-p','5432','-U','trinity','-d','trinity','--data-only','--no-owner','-f',$partial) -Timeout 1800
+                if (-not (Test-Path -LiteralPath $partial) -or (Get-Item -LiteralPath $partial).Length -lt 1) { throw 'pg_dump produced no output.' }
+                Move-Item -LiteralPath $partial -Destination $importPath -Force
+                Invoke-Native $pgCtl @('stop','-D',$data,'-m','fast','-w','-t','60') -Timeout 90
+                $pgStarted = $false
+                Write-Log 'Old PostgreSQL data was imported into import.sql. It is left in .trinity\data and can be deleted once you are happy with the new world.'
+            } catch [OperationCanceledException] { throw }
+            catch {
+                Write-Log ('PostgreSQL migration failed: ' + $_.Exception.Message)
+                Write-Log 'The old PostgreSQL data was left untouched and was NOT imported.'
+                Set-Status 'Migrating' 'The old PostgreSQL data could not be imported (see logs/launcher.log). Starting a fresh world; your old data was not changed.' 45
+                if (Test-Path -LiteralPath ($importPath + '.part')) { Remove-Item -LiteralPath ($importPath + '.part') -ErrorAction SilentlyContinue }
+            } finally {
+                if ($pgStarted) {
+                    try { Invoke-Native $pgCtl @('stop','-D',$data,'-m','fast','-w','-t','60') -Timeout 90 }
+                    catch { try { & $pgCtl stop -D $data -m fast -w -t 60 *> $null } catch { Write-Log ('Could not stop the old PostgreSQL: ' + $_.Exception.Message) } }
+                }
+                $env:PGPASSWORD = $null
+            }
         }
-        $password = [IO.File]::ReadAllText($passwordPath).Trim()
-        # Existing PostgreSQL client/service settings must not redirect or alter
-        # the private cluster. These changes affect only this worker and its children.
-        foreach ($variable in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PG*' })) {
-            [Environment]::SetEnvironmentVariable($variable.Name, $null, 'Process')
-        }
-        $env:PGPASSWORD = $password
-        $env:PGCLIENTENCODING = 'UTF8'
-        $env:PGCONNECT_TIMEOUT = '5'
-        if (-not (Test-Path -LiteralPath (Join-Path $data 'PG_VERSION'))) {
-            if (Test-Path -LiteralPath $data) { throw 'Incomplete data folder found. Preserve it and move it aside before retrying.' }
-            $staging = Join-Path $Runtime ('data-init-' + [Guid]::NewGuid().ToString('N'))
-            Invoke-Native (Join-Path $pgBin 'initdb.exe') @('-D',$staging,'-U','trinity','--pwfile',$passwordPath,'--encoding=UTF8','--locale=C','--auth-host=scram-sha-256','--auth-local=scram-sha-256')
-            # Both absolute paths are fixed children of this launcher's private runtime.
-            [IO.Directory]::Move($staging, $data)
-        }
-        if ([IO.File]::ReadAllText((Join-Path $data 'PG_VERSION')).Trim() -ne '16') { throw 'This launcher requires a PostgreSQL 16 data directory.' }
-        $pgCtl = Join-Path $pgBin 'pg_ctl.exe'
-        if (Test-OwnedPostgres $data (Join-Path $pgBin 'postgres.exe')) {
-            Invoke-Native $pgCtl @('status','-D',$data)
-            $databaseOwned = $true
-            Invoke-Native $pgCtl @('stop','-D',$data,'-m','fast','-w','-t','60') -Timeout 90
-            $databaseOwned = $false
-        }
-        if (-not (Test-FreePort $databasePort)) { throw 'PostgreSQL port 5432 is already in use. Close the other database server before starting Trinity.' }
-        $databaseOwned = $true
-        $pgOptions = '-h 127.0.0.1 -p ' + $databasePort
-        Invoke-Native $pgCtl @('start','-D',$data,'-l',(Join-Path $Logs 'postgres.log'),'-o',$pgOptions,'-w','-t','60') -Timeout 90
-        $psql = Join-Path $pgBin 'psql.exe'
-        $pgArgs = @('-X','-h','127.0.0.1','-p',[string]$databasePort,'-U','trinity','-v','ON_ERROR_STOP=1')
-        $exists = Invoke-Native $psql ($pgArgs + @('-d','postgres','-Atc',"SELECT 1 FROM pg_database WHERE datname='trinity'")) -Capture
-        if ($exists -ne '1') { Invoke-Native (Join-Path $pgBin 'createdb.exe') @('-h','127.0.0.1','-p',[string]$databasePort,'-U','trinity','-E','UTF8','-T','template0','trinity') }
-        $dbArgs = $pgArgs + @('-d','trinity')
-        Invoke-Native $psql ($dbArgs + @('-q','-c','CREATE TABLE IF NOT EXISTS public.trinity_launcher_imports (name text PRIMARY KEY, imported_at timestamptz NOT NULL DEFAULT now());'))
-        $done = Invoke-Native $psql ($dbArgs + @('-Atc','SELECT name FROM public.trinity_launcher_imports ORDER BY name;')) -Capture
-        $completed = @{}
-        foreach ($name in ($done -split "`n")) { $completed[$name.Trim()] = $true }
-        $dumps = @(Get-ChildItem -LiteralPath (Join-Path $Root 'db') -Filter '*.sql.gz' | Sort-Object -Property Name)
-        if ($dumps.Count -lt 1) { throw 'No database dumps found.' }
-        $index = 0
-        foreach ($dump in $dumps) {
-            Assert-Running
-            $index++
-            if ($completed.ContainsKey($dump.Name)) { continue }
-            Set-Status 'Importing universe' ("{0}/{1} - {2}" -f $index,$dumps.Count,$dump.Name) (50 + [int](35 * $index / $dumps.Count))
-            $sqlPath = Join-Path $Runtime 'import.sql'
-            $inputFile = [IO.File]::OpenRead($dump.FullName)
-            $gzip = New-Object IO.Compression.GzipStream($inputFile, [IO.Compression.CompressionMode]::Decompress)
-            $outputFile = [IO.File]::Create($sqlPath)
-            try { $gzip.CopyTo($outputFile) } finally { $outputFile.Dispose(); $gzip.Dispose(); $inputFile.Dispose() }
-            $safeName = $dump.Name.Replace("'", "''")
-            [IO.File]::AppendAllText($sqlPath, "`nINSERT INTO public.trinity_launcher_imports(name) VALUES ('$safeName');`n", $Utf8)
-            # Each dump and its checkpoint commit together, so interrupted setup resumes safely.
-            Invoke-Native $psql ($dbArgs + @('-q','-o','NUL','--single-transaction','-f',$sqlPath)) -Timeout 900
-        }
-        $sqlPath = Join-Path $Runtime 'import.sql'
-        if (Test-Path -LiteralPath $sqlPath) { Remove-Item -LiteralPath $sqlPath }
+        # Start the server from the dump while the world folder has no snapshot yet.
+        if (-not $hasSnapshot -and (Test-Path -LiteralPath $importPath) ) { $env:RMR_IMPORT = $importPath }
 
         Set-Status 'Client' 'Finding and preparing the Trinity game client' 87
         Prepare-TrinityClient $settings
@@ -644,7 +544,6 @@ function Start-TrinityWorker {
         Set-Status 'Starting' 'Loading the universe and starting the game server' 92
         $env:RMR_CONFIG = Join-Path $Root 'trinity.yml'
         $env:RMR_STRINGS = Join-Path $Root 'crates\eve-marshal\data\strings.txt'
-        $env:RMR_DATABASE = 'postgres://trinity:' + $password + '@127.0.0.1:' + $databasePort + '/trinity'
         $env:RMR_BIND = '127.0.0.1:' + $gamePort
         $env:RMR_WEB = '127.0.0.1:' + $webPort
         $env:RMR_LOG_FILE = Join-Path $Logs 'server.log'
@@ -685,24 +584,11 @@ function Start-TrinityWorker {
                     Read-NativeOutput $server
                     $server.Process.Dispose()
                 }
-                if ($databaseOwned) {
-                    Write-Log 'Stopping this launcher''s PostgreSQL database...'
-                    try {
-                        if (Test-OwnedPostgres $data (Join-Path $pgBin 'postgres.exe')) {
-                            Invoke-Native (Join-Path $pgBin 'pg_ctl.exe') @('stop','-D',$data,'-m','fast','-w','-t','60') -Timeout 90
-                        }
-                        $databaseOwned = $false
-                    }
-                    catch { $exitCode = 1; $script:Status.error = $true; Set-Status 'Needs attention' ('Database shutdown failed: ' + $_.Exception.Message) 100 }
-                }
-                $env:PGPASSWORD = $null; $env:RMR_DATABASE = $null
+                $env:RMR_DATA = $null; $env:RMR_IMPORT = $null
                 $script:Status.stopped = $true
                 if (-not $script:Status.error) { Set-Status 'Stopped' 'Server stopped. Your universe is saved for the next launch.' 100 }
                 else { [IO.File]::WriteAllText($StatusPath, ($script:Status | ConvertTo-Json -Compress), $Utf8) }
             } finally {
-                # Keep the path available if PostgreSQL could not be stopped.
-                # A later launcher can reuse it and recover the private cluster.
-                if ($databaseOwned -and $checkoutAlias) { $checkoutAlias.Created = $false }
                 try {
                     try {
                         Set-Location -LiteralPath $SourceRoot
@@ -1199,7 +1085,7 @@ namespace Trinity {
     $stageLabel.AutoEllipsis = $true
     $stageLabel.Margin = New-Object System.Windows.Forms.Padding(0)
     $messageLabel = New-Object System.Windows.Forms.Label
-    $messageLabel.Text = if ($firstRun) { 'We will download the tools, build your server and prepare its database automatically.' } else { 'Checking your saved setup and getting everything ready for launch.' }
+    $messageLabel.Text = if ($firstRun) { 'We will download the tools, build your server automatically.' } else { 'Checking your saved setup and getting everything ready for launch.' }
     $messageLabel.ForeColor = $muted
     $messageLabel.Dock = 'Fill'
     $messageLabel.AutoEllipsis = $true
@@ -1232,7 +1118,7 @@ namespace Trinity {
     $progressTrack.Dock = 'Fill'
     $progressTrack.Margin = New-Object System.Windows.Forms.Padding(0)
     $setupHint = New-Object System.Windows.Forms.Label
-    $setupHint.Text = if ($firstRun) { 'First setup can take a few minutes while tools download and the database is prepared.' } else { 'Your saved universe and installed tools will be reused.' }
+    $setupHint.Text = if ($firstRun) { 'First setup can take a few minutes while tools download and the server is built.' } else { 'Your saved universe and installed tools will be reused.' }
     $setupHint.Font = New-Object System.Drawing.Font('Segoe UI', 11.5)
     $setupHint.ForeColor = $muted
     $setupHint.Dock = 'Fill'
@@ -1397,7 +1283,7 @@ namespace Trinity {
             $stageLabel.Text = 'Stopping Trinity'
             $form.Text = 'Trinity | Stopping'
             $statusEyebrow.Text = 'SAFE SHUTDOWN'
-            $messageLabel.Text = 'Finishing the current operation and shutting down the database. Please keep this window open.'
+            $messageLabel.Text = 'Finishing the current operation and saving the server. Please keep this window open.'
             $setupHint.Text = 'Your universe will be kept for the next launch.'
             $stopButton.Enabled = $false
             $stopButton.Text = 'Stopping...'
@@ -1588,7 +1474,7 @@ namespace Trinity {
                 $setupHint.Text = 'Close this window when you are ready.'
                 if ($state.Process.ExitCode -eq 0) {
                     $stageLabel.Text = 'Trinity stopped'
-                    $messageLabel.Text = 'Your database is kept for next time. Run start.bat whenever you are ready.'
+                    $messageLabel.Text = 'Your universe is kept for next time. Run start.bat whenever you are ready.'
                 } else {
                     $statusEyebrow.Text = 'A LITTLE ATTENTION NEEDED'
                     $stageLabel.Text = 'Trinity needs attention'
@@ -1660,7 +1546,7 @@ namespace Trinity {
 
 if ($env:TRINITY_MODE -eq 'stop') {
     [IO.File]::WriteAllText($StopPath, 'stop', $Utf8)
-    Write-Host 'Stop requested. The launcher will save and close its database.'
+    Write-Host 'Stop requested. The launcher will save and close the server.'
     exit 0
 }
 if ($env:TRINITY_MODE -eq 'ui') {

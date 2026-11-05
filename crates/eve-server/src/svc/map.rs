@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use eve_marshal::Value;
-use tracing::error;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{cell, rowset};
+use crate::store::{self, Db, Store, StoreError, Tx};
+use crate::svc::rows::rowset;
 
 pub async fn map(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
@@ -29,111 +31,186 @@ async fn alliance_beacons(ctx: &Ctx<'_>) -> Value {
         return Value::List(vec![]);
     };
     // Capital navigation unpacks (solarSystemID, structureID, structureTypeID).
-    let sql = r#"SELECT e."locationID",e."itemID",e."typeID" FROM entity e
-        JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "posStructures" p ON p."itemID"=e."itemID"
-        JOIN corporation c ON c."corporationID"=e."ownerID"
-        WHERE c."allianceID"=$1 AND t."groupID"=838 AND p.state IN (4,5)
-        ORDER BY e."locationID",e."itemID""#;
-    Value::List(
-        ctx.query(sql, &[&(alliance as i32)])
-            .await
-            .iter()
-            .map(|r| Value::Tuple(crate::svc::rows::line(r)))
-            .collect(),
-    )
+    // The beacons are the Cynosural Generator Arrays (group 838).
+    let beacons = crate::sde::get().types_in_group(838);
+    let mut found: Vec<(i64, i64, Vec<Value>)> = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        let structures = db.table("posStructures");
+        let mut found = Vec::new();
+        for corp in db.table("corporation").find(&["allianceID"], &[store::Value::Int(alliance)]) {
+            let Some(owner) = corp.int("corporationID") else { continue };
+            for e in entity.find(&["ownerID"], &[store::Value::Int(owner)]) {
+                if !e.int("typeID").is_some_and(|t| beacons.contains(&(t as i32))) {
+                    continue;
+                }
+                let online = e
+                    .int("itemID")
+                    .and_then(|id| structures.get_id(id))
+                    .is_some_and(|p| matches!(p.int("state"), Some(4 | 5)));
+                if online {
+                    found.push((e.int("locationID").unwrap_or(0), e.int("itemID").unwrap_or(0), e.line(&["locationID", "itemID", "typeID"])));
+                }
+            }
+        }
+        found
+    });
+    found.sort_by_key(|(location, item, _)| (*location, *item));
+    Value::List(found.into_iter().map(|(_, _, line)| Value::Tuple(line)).collect())
 }
 
 async fn pseudo_securities(ctx: &Ctx<'_>) -> Value {
     const HEADER: &[&str] = &["solarSystemID", "security"];
-    let sql = r#"SELECT "solarSystemID", "security"
-                   FROM "mapSolarSystems" WHERE "security" IS NOT NULL"#;
-    ctx.rowset(HEADER, sql, &[]).await
+    let lines = ctx.store.read(|db| {
+        db.table("mapSolarSystems").rows().filter(|r| !r.value("security").is_null()).map(|r| Value::List(r.line(HEADER))).collect()
+    });
+    rowset(HEADER, lines)
 }
 
 fn stuck_systems() -> Value {
     Value::Dict(Vec::new())
 }
 
-pub async fn ensure(db: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    db.batch_execute(
-        r#"CREATE TABLE IF NOT EXISTS "chrSystemVisits" (
-        "characterID" integer NOT NULL,"solarSystemID" integer NOT NULL,
-        visits integer NOT NULL DEFAULT 1,"lastDateTime" bigint NOT NULL,
-        PRIMARY KEY ("characterID","solarSystemID"));
-        CREATE TABLE IF NOT EXISTS "mapActivity" (
-        "solarSystemID" integer NOT NULL,kind smallint NOT NULL,"eventTime" bigint NOT NULL);
-        CREATE INDEX IF NOT EXISTS "mapActivity_time" ON "mapActivity" ("eventTime");"#,
-    )
-    .await
+/// The tables are defined by the store's schema; nothing to bring up to
+/// date.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    Ok(())
 }
 
-pub async fn record_visit(
-    db: &tokio_postgres::Client,
-    char_id: i64,
-    system: i64,
-    arrived: bool,
-) -> Result<(), tokio_postgres::Error> {
-    db.execute(r#"INSERT INTO "chrSystemVisits" ("characterID","solarSystemID","lastDateTime") VALUES ($1,$2,$3)
-        ON CONFLICT ("characterID","solarSystemID") DO UPDATE SET
-        visits="chrSystemVisits".visits + CASE WHEN $4 THEN 1 ELSE 0 END,"lastDateTime"=$3"#,
-        &[&(char_id as i32),&(system as i32),&crate::bulkdata::filetime_now(),&arrived]).await?;
-    Ok(())
+pub async fn record_visit(store: &Store, char_id: i64, system: i64, arrived: bool) -> Result<(), StoreError> {
+    let now = crate::bulkdata::filetime_now();
+    store.write(|tx| {
+        let key = [store::Value::Int(char_id), store::Value::Int(system)];
+        match tx.table("chrSystemVisits").get(&key).map(|r| (r.id, r.int("visits").unwrap_or(0))) {
+            Some((id, visits)) => tx.update(
+                "chrSystemVisits",
+                id,
+                &[("visits", store::Value::Int(visits + i64::from(arrived))), ("lastDateTime", store::Value::Int(now))],
+            ),
+            None => tx
+                .insert(
+                    "chrSystemVisits",
+                    &[("characterID", key[0].clone()), ("solarSystemID", key[1].clone()), ("lastDateTime", store::Value::Int(now))],
+                )
+                .map(drop),
+        }
+    })
 }
 
 /// kind 1 is a jump; kind 2 an NPC ship destroyed.
-pub async fn record_activity(
-    db: &tokio_postgres::Client,
-    system: i64,
-    kind: i16,
-) -> Result<(), tokio_postgres::Error> {
-    db.execute(
-        r#"INSERT INTO "mapActivity" ("solarSystemID",kind,"eventTime") VALUES ($1,$2,$3)"#,
-        &[&(system as i32), &kind, &crate::bulkdata::filetime_now()],
-    )
-    .await?;
-    Ok(())
+pub async fn record_activity(store: &Store, system: i64, kind: i16) -> Result<(), StoreError> {
+    store.write(|tx| {
+        tx.insert(
+            "mapActivity",
+            &[
+                ("solarSystemID", store::Value::Int(system)),
+                ("kind", store::Value::Int(kind.into())),
+                ("eventTime", store::Value::Int(crate::bulkdata::filetime_now())),
+            ],
+        )
+        .map(drop)
+    })
+}
+
+/// Per-system sums, in the order each system first appears (as a GROUP BY
+/// without ORDER BY gave them).
+#[derive(Default)]
+struct BySystem {
+    order: Vec<i64>,
+    sums: HashMap<i64, [i64; 3]>,
+}
+
+impl BySystem {
+    fn add(&mut self, system: i64, values: [i64; 3]) {
+        let sums = self.sums.entry(system).or_insert_with(|| {
+            self.order.push(system);
+            [0; 3]
+        });
+        for (sum, v) in sums.iter_mut().zip(values) {
+            *sum += v;
+        }
+    }
+
+    fn lines(&self) -> Vec<Value> {
+        self.order
+            .iter()
+            .map(|s| Value::List(std::iter::once(*s).chain(self.sums[s]).map(Value::Int).collect()))
+            .collect()
+    }
 }
 
 async fn history(ctx: &Ctx<'_>, kind: i64, hours: i64) -> Value {
     let header = &["solarSystemID", "value1", "value2", "value3"];
     let since = crate::bulkdata::filetime_now() - hours.clamp(1, 24) * 36_000_000_000;
+    // The recent mapActivity rows of one kind, by system.
+    let activity = |db: &Db, kind: i64| -> Vec<i64> {
+        db.table("mapActivity")
+            .rows()
+            .filter(|r| r.int("kind") == Some(kind) && r.int("eventTime").is_some_and(|t| t >= since))
+            .filter_map(|r| r.int("solarSystemID"))
+            .collect()
+    };
     match kind {
-        1 => ctx.rowset(header,r#"SELECT "solarSystemID",count(*)::integer,0,0 FROM "mapActivity"
-            WHERE kind=1 AND "eventTime">=$1 GROUP BY "solarSystemID""#,&[&since]).await,
-        3 => ctx.rowset(header,r#"SELECT "solarSystemID",sum(ships)::integer,sum(npcs)::integer,sum(pods)::integer FROM (
-            SELECT "solarSystemID",count(*) FILTER (WHERE "isPodKill"=0) AS ships,0::bigint AS npcs,
-                count(*) FILTER (WHERE "isPodKill"<>0) AS pods FROM "killLog" WHERE "killTime">=$1 GROUP BY "solarSystemID"
-            UNION ALL SELECT "solarSystemID",count(*),count(*),0::bigint FROM "mapActivity"
-                WHERE kind=2 AND "eventTime">=$1 GROUP BY "solarSystemID") h GROUP BY "solarSystemID""#,&[&since]).await,
-        _ => rowset(header,vec![]),
+        1 => {
+            let lines = ctx.store.read(|db| {
+                let mut jumps = BySystem::default();
+                for system in activity(db, 1) {
+                    jumps.add(system, [1, 0, 0]);
+                }
+                jumps.lines()
+            });
+            rowset(header, lines)
+        }
+        3 => {
+            // Ships, NPCs and pods destroyed: a kill counts as a ship or a
+            // pod, an NPC kill as both a ship and an NPC.
+            let lines = ctx.store.read(|db| {
+                let mut kills = BySystem::default();
+                for r in db.table("killLog").rows().filter(|r| r.int("killTime").is_some_and(|t| t >= since)) {
+                    let Some(system) = r.int("solarSystemID") else { continue };
+                    let pod = r.int("isPodKill").unwrap_or(0) != 0;
+                    kills.add(system, if pod { [0, 0, 1] } else { [1, 0, 0] });
+                }
+                for system in activity(db, 2) {
+                    kills.add(system, [1, 1, 0]);
+                }
+                kills.lines()
+            });
+            rowset(header, lines)
+        }
+        _ => rowset(header, vec![]),
     }
 }
 
 async fn solar_system_visits(ctx: &Ctx<'_>) -> Value {
-    ctx.rowset(&["solarSystemID", "visits", "lastDateTime"],
-        r#"SELECT "solarSystemID",visits,"lastDateTime" FROM "chrSystemVisits" WHERE "characterID"=$1 ORDER BY "solarSystemID""#,
-        &[&(ctx.session.char_id.unwrap_or(0) as i32)]).await
+    const HEADER: &[&str] = &["solarSystemID", "visits", "lastDateTime"];
+    let char_id = ctx.session.char_id.unwrap_or(0);
+    let lines = ctx.store.read(|db| {
+        let mut visits: Vec<_> = db.table("chrSystemVisits").find(&["characterID"], &[store::Value::Int(char_id)]).collect();
+        visits.sort_by_key(|r| r.int("solarSystemID"));
+        visits.iter().map(|r| Value::List(r.line(HEADER))).collect()
+    });
+    rowset(HEADER, lines)
 }
 
 async fn station_count(ctx: &Ctx<'_>) -> Value {
-    let sql = r#"SELECT "solarSystemID", count(*)::int AS "count"
-                   FROM "staStations" GROUP BY "solarSystemID""#;
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => Value::List(
-            rows.iter()
-                .map(|r| Value::Tuple(vec![cell(r, 0), cell(r, 1)]))
-                .collect(),
-        ),
-        Err(e) => {
-            error!("GetStationCount: {err}", err = crate::logging::chain(&e));
-            Value::List(Vec::new())
+    // Stations without a system count together, as GROUP BY put them.
+    let counts = ctx.store.read(|db| {
+        let mut order: Vec<Option<i64>> = Vec::new();
+        let mut counts: HashMap<Option<i64>, i64> = HashMap::new();
+        for r in db.table("staStations").rows() {
+            let system = r.int("solarSystemID");
+            *counts.entry(system).or_insert_with(|| {
+                order.push(system);
+                0
+            }) += 1;
         }
-    }
+        order.into_iter().map(|s| (s, counts[&s])).collect::<Vec<_>>()
+    });
+    Value::List(counts.into_iter().map(|(system, count)| Value::Tuple(vec![Value::int_or_none(system), Value::Int(count)])).collect())
 }
 
 async fn deadspace_complex_map(ctx: &Ctx<'_>) -> Value {
-    let found = crate::complexes::map(ctx.db).await;
+    let found = ctx.store.read(|db| crate::complexes::map(db));
     Value::List(
         found
             .into_iter()
@@ -158,9 +235,13 @@ async fn my_extra_map_info_agents(ctx: &Ctx<'_>) -> Value {
     let Some(char_id) = ctx.session.char_id else {
         return rowset(HEADER, Vec::new());
     };
-    let sql = r#"SELECT "fromID", "standing" / 10.0 AS "rank"
-                   FROM "chrNPCStandings" WHERE "characterID" = $1"#;
-    ctx.rowset(HEADER, sql, &[&(char_id as i32)]).await
+    let lines = ctx.store.read(|db| {
+        db.table("chrNPCStandings")
+            .find(&["characterID"], &[store::Value::Int(char_id)])
+            .map(|r| Value::List(vec![r.cell("fromID"), r.float("standing").map_or(Value::None, |s| Value::Double(s / 10.0))]))
+            .collect()
+    });
+    rowset(HEADER, lines)
 }
 
 fn load_ratios() -> Value {
@@ -186,15 +267,14 @@ mod tests {
             .unwrap()
     }
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn visits_persist_and_map_history_separates_npcs_ships_and_pods() {
         let fixture = crate::test_support::Database::load().await;
         let pilot = fixture.id().await as i64;
         let system = fixture.id().await as i64;
-        let db = &fixture.db;
-        record_visit(db, pilot, system, false).await.unwrap();
-        record_visit(db, pilot, system, false).await.unwrap();
-        record_visit(db, pilot, system, true).await.unwrap();
+        let store = &fixture.store;
+        record_visit(store, pilot, system, false).await.unwrap();
+        record_visit(store, pilot, system, false).await.unwrap();
+        record_visit(store, pilot, system, true).await.unwrap();
         let session = crate::session::Session {
             char_id: Some(pilot),
             ..Default::default()
@@ -206,12 +286,33 @@ mod tests {
             Some(2),
             "relogin does not count as arrival"
         );
-        record_activity(db, system, 1).await.unwrap();
-        record_activity(db, system, 2).await.unwrap();
-        for pod in [0i16, 1] {
-            db.execute(r#"INSERT INTO "killLog" ("killTime","victimCharID","victimCorpID","victimAllianceID","victimShipTypeID","victimItemID","solarSystemID","locationID","finalBlowID","totalDamage","isPodKill")
-                VALUES ($1,$2,0,0,670,0,$3,$3,0,1,$4)"#,&[&crate::bulkdata::filetime_now(),&(pilot as i32),&(system as i32),&pod]).await.unwrap();
-        }
+        record_activity(store, system, 1).await.unwrap();
+        record_activity(store, system, 2).await.unwrap();
+        store
+            .write(|tx| {
+                for pod in [0, 1] {
+                    let kill = tx.nextval("killLog_killID_seq")?;
+                    tx.insert(
+                        "killLog",
+                        &[
+                            ("killID", store::Value::Int(kill)),
+                            ("killTime", store::Value::Int(crate::bulkdata::filetime_now())),
+                            ("victimCharID", store::Value::Int(pilot)),
+                            ("victimCorpID", store::Value::Int(0)),
+                            ("victimAllianceID", store::Value::Int(0)),
+                            ("victimShipTypeID", store::Value::Int(670)),
+                            ("victimItemID", store::Value::Int(0)),
+                            ("solarSystemID", store::Value::Int(system)),
+                            ("locationID", store::Value::Int(system)),
+                            ("finalBlowID", store::Value::Int(0)),
+                            ("totalDamage", store::Value::Float(1.0)),
+                            ("isPodKill", store::Value::Int(pod)),
+                        ],
+                    )?;
+                }
+                Ok::<_, StoreError>(())
+            })
+            .unwrap();
         let killed = history(&ctx, 3, 24).await;
         let row = lines(&killed)
             .iter()
@@ -234,32 +335,17 @@ mod tests {
             .seq()
             .unwrap();
         assert_eq!(row[1].as_i64(), Some(1));
-        db.execute(
-            r#"UPDATE "mapActivity" SET "eventTime"=0 WHERE "solarSystemID"=$1"#,
-            &[&(system as i32)],
-        )
-        .await
-        .unwrap();
+        store
+            .write(|tx| {
+                let ids: Vec<_> = tx.table("mapActivity").find(&["solarSystemID"], &[store::Value::Int(system)]).map(|r| r.id).collect();
+                for id in ids {
+                    tx.update("mapActivity", id, &[("eventTime", store::Value::Int(0))])?;
+                }
+                Ok::<_, StoreError>(())
+            })
+            .unwrap();
         assert!(!lines(&history(&ctx, 1, 1).await)
             .iter()
             .any(|r| r.seq().unwrap()[0].as_i64() == Some(system)));
-        db.execute(
-            r#"DELETE FROM "mapActivity" WHERE "solarSystemID"=$1"#,
-            &[&(system as i32)],
-        )
-        .await
-        .unwrap();
-        db.execute(
-            r#"DELETE FROM "chrSystemVisits" WHERE "characterID"=$1"#,
-            &[&(pilot as i32)],
-        )
-        .await
-        .unwrap();
-        db.execute(
-            r#"DELETE FROM "killLog" WHERE "victimCharID"=$1"#,
-            &[&(pilot as i32)],
-        )
-        .await
-        .unwrap();
     }
 }

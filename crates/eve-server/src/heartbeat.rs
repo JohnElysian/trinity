@@ -1,21 +1,21 @@
 //! The server's pulse: four times a second, every solar system with a player
 //! in space moves on (see `fight`). The pulse only decides, under the world
-//! lock; what it decided that needs the database is done after the lock is
-//! released, on the heartbeat's own connection: charges used, ore mined,
-//! bounties paid, ships and capsules lost.
+//! lock; what it decided that needs the store is done after the lock is
+//! released: charges used, ore mined, bounties paid, ships and capsules
+//! lost.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use eve_marshal::Value;
-use tokio_postgres::Client;
 use tracing::{error, info, warn};
 
 use crate::ballpark::Vec3;
 use crate::combat;
 use crate::conn::Server;
 use crate::items::{self, ItemTxn, NewItem};
+use crate::store::{Store, StoreError, Value as StoreValue};
 use crate::svc::{inflight, space};
 use crate::world::{World, WorldState};
 
@@ -143,9 +143,9 @@ pub enum Job {
 
 pub async fn run(server: Arc<Server>) {
     let (queued,waiting)=tokio::sync::mpsc::unbounded_channel();
-    // A stalled established query is just as possible as a failed reconnect.
-    // Join two scoped futures: dropping run cancels both; database I/O never
-    // holds up the simulation and there is only one persistence consumer.
+    // Join two scoped futures: dropping run cancels both; the jobs a pulse
+    // leaves never hold up the simulation and there is only one persistence
+    // consumer.
     tokio::join!(simulation(&server,queued),persistence(&server,waiting));
 }
 
@@ -166,61 +166,53 @@ async fn simulation(server:&Server,queued:tokio::sync::mpsc::UnboundedSender<Job
 }
 
 async fn persistence(server:&Server,mut waiting:tokio::sync::mpsc::UnboundedReceiver<Job>) {
-    let mut connection:Option<tokio_postgres::Client>=None;
-    let mut reconnect=crate::db::Reconnect::default();
-    // The receiver owns undispatched jobs during outages. Once dispatched, an
-    // error might mean COMMIT succeeded: only the subsystem's journal can retry.
+    let store=&server.store;
     let mut interval=tokio::time::interval(Duration::from_millis(PULSE_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pulses=0u64;
     loop {
         interval.tick().await;
         pulses=pulses.wrapping_add(1);
-        if connection.as_ref().is_some_and(|db|db.is_closed()) {connection=None;}
-        if connection.is_none() {connection=reconnect.poll(&server.db_url).await;}
-        let Some(db)=connection.as_mut() else {continue;};
         // Bound each batch so a continuously producing simulation cannot
         // starve checkpoints, journal repair, or other periodic work.
         for _ in 0..128 {
-            if db.is_closed() {break;}
             let job=match waiting.try_recv() {
                 Ok(job)=>job,
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)=>break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)=>return,
             };
-            perform(server, db, job).await;
+            perform(server, job).await;
         }
-        if db.is_closed() {continue;}
-        crate::svc::fleet::update_bonuses(&server.world, db, &server.dogma).await;
-        if pulses%4==0 {crate::svc::boosters::pulse(&server,db).await;}
+        store.read(|db| crate::svc::fleet::update_bonuses(&server.world, db, &server.dogma));
+        if pulses%4==0 {crate::svc::boosters::pulse(server,store).await;}
         if pulses % 20 == 1 {
-            crate::drones::checkpoint(&server.world, db).await;
-            crate::space_state::checkpoint(&server.world, db).await;
-            crate::svc::maintenance::retry_repairs(&server.world, &server.db_url).await;
-            crate::losses::pending::retry(&server, db).await;
-            crate::losses::journal::retry(&server, db).await;
-            crate::travel::retry(&server, db).await;
-            crate::svc::jumps::portal::retry(&server, db).await;
-            crate::conn::logout::retry(&server,db).await;
-            if let Err(e) = crate::svc::fleet::refresh_skills(&server.world, db).await {
+            crate::drones::checkpoint(&server.world, store).await;
+            crate::space_state::checkpoint(&server.world, store).await;
+            crate::svc::maintenance::retry_repairs(&server.world, store).await;
+            crate::losses::pending::retry(server, store).await;
+            crate::losses::journal::retry(server, store).await;
+            crate::travel::retry(server, store).await;
+            crate::svc::jumps::portal::retry(server, store).await;
+            crate::conn::logout::retry(server,store).await;
+            if let Err(e) = store.read(|db| crate::svc::fleet::refresh_skills(&server.world, db)) {
                 warn!("refreshing fleet skills: {e}");
             }
         }
         if pulses % AFFAIRS_EVERY == 1 {
             let session = crate::session::Session::default();
-            let ctx = crate::services::Ctx { db, db_url: &server.db_url, dogma: &server.dogma,
+            let ctx = crate::services::Ctx { store, dogma: &server.dogma,
                 bulk: &server.bulk, world: &server.world, node_id: server.node_id, client_id: 0, session: &session };
             crate::svc::trade::expire(&ctx).await;
-            crate::svc::alliance::take_effect(&server.world, db, server.alliance_join_delay_secs).await;
-            crate::svc::alliance::bill_alliances(db).await;
-            crate::svc::war::bill_wars(&server.world, db).await;
-            crate::svc::starbase::burn_fuel(&server.world, db).await;
-            crate::svc::starbase::sovereignty(db, server.sov_claim_delay_secs).await;
-            crate::svc::votes::close_votes(&server.world, db).await;
-            crate::complexes::seed(db).await;
-            crate::svc::outposts::finish(&server.world, db).await;
-            crate::guard::reload(&server.world, db).await;
-            crate::guard::refresh_standings(db).await;
+            crate::svc::alliance::take_effect(&server.world, store, server.alliance_join_delay_secs).await;
+            crate::svc::alliance::bill_alliances(store).await;
+            crate::svc::war::bill_wars(&server.world, store).await;
+            crate::svc::starbase::burn_fuel(&server.world, store).await;
+            crate::svc::starbase::sovereignty(store, server.sov_claim_delay_secs).await;
+            crate::svc::votes::close_votes(&server.world, store).await;
+            crate::complexes::seed(store).await;
+            crate::svc::outposts::finish(&server.world, store).await;
+            store.read(|db| crate::guard::reload(&server.world, db));
+            store.read(crate::guard::refresh_standings);
         }
     }
 }
@@ -250,9 +242,9 @@ fn pulse(world: &World, now: i64) -> Vec<Job> {
     crate::svc::fleet::pulse(&mut w, now);
     let mut jobs = std::mem::take(&mut w.pending_jobs);
     jobs.extend(out.deliver(&w));
-    // A shared RPC connection may recover before this worker does. Quarantine
-    // a confirmed death while still holding the simulation lock, even if its
-    // SQL job has not started, so reconnect cannot reload the destroyed hull.
+    // The loss is handled after the lock is released. Quarantine a confirmed
+    // death while still holding the simulation lock, even if its job has not
+    // started, so a reconnecting pilot cannot reload the destroyed hull.
     for job in &jobs {
         if let Job::Lost(loss)=job {
             w.pending_ship_losses.entry(loss.ship_id).or_insert_with(||(**loss).clone());
@@ -290,48 +282,48 @@ fn warp_changes(park: &mut crate::ballpark::Park, out: &mut Out) {
     if resync { out.jobs.push(Job::WarpResync { system:park.solar_system_id }); }
 }
 
-async fn perform(server: &Server, db: &mut Client, job: Job) {
+async fn perform(server: &Server, job: Job) {
+    let store = &server.store;
     match job {
         Job::NpcKill { system } => {
-            if let Err(e) = crate::svc::map::record_activity(db,system,2).await { warn!("recording NPC kill: {e}"); }
+            if let Err(e) = crate::svc::map::record_activity(store,system,2).await { warn!("recording NPC kill: {e}"); }
         }
-        Job::Ammo { client_id, charge_id, quantity } => ammo(server, db, client_id, charge_id, quantity).await,
+        Job::Ammo { client_id, charge_id, quantity } => ammo(server, client_id, charge_id, quantity).await,
         Job::Ore { client_id, char_id, ship_id, miner_id, module_id, system, type_id, quantity } => {
-            ore(server, db, client_id, char_id, (ship_id, miner_id, module_id), system, type_id, quantity).await
+            ore(server, client_id, char_id, (ship_id, miner_id, module_id), system, type_id, quantity).await
         }
         Job::Bounty { client_id, char_id, amount, npc_type, security } => {
-            bounty(server, db, client_id, char_id, amount, npc_type).await;
-            raise_security(db, char_id, security).await;
+            bounty(server, client_id, char_id, amount, npc_type).await;
+            raise_security(store, char_id, security).await;
         }
         Job::Refit { client_id, char_id, ship_id, system } => {
-            inflight::refit(db, &server.dogma, &server.world, client_id, char_id, ship_id, system).await
+            store.read(|db| inflight::refit(db, &server.dogma, &server.world, client_id, char_id, ship_id, system))
         }
-        Job::Lost(loss) => crate::losses::handle(server, db, *loss).await,
-        Job::BotLost(loss) => crate::losses::bot_lost(server, db, *loss).await,
-        Job::Loot { system, pos, owner_id, stash } => crate::loot::drop_can(db, &server.world, system, pos, owner_id, stash).await,
-        Job::Scrap { can_id } => crate::loot::scrap(db, can_id).await,
-        Job::DroneHome { client_id, drone_id, ship_id } => crate::drones::home(server, db, client_id, drone_id, ship_id).await,
-        Job::DroneLost { client_id, drone_id, system, owner, generation } => crate::drones::lost(server, db, client_id, drone_id, system, owner, generation).await,
-        Job::Security { char_id, delta } => change_security(db, char_id, delta).await,
-        Job::SiteCleared { mission_id, char_id } => crate::svc::agent_missions::site_cleared(&server.world, db, mission_id, char_id).await,
-        Job::Structure { id, state, stamp, tower } => save_structure(db, id, state, stamp, tower).await,
-        Job::StructureDamage { id, shield, armor, hull } => crate::svc::starbase::save_damage(db, id, shield, armor, hull).await,
-        Job::Reinforce { system, tower } => crate::svc::starbase::reinforce(&server.world, db, system, tower).await,
-        Job::StructureLost { id, tower } => crate::svc::starbase::lost(db, id, tower).await,
-        Job::StructureAmmo { item_id, quantity } => crate::guard::save_ammo(db, item_id, quantity).await,
+        Job::Lost(loss) => crate::losses::handle(server, store, *loss).await,
+        Job::BotLost(loss) => crate::losses::bot_lost(server, store, *loss).await,
+        Job::Loot { system, pos, owner_id, stash } => crate::loot::drop_can(store, &server.world, system, pos, owner_id, stash).await,
+        Job::Scrap { can_id } => crate::loot::scrap(store, can_id).await,
+        Job::DroneHome { client_id, drone_id, ship_id } => crate::drones::home(server, store, client_id, drone_id, ship_id).await,
+        Job::DroneLost { client_id, drone_id, system, owner, generation } => crate::drones::lost(server, store, client_id, drone_id, system, owner, generation).await,
+        Job::Security { char_id, delta } => change_security(store, char_id, delta).await,
+        Job::SiteCleared { mission_id, char_id } => crate::svc::agent_missions::site_cleared(&server.world, store, mission_id, char_id).await,
+        Job::Structure { id, state, stamp, tower } => save_structure(store, id, state, stamp, tower).await,
+        Job::StructureDamage { id, shield, armor, hull } => crate::svc::starbase::save_damage(store, id, shield, armor, hull).await,
+        Job::Reinforce { system, tower } => crate::svc::starbase::reinforce(&server.world, store, system, tower).await,
+        Job::StructureLost { id, tower } => crate::svc::starbase::lost(store, id, tower).await,
+        Job::StructureAmmo { item_id, quantity } => crate::guard::save_ammo(store, item_id, quantity).await,
         Job::Uncloak { system, ship_id } => crate::cloak::uncloaked(&mut server.world.lock(), system, ship_id),
-        Job::WarpResync { system } => space::resync_after_warp_limit(db, &server.world, system).await,
-        Job::ComplexCleared { complex_id } => crate::complexes::cleared(db, complex_id).await,
+        Job::WarpResync { system } => store.read(|db| space::resync_after_warp_limit(db, &server.world, system)),
+        Job::ComplexCleared { complex_id } => crate::complexes::cleared(store, complex_id).await,
     }
 }
 
-async fn ammo(server: &Server, db: &mut Client, client_id: i64, charge_id: i64, quantity: i64) {
-    let result = async {
-        let mut txn = ItemTxn::begin(db).await?;
-        txn.set_quantity(charge_id, quantity).await?;
-        txn.commit().await
-    }
-    .await;
+async fn ammo(server: &Server, client_id: i64, charge_id: i64, quantity: i64) {
+    let result = server.store.write(|tx| {
+        let mut txn = ItemTxn::new(tx);
+        txn.set_quantity(charge_id, quantity)?;
+        Ok::<_, StoreError>(txn.events())
+    });
     match result {
         Ok(events) => items::notify(&server.world, client_id, events),
         Err(e) => error!("using charge {charge_id}: {}", crate::logging::chain(&e)),
@@ -341,33 +333,45 @@ async fn ammo(server: &Server, db: &mut Client, client_id: i64, charge_id: i64, 
 /// Mined ore goes into the cargo hold, as much as fits; a full hold stops
 /// the laser.
 #[allow(clippy::too_many_arguments)]
-async fn ore(server: &Server, db: &mut Client, client_id: i64, char_id: i64, (ship_id, miner_id, module_id): (i64, i64, i64), system: i64, type_id: i64, quantity: i64) {
-    let result = async {
-        let room = db
-            .query_one(
-                r#"SELECT COALESCE(st."capacity", 0)
-                          - COALESCE((SELECT SUM(e."quantity" * COALESCE(t."volume", 0))
-                                        FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                                       WHERE e."locationID" = $1 AND e."flag" = $2), 0),
-                          (SELECT COALESCE("volume", 1) FROM "invTypes" WHERE "typeID" = $3)
-                     FROM entity s JOIN "invTypes" st ON st."typeID" = s."typeID"
-                    WHERE s."itemID" = $1"#,
-                &[&(ship_id as i32), &(FLAG_CARGO as i32), &(type_id as i32)],
-            )
-            .await?;
-        let (room, volume): (f64, f64) = (room.get(0), room.get(1));
-        let fits = ((room / volume.max(1e-6)).floor() as i64).clamp(0, quantity);
-        if fits == 0 {
-            return Ok((0, Vec::new()));
-        }
-        let mut txn = ItemTxn::begin(db).await?;
-        txn.stack_onto(NewItem { type_id, owner_id: char_id, location_id: ship_id, flag: FLAG_CARGO, quantity: fits, singleton: false })
-            .await?;
-        Ok::<_, tokio_postgres::Error>((fits, txn.commit().await?))
-    }
-    .await;
+async fn ore(server: &Server, client_id: i64, char_id: i64, (ship_id, miner_id, module_id): (i64, i64, i64), system: i64, type_id: i64, quantity: i64) {
+    let types = crate::sde::table("invTypes");
+    // The hull's type and what its hold has, each content's type and
+    // quantity in itemID order.
+    let hold = server.store.read(|db| {
+        let entity = db.table("entity");
+        let hull_type = entity.get_id(ship_id)?.int("typeID").unwrap_or(0);
+        let mut contents: Vec<(i64, i64, i64)> = entity
+            .find(&["locationID", "flag"], &[StoreValue::Int(ship_id), StoreValue::Int(FLAG_CARGO)])
+            .map(|e| (e.int("itemID").unwrap_or(0), e.int("typeID").unwrap_or(0), e.int("quantity").unwrap_or(0)))
+            .collect();
+        contents.sort_unstable_by_key(|(id, _, _)| *id);
+        Some((hull_type, contents))
+    });
+    let Some((hull_type, contents)) = hold else {
+        error!("mining {quantity} of {type_id} into {ship_id}: the ship is gone");
+        return;
+    };
+    // A hull of a type the static data does not know holds nothing;
+    // contents of a type it does not know take no room.
+    let capacity = types.get("typeID", hull_type).map(|t| t.float("capacity").unwrap_or(0.0));
+    let used: f64 = contents
+        .iter()
+        .filter_map(|(_, t, q)| Some(*q as f64 * types.get("typeID", *t)?.float("volume").unwrap_or(0.0)))
+        .sum();
+    let room = capacity.map_or(0.0, |c| c - used);
+    let volume = types.get("typeID", type_id).map_or(1.0, |t| t.float("volume").unwrap_or(1.0));
+    let fits = ((room / volume.max(1e-6)).floor() as i64).clamp(0, quantity);
+    let result = if fits == 0 {
+        Ok(Vec::new())
+    } else {
+        server.store.write(|tx| {
+            let mut txn = ItemTxn::new(tx);
+            txn.stack_onto(NewItem { type_id, owner_id: char_id, location_id: ship_id, flag: FLAG_CARGO, quantity: fits, singleton: false })?;
+            Ok::<_, StoreError>(txn.events())
+        })
+    };
     match result {
-        Ok((fits, events)) => {
+        Ok(events) => {
             items::notify(&server.world, client_id, events);
             if fits < quantity {
                 let mut w = server.world.lock();
@@ -383,17 +387,25 @@ async fn ore(server: &Server, db: &mut Client, client_id: i64, char_id: i64, (sh
     }
 }
 
-async fn bounty(server: &Server, db: &mut Client, client_id: Option<i64>, char_id: i64, amount: f64, npc_type: i64) {
+/// A payment the wallet refused, as the store write gives it up.
+struct Unpaid(crate::svc::wallet::Transfer);
+
+impl From<StoreError> for Unpaid {
+    fn from(e: StoreError) -> Self {
+        Unpaid(crate::svc::wallet::Transfer::Db(e))
+    }
+}
+
+async fn bounty(server: &Server, client_id: Option<i64>, char_id: i64, amount: f64, npc_type: i64) {
     use crate::svc::wallet::{post, Entry, Transfer};
     let arg = npc_type.to_string();
-    let result = async {
-        let tx = db.transaction().await.map_err(Transfer::Db)?;
-        let entry = Entry { ref_type: REF_BOUNTY_PRIZE, payer: OWNER_CONCORD, payee: char_id, arg_id1: &arg, reason: "" };
-        let balance = post(&tx, char_id, amount, &entry).await?;
-        tx.commit().await.map_err(Transfer::Db)?;
-        Ok::<_, Transfer>(balance)
-    }
-    .await;
+    let result = server
+        .store
+        .write(|tx| {
+            let entry = Entry { ref_type: REF_BOUNTY_PRIZE, payer: OWNER_CONCORD, payee: char_id, arg_id1: &arg, reason: "" };
+            post(tx, char_id, amount, &entry).map_err(Unpaid)
+        })
+        .map_err(|Unpaid(t)| t);
     match result {
         Ok(balance) => {
             info!("bounty of {amount} ISK to {char_id} for a {npc_type}");
@@ -413,30 +425,44 @@ async fn bounty(server: &Server, db: &mut Client, client_id: Option<i64>, char_i
 
 /// A pirate killed: security status rises by a share of the way to 10, but
 /// no killing of that rat raises it past its maximum.
-async fn raise_security(db: &mut Client, char_id: i64, (bonus, max_gain): (f64, f64)) {
+async fn raise_security(store: &Store, char_id: i64, (bonus, max_gain): (f64, f64)) {
     if bonus <= 0.0 {
         return;
     }
-    let sql = r#"UPDATE "character_"
-                    SET "securityRating" = LEAST($3, "securityRating" + (10 - "securityRating") * $2)
-                  WHERE "characterID" = $1 AND "securityRating" < $3"#;
-    if let Err(e) = db.execute(sql, &[&(char_id as i32), &bonus, &max_gain]).await {
+    let result = store.write(|tx| {
+        let Some(c) = tx.table("character_").get_id(char_id) else { return Ok(()) };
+        let (row, rating) = (c.id, c.float("securityRating").unwrap_or(0.0));
+        if rating < max_gain {
+            tx.update("character_", row, &[("securityRating", StoreValue::Float(max_gain.min(rating + (10.0 - rating) * bonus)))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = result {
         error!("raising the security status of {char_id}: {}", crate::logging::chain(&e));
     }
 }
 
-async fn save_structure(db: &mut Client, id: i64, state: i16, stamp: Option<i64>, tower: Option<i64>) {
-    let sql = r#"UPDATE "posStructures" SET "state" = $2, "stateTimestamp" = $3, "controlTowerID" = $4 WHERE "itemID" = $1"#;
-    if let Err(e) = db.execute(sql, &[&(id as i32), &state, &stamp, &tower.map(|t| t as i32)]).await {
+async fn save_structure(store: &Store, id: i64, state: i16, stamp: Option<i64>, tower: Option<i64>) {
+    let result = store.write(|tx| {
+        let Some(row) = tx.table("posStructures").get_id(id).map(|r| r.id) else { return Ok(()) };
+        let or_null = |v: Option<i64>| v.map_or(StoreValue::Null, StoreValue::Int);
+        tx.update("posStructures", row, &[("state", StoreValue::Int(i64::from(state))), ("stateTimestamp", or_null(stamp)), ("controlTowerID", or_null(tower))])
+    });
+    if let Err(e) = result {
         error!("saving structure {id}: {}", crate::logging::chain(&e));
     }
 }
 
-async fn change_security(db: &mut Client, char_id: i64, delta: f64) {
-    let sql = r#"UPDATE "character_" SET "securityRating" = GREATEST(-10, LEAST(10, "securityRating" + $2))
-                  WHERE "characterID" = $1 RETURNING "securityRating""#;
-    match db.query_opt(sql, &[&(char_id as i32), &delta]).await {
-        Ok(Some(r)) => info!("security status of {char_id} {delta:+.3}, now {:.2}", r.get::<_, f64>(0)),
+async fn change_security(store: &Store, char_id: i64, delta: f64) {
+    let result = store.write(|tx| {
+        let Some(c) = tx.table("character_").get_id(char_id) else { return Ok(None) };
+        let (row, rating) = (c.id, c.float("securityRating").unwrap_or(0.0));
+        let rating = (rating + delta).min(10.0).max(-10.0);
+        tx.update("character_", row, &[("securityRating", StoreValue::Float(rating))])?;
+        Ok::<_, StoreError>(Some(rating))
+    });
+    match result {
+        Ok(Some(rating)) => info!("security status of {char_id} {delta:+.3}, now {rating:.2}"),
         Ok(None) => {}
         Err(e) => error!("changing the security status of {char_id}: {}", crate::logging::chain(&e)),
     }

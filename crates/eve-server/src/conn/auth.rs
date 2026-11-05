@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use super::{Conn, ConnError, Result};
 use crate::db;
 use crate::session::{ROLE_LOGIN, ROLE_PLAYER};
+use crate::store::{Store, StoreError, Value as StoreValue};
 use crate::svc::language::{canonical_language, resolve_language};
 use crate::services::Call;
 
@@ -141,12 +142,7 @@ impl Conn {
         }
 
         // 6. The account.
-        if let Err(error)=self.refresh_database().await {
-            error!("login database unavailable: {error}");
-            self.close_round("AutClusterStarting",Some("AutClusterStarting")).await?;
-            return Err(error);
-        }
-        let account = match db::authenticate(&self.db, &user_name, &password).await {
+        let account = match db::authenticate(&self.server.store, &user_name, &password) {
             Ok(Some(a)) => a,
             Ok(None) => {
                 info!("login rejected for {user_name:?}");
@@ -188,7 +184,7 @@ impl Conn {
             return self.send_error(request, crate::exceptions::custom_error("The language ID must be text.")).await;
         };
         let before = self.session.clone();
-        if let Err(error) = persist_language(&self.db, &mut self.session, &language).await {
+        if let Err(error) = persist_language(&self.server.store, &mut self.session, &language).await {
             return self.send_error(request, crate::exceptions::custom_error(&error)).await;
         }
         if self.pending_session_change.is_some() {
@@ -287,16 +283,21 @@ fn login_language(requested: Option<&str>, saved: Option<&str>) -> &'static str 
         .unwrap_or_else(|| resolve_language(saved.unwrap_or("EN")))
 }
 
-async fn persist_language(db: &tokio_postgres::Client, session: &mut crate::session::Session, language: &str) -> std::result::Result<(), String> {
+async fn persist_language(store: &Store, session: &mut crate::session::Session, language: &str) -> std::result::Result<(), String> {
     let Some(language) = canonical_language(language) else {
         return Err("That language is not available.".into());
     };
-    let Some(account) = session.user_id.and_then(|id| i32::try_from(id).ok()).filter(|id| *id > 0) else {
+    let Some(account) = session.user_id.filter(|id| i32::try_from(*id).is_ok_and(|id| id > 0)) else {
         return Err("A language change requires an authenticated account.".into());
     };
-    match db.execute(r#"UPDATE account SET "languageID"=$2 WHERE "accountID"=$1"#, &[&account, &language]).await {
-        Ok(1) => { session.language_id = Some(language.into()); Ok(()) }
-        Ok(_) => Err("The account could not be found.".into()),
+    let saved = store.write(|tx| {
+        let Some(row) = tx.table("account").get_id(account).map(|r| r.id) else { return Ok(false) };
+        tx.update("account", row, &[("languageID", StoreValue::Text(language.into()))])?;
+        Ok::<_, StoreError>(true)
+    });
+    match saved {
+        Ok(true) => { session.language_id = Some(language.into()); Ok(()) }
+        Ok(false) => Err("The account could not be found.".into()),
         Err(error) => {
             error!("saving account language: {}", crate::logging::chain(&error));
             Err("The language preference could not be saved. Please try again.".into())
@@ -338,46 +339,36 @@ mod language_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn language_change_is_durable_updates_session_and_refuses_invalid_or_failed_writes() {
+    async fn language_change_is_durable_updates_session_and_refuses_invalid_writes() {
         let fixture = crate::test_support::Database::load().await;
-        let account = fixture.id().await;
+        let account = i64::from(fixture.id().await);
         let name = format!("language-account-{account}");
-        fixture.db.execute(r#"INSERT INTO account ("accountID","accountName",password) VALUES ($1,$2,'language-test')"#, &[&account, &name]).await.unwrap();
+        fixture.store.write(|tx| tx.insert("account", &[("accountID", StoreValue::Int(account)), ("accountName", StoreValue::Text(name.as_str().into())),
+            ("password", StoreValue::Text("language-test".into()))])).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
         let mut client = client.unwrap();
         let (socket, peer) = accepted.unwrap();
         let server = std::sync::Arc::new(super::super::Server {
-            table: Default::default(), db:crate::db::Shared::new(fixture.db,fixture.url.clone()), db_url: fixture.url, node_id: 1,
+            table: Default::default(), store: fixture.store, node_id: 1,
             bulk: fixture.bulk, dogma: fixture.dogma, services: crate::svc::registry(),
             world: fixture.world, dump_dir: Default::default(),
             alliance_join_delay_secs: 0, sov_claim_delay_secs: 0,
         });
         let mut conn = Conn::new(socket, peer, server, 9301);
         conn.authenticated = true;
-        conn.session.user_id = Some(account as i64);
+        conn.session.user_id = Some(account);
         conn.session.language_id = Some("EN".into());
         conn.pending_session_change = Some(conn.session_change(conn.session.change_body()));
         let request = MachoPacket::call_req(Value::None);
         let call = |language: &str| Call { service: "authentication".into(), method: "SetLanguageID".into(), args: vec![Value::bytes(language)], kwargs: vec![] };
 
-        // A socket authenticated before a database restart must acquire a new
-        // lease for its next request, without replacing the old operation's
-        // connection or repeating its mutation.
-        let admin=crate::db::connect(&conn.server.db_url).await.unwrap();
-        let terminated=conn.db.clone();
-        let pid:i32=terminated.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        admin.query_one("SELECT pg_terminate_backend($1)",&[&pid]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3),async {while !terminated.is_closed(){tokio::task::yield_now().await;}}).await.unwrap();
-
         conn.handle_call(&request, &call("fr")).await.unwrap();
-        assert!(!std::sync::Arc::ptr_eq(&terminated,&conn.db));
         assert_eq!(receive(&mut client).await.command, MessageType::CallRsp);
         assert_eq!(language_change(&receive(&mut client).await), Value::Tuple(vec![Value::None, Value::bytes("FR")]));
         assert!(conn.pending_session_change.is_none());
         assert_eq!(conn.session.language_id.as_deref(), Some("FR"));
-        let saved = crate::db::authenticate(&conn.db, &name, "language-test").await.unwrap().unwrap();
+        let saved = crate::db::authenticate(&conn.server.store, &name, "language-test").unwrap().unwrap();
         assert_eq!(saved.language_id.as_deref(), Some("FR"));
         assert_eq!(login_language(None, saved.language_id.as_deref()), "FR");
 
@@ -386,27 +377,15 @@ mod language_tests {
             assert_eq!(receive(&mut client).await.command, MessageType::ErrorResponse);
             assert_eq!(conn.session.language_id.as_deref(), Some("FR"));
         }
-        // Deterministically fail the database write after all input checks.
-        let constraint = format!("test_language_failure_{account}");
-        conn.db.batch_execute(&format!(r#"ALTER TABLE account ADD CONSTRAINT {constraint} CHECK ("accountID"<>{account} OR "languageID"<>'DE') NOT VALID"#)).await.unwrap();
-        conn.handle_call(&request, &call("DE")).await.unwrap();
-        assert_eq!(receive(&mut client).await.command, MessageType::ErrorResponse);
-        assert_eq!(conn.session.language_id.as_deref(), Some("FR"));
-        assert_eq!(crate::db::authenticate(&conn.db, &name, "language-test").await.unwrap().unwrap().language_id.as_deref(), Some("FR"));
-        conn.db.batch_execute(&format!("ALTER TABLE account DROP CONSTRAINT {constraint}")).await.unwrap();
         conn.handle_call(&request, &call("ja")).await.unwrap();
         assert_eq!(language_change(&receive(&mut client).await), Value::Tuple(vec![Value::bytes("FR"), Value::bytes("JA")]));
         assert_eq!(receive(&mut client).await.command, MessageType::CallRsp);
-        let pid:i32=conn.db.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-        admin.query_one("SELECT pg_terminate_backend($1)",&[&pid]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3),async {while !conn.db.is_closed(){tokio::task::yield_now().await;}}).await.unwrap();
-        conn.forced_move(crate::world::Move::Gang {gang_id:Some(account as i64),leader:false}).await.unwrap();
+        conn.forced_move(crate::world::Move::Gang {gang_id:Some(account),leader:false}).await.unwrap();
         assert_eq!(receive(&mut client).await.command,MessageType::SessionChangeNotification);
-        assert_eq!(conn.session.gang_id,Some(account as i64));
+        assert_eq!(conn.session.gang_id,Some(account));
         conn.authenticated = false;
         conn.handle_call(&request, &call("EN")).await.unwrap();
         assert_eq!(receive(&mut client).await.command, MessageType::ErrorResponse);
         assert_eq!(conn.session.language_id.as_deref(), Some("JA"));
-        conn.db.execute(r#"DELETE FROM account WHERE "accountID"=$1"#, &[&account]).await.unwrap();
     }
 }

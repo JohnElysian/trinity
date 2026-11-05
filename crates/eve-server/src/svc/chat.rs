@@ -1,23 +1,28 @@
 use eve_marshal::Value;
-use tokio_postgres::Row as PgRow;
 use tracing::{error, warn};
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::{Session, ROLE_LOGIN, ROLE_PLAYER};
-use crate::svc::rows::{int, row, rowset, text};
+use crate::store::{self, Db, Row, StoreError, Tx};
+use crate::svc::rows::{row, rowset};
 use crate::world::{local_system, LocalBot, WorldState};
 
-const OWNER_SYSTEM: i32 = 1;
+const OWNER_SYSTEM: i64 = 1;
 
 const CHTMODE_LISTENER: i64 = 1;
 const CHTMODE_CONVERSATIONALIST: i64 = 3;
 const CHTMODE_CREATOR: i64 = 15;
 const CHTMODE_NOTSPECIFIED: i64 = -1;
 
-/// SQL true when $2 may run channel $1: its owner, or listed as an operator
+/// Whether `char_id` may run `channel`: its owner, or listed as an operator
 /// (CHTMODE_OPERATOR = 7).
-const OPERATOR_TEST: &str = r#""ownerID" = $2 OR EXISTS (
-    SELECT 1 FROM "channelMods" m WHERE m."channelID" = $1 AND m."accessor" = $2 AND m."mode" >= 7)"#;
+fn operates(db: &Db, channel: &Row, char_id: i64) -> bool {
+    channel.int("ownerID") == Some(char_id)
+        || db
+            .table("channelMods")
+            .find(&["channelID"], &[channel.value("channelID").clone()])
+            .any(|m| m.int("accessor") == Some(char_id) && m.int("mode").is_some_and(|mode| mode >= 7))
+}
 
 const CSPA_MAILBOX: i64 = 127;
 
@@ -27,6 +32,7 @@ const CHANNEL_HEADER: &[&str] = &[
     "estimatedMemberCount", "languageRestriction",
 ];
 
+const IX_PASSWORD: usize = 6;
 const IX_SUBSCRIBED: usize = 11;
 
 const ACL_HEADER: &[&str] =
@@ -34,18 +40,24 @@ const ACL_HEADER: &[&str] =
 
 const MEMBER_HEADER: &[&str] = &["charID", "corpID", "allianceID", "role", "extra"];
 
-pub async fn ensure(db: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    db.batch_execute(r#"ALTER TABLE channels ADD COLUMN IF NOT EXISTS "languageRestriction" smallint NOT NULL DEFAULT 0"#).await
+/// The `languageRestriction` column this once added is part of the store's
+/// schema; there is nothing left to fix up.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    Ok(())
 }
 
 async fn set_language_restriction(ctx: &Ctx<'_>, channel: i64, enabled: i64) -> Outcome {
     // The Trinity channel dialog exposes this on its game-master tab only.
     if ctx.session.role & (8 | 16) == 0 { return Outcome::custom("Only a game master can change the language restriction."); }
     if !matches!(enabled, 0 | 1) { return Outcome::custom("Invalid language restriction."); }
-    match ctx.db.execute(r#"UPDATE channels SET "languageRestriction"=$2 WHERE "channelID"=$1"#,
-        &[&(channel as i32), &(enabled as i16)]).await {
-        Ok(0) => Outcome::custom("That channel does not exist."),
-        Ok(_) => {
+    let updated = ctx.store.write(|tx| {
+        let Some(id) = tx.table("channels").get_id(channel).map(|r| r.id) else { return Ok(false) };
+        tx.update("channels", id, &[("languageRestriction", store::Value::Int(enabled))])?;
+        Ok::<_, StoreError>(true)
+    });
+    match updated {
+        Ok(false) => Outcome::custom("That channel does not exist."),
+        Ok(true) => {
             let world = ctx.world.lock();
             let id = Value::Int(channel);
             announce(&world, &world.channel_members(&id), &id, "SetChannelLanguageRestriction", &who(ctx.session), vec![Value::Int(enabled)]);
@@ -59,26 +71,28 @@ async fn set_language_restriction(ctx: &Ctx<'_>, channel: i64, enabled: i64) -> 
 mod trinity_tests {
     use super::*;
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE pointing at a disposable imported database"]
     async fn dashboard_feature_language_restriction_is_persisted_and_voice_requires_membership() {
         let fixture = crate::test_support::Database::load().await;
         let pilot = fixture.id().await;
-        let channel:i32 = fixture.db.query_one(r#"INSERT INTO channels ("ownerID","displayName") VALUES ($1,'Language test') RETURNING "channelID""#,&[&pilot]).await.unwrap().get(0);
+        let channel = fixture.store.write(|tx| {
+            let id = tx.insert("channels", &[("ownerID", store::Value::Int(pilot as i64)), ("displayName", store::Value::Text("Language test".into()))])?;
+            Ok::<_, StoreError>(tx.table("channels").row(id).and_then(|r| r.int("channelID")).unwrap())
+        }).unwrap();
         let player = crate::session::Session {char_id:Some(pilot as i64),..Default::default()};
-        assert!(matches!(set_language_restriction(&fixture.ctx(&player),channel as i64,1).await,Outcome::UserError{..}));
-        let configure_call = Call {service:"LSC".into(),method:"Configure".into(),args:vec![Value::Int(channel as i64)],
+        assert!(matches!(set_language_restriction(&fixture.ctx(&player),channel,1).await,Outcome::UserError{..}));
+        let configure_call = Call {service:"LSC".into(),method:"Configure".into(),args:vec![Value::Int(channel)],
             kwargs:vec![(Value::bytes("languageRestriction"),Value::Int(1))]};
         assert!(matches!(lsc(&configure_call,&fixture.ctx(&player)).await,Some(Outcome::UserError{..})));
         let gm = crate::session::Session {role:8,..player.clone()};
-        assert!(matches!(set_language_restriction(&fixture.ctx(&gm),channel as i64,1).await,Outcome::Value(Value::None)));
-        let (line,_) = channel_info(&fixture.ctx(&player),channel as i64).await.unwrap();
+        assert!(matches!(set_language_restriction(&fixture.ctx(&gm),channel,1).await,Outcome::Value(Value::None)));
+        let (line,_) = channel_info(&fixture.ctx(&player),channel).await.unwrap();
         assert_eq!(line.len(),CHANNEL_HEADER.len());
         assert_eq!(line[13],Value::Int(1));
         assert_eq!(synthetic_mailbox(pilot as i64).len(),CHANNEL_HEADER.len());
-        let call = Call {service:"LSC".into(),method:"VoiceStatus".into(),args:vec![Value::Int(channel as i64),Value::Int(2)],kwargs:vec![]};
+        let call = Call {service:"LSC".into(),method:"VoiceStatus".into(),args:vec![Value::Int(channel),Value::Int(2)],kwargs:vec![]};
         assert!(matches!(lsc(&call,&fixture.ctx(&player)).await,Some(Outcome::UserError{..})));
         let mut rx = fixture.world.lock().connect(1);
-        fixture.world.lock().join_channel(&Value::Int(channel as i64),1);
+        fixture.world.lock().join_channel(&Value::Int(channel),1);
         assert!(matches!(lsc(&call,&fixture.ctx(&player)).await,Some(Outcome::Value(Value::None))));
         let crate::world::Push::Notify(note) = rx.try_recv().unwrap() else {panic!("notification")};
         assert_eq!(note.event,"OnLSC");
@@ -135,39 +149,56 @@ pub async fn lsc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "CreateChannel" => create_channel(ctx, call).await,
         "Configure" => return Some(configure(ctx, call).await),
         "RenameChannel" => {
-            let sql = r#"UPDATE "channels" SET "displayName" = $3, "comparisonKey" = lower($3)
-                          WHERE "channelID" = $1 AND "ownerID" = $2 RETURNING 1"#;
             let name = call.arg_text(1).unwrap_or_default();
-            if ctx.query_one(sql, &[&(call.arg_id(0) as i32), &me(ctx), &name]).await.is_some() {
+            let sets = [("displayName", store::Value::Text(name.as_str().into())), ("comparisonKey", store::Value::Text(name.to_lowercase().into()))];
+            if set_owned(ctx, call.arg_id(0), &sets, |_| true, "RenameChannel") {
                 announce_change(ctx, call, "RenameChannel", vec![Value::text(name)]);
             }
             Value::None
         }
         "SetChannelMOTD" => {
-            let sql = format!(
-                r#"UPDATE "channels" SET "motd" = $3 WHERE "channelID" = $1 AND ({OPERATOR_TEST}) RETURNING 1"#
-            );
             let motd = call.arg_text(1).unwrap_or_default();
-            if ctx.query_one(&sql, &[&(call.arg_id(0) as i32), &me(ctx), &motd]).await.is_some() {
-                announce_change(ctx, call, "SetChannelMOTD", vec![Value::text(motd)]);
+            let (channel_id, char_id) = (call.arg_id(0), me(ctx));
+            let updated = ctx.store.write(|tx| {
+                let Some(channel) = tx.table("channels").get_id(channel_id) else { return Ok(false) };
+                if !operates(tx.db(), &channel, char_id) {
+                    return Ok(false);
+                }
+                let id = channel.id;
+                tx.update("channels", id, &[("motd", store::Value::Text(motd.as_str().into()))])?;
+                Ok::<_, StoreError>(true)
+            });
+            match updated {
+                Ok(true) => announce_change(ctx, call, "SetChannelMOTD", vec![Value::text(motd)]),
+                Ok(false) => {}
+                Err(e) => error!("LSC.SetChannelMOTD({channel_id}): {err}", err = crate::logging::chain(&e)),
             }
             Value::None
         }
         "DestroyChannel" => {
-            let sql = r#"WITH target AS (SELECT "channelID" FROM "channels"
-                                          WHERE "channelID" = $1 AND "ownerID" = $2),
-                              members AS (DELETE FROM "channelChars" WHERE "channelID" IN (SELECT * FROM target)),
-                              mods AS (DELETE FROM "channelMods" WHERE "channelID" IN (SELECT * FROM target))
-                         DELETE FROM "channels" WHERE "channelID" IN (SELECT * FROM target)
-                         RETURNING 1"#;
-            if ctx.query_one(sql, &[&(call.arg_id(0) as i32), &me(ctx)]).await.is_some() {
-                announce_change(ctx, call, "DestroyChannel", Vec::new());
+            let (channel_id, char_id) = (call.arg_id(0), me(ctx));
+            let destroyed = ctx.store.write(|tx| {
+                let Some(channel) = tx.table("channels").get_id(channel_id).filter(|c| c.int("ownerID") == Some(char_id)).map(|c| c.id) else {
+                    return Ok(false);
+                };
+                tx.delete_where("channelChars", &["channelID"], &[store::Value::Int(channel_id)])?;
+                tx.delete_where("channelMods", &["channelID"], &[store::Value::Int(channel_id)])?;
+                tx.delete("channels", channel)?;
+                Ok::<_, StoreError>(true)
+            });
+            match destroyed {
+                Ok(true) => announce_change(ctx, call, "DestroyChannel", Vec::new()),
+                Ok(false) => {}
+                Err(e) => error!("LSC.DestroyChannel({channel_id}): {err}", err = crate::logging::chain(&e)),
             }
             Value::None
         }
         "ForgetChannel" => {
-            let sql = r#"DELETE FROM "channelChars" WHERE "channelID" = $1 AND "charID" = $2"#;
-            ctx.execute(sql, &[&(call.arg_id(0) as i32), &me(ctx)]).await;
+            let (channel_id, char_id) = (call.arg_id(0), me(ctx));
+            let forgotten = ctx.store.write(|tx| tx.delete_where("channelChars", &["channelID", "charID"], &[store::Value::Int(channel_id), store::Value::Int(char_id)]));
+            if let Err(e) = forgotten {
+                error!("LSC.ForgetChannel({channel_id}): {err}", err = crate::logging::chain(&e));
+            }
             Value::None
         }
         // (channelID, accessor, mode, untilWhen=None, reason=None). On the caller's
@@ -189,26 +220,28 @@ async fn get_my_messages(ctx: &Ctx<'_>) -> Value {
     const HEADER: &[&str] =
         &["channelID", "messageID", "senderID", "subject", "created", "read"];
     let Some(char_id) = ctx.session.char_id else { return rowset(HEADER, Vec::new()) };
-    let mailboxes: Vec<i32> =
-        own_entity_ids(ctx).into_iter().filter_map(|id| i32::try_from(id).ok()).collect();
+    let lines = ctx.store.read(|db| {
+        let mut mailboxes = own_entity_ids(ctx);
+        mailboxes.extend(mailing_lists(db, char_id));
+        mailboxes.sort_unstable();
+        mailboxes.dedup();
+        let evemail = db.table("evemail");
+        let mut rows: Vec<Row> =
+            mailboxes.iter().flat_map(|m| evemail.find(&["channelID"], &[store::Value::Int(*m)])).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse((r.int("created"), r.int("messageID"))));
+        rows.iter().map(|r| Value::List(r.line(HEADER))).collect()
+    });
+    rowset(HEADER, lines)
+}
 
-    let sql = r#"SELECT "channelID","messageID","senderID","subject","created","read"
-                   FROM "evemail"
-                  WHERE "channelID" = ANY($1)
-                     OR "channelID" IN (SELECT cc."channelID"
-                                          FROM "channelChars" cc
-                                          JOIN "channels" c ON c."channelID" = cc."channelID"
-                                         WHERE cc."charID" = $2 AND c."mailingList" <> 0)
-                  ORDER BY "created" DESC, "messageID" DESC"#;
-    match ctx.db.query(sql, &[&mailboxes, &(char_id as i32)]).await {
-        Ok(rows) => {
-            rowset(HEADER, rows.iter().map(|r| Value::List(crate::svc::rows::line(r))).collect())
-        }
-        Err(e) => {
-            error!("LSC.GetMyMessages({char_id}): {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+/// The mailing lists `char_id` belongs to: their mail is theirs to read.
+fn mailing_lists(db: &Db, char_id: i64) -> Vec<i64> {
+    let channels = db.table("channels");
+    db.table("channelChars")
+        .find(&["charID"], &[store::Value::Int(char_id)])
+        .filter_map(|cc| cc.int("channelID"))
+        .filter(|id| channels.get_id(*id).is_some_and(|c| c.int("mailingList").is_some_and(|l| l != 0)))
+        .collect()
 }
 
 /// Mail sent to a mailbox: a character, a corporation, an alliance, or a
@@ -223,18 +256,27 @@ async fn page(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     if call.kwarg("attachments").is_some_and(|a| a.seq().is_some_and(|s| !s.is_empty())) {
         warn!("LSC.Page: attachments are not stored; sending the text alone");
     }
-    let ids: Vec<i32> = destinations.iter().filter_map(|id| i32::try_from(*id).ok()).collect();
-    let sql = r#"SELECT id FROM unnest($1::int[]) AS id
-                  WHERE EXISTS (SELECT 1 FROM "character_" WHERE "characterID" = id)
-                     OR EXISTS (SELECT 1 FROM corporation WHERE "corporationID" = id)
-                     OR EXISTS (SELECT 1 FROM alliances WHERE "allianceID" = id)
-                     OR EXISTS (SELECT 1 FROM channels WHERE "channelID" = id AND "mailingList" <> 0)"#;
-    let mailboxes: Vec<i64> = ctx.query(sql, &[&ids]).await.iter().map(|r| r.get::<_, i32>(0) as i64).collect();
-    if mailboxes.is_empty() {
-        return Outcome::custom("None of those can receive mail.");
-    }
-    match deliver(ctx.db, ctx.world, sender, &mailboxes, &subject, &body).await {
-        Ok(()) => {
+    let sent = ctx.store.write(|tx| {
+        let db = tx.db();
+        let mailboxes: Vec<i64> = destinations
+            .iter()
+            .copied()
+            .filter(|id| {
+                db.table("character_").get_id(*id).is_some()
+                    || db.table("corporation").get_id(*id).is_some()
+                    || db.table("alliances").get_id(*id).is_some()
+                    || db.table("channels").get_id(*id).is_some_and(|c| c.int("mailingList").is_some_and(|l| l != 0))
+            })
+            .collect();
+        if mailboxes.is_empty() {
+            return Ok(None);
+        }
+        deliver(tx, ctx.world, sender, &mailboxes, &subject, &body)?;
+        Ok::<_, StoreError>(Some(mailboxes))
+    });
+    match sent {
+        Ok(None) => Outcome::custom("None of those can receive mail."),
+        Ok(Some(mailboxes)) => {
             tracing::info!("mail {subject:?} from {sender} to {mailboxes:?}");
             Outcome::Value(Value::None)
         }
@@ -258,13 +300,11 @@ async fn invite(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let (other, channel_id) = (call.arg_id(0), call.args.get(1).cloned().unwrap_or(Value::None));
     let channel_name = call.arg_text(2).unwrap_or_default();
     let add_allowed = call.arg_i64(3).unwrap_or(0) != 0;
-    let names = r#"SELECT (SELECT "characterName" FROM "character_" WHERE "characterID" = $1),
-                          (SELECT "characterName" FROM "character_" WHERE "characterID" = $2),
-                          (SELECT "gender" FROM "character_" WHERE "characterID" = $1)"#;
-    let row = ctx.query_one(names, &[&(me as i32), &(other as i32)]).await;
-    let name = |i| row.as_ref().and_then(|r| text(r, i)).unwrap_or_default();
-    let (my_name, other_name) = (name(0), name(1));
-    let gender = row.as_ref().and_then(|r| int(r, 2)).unwrap_or(1);
+    let (my_name, other_name, gender) = ctx.store.read(|db| {
+        let characters = db.table("character_");
+        let name = |id| characters.get_id(id).and_then(|r| r.text("characterName")).unwrap_or_default().to_string();
+        (name(me), name(other), characters.get_id(me).and_then(|r| r.int("gender")).unwrap_or(1))
+    });
     let char_arg = |key: &str| Outcome::UserError { msg: key.into(), args: vec![("char".into(), Value::text(&other_name))] };
     if other == me {
         return char_arg("ChtCannotInviteSelf");
@@ -272,9 +312,17 @@ async fn invite(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let target = ctx.world.lock().clients_of(other).first().copied();
     let Some(target) = target else { return char_arg("ChtCharNotReachable") };
     if let (true, Some(id)) = (add_allowed, channel_id.as_i64()) {
-        let sql = r#"INSERT INTO "channelMods" ("channelID", "accessor", "mode")
-                     SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM "channelMods" WHERE "channelID" = $1 AND "accessor" = $2)"#;
-        ctx.execute(sql, &[&(id as i32), &(other as i32), &(CHTMODE_CONVERSATIONALIST as i32)]).await;
+        let allowed = ctx.store.write(|tx| {
+            let listed = tx.table("channelMods").find(&["channelID"], &[store::Value::Int(id)]).any(|m| m.int("accessor") == Some(other));
+            if !listed {
+                let sets = [("channelID", store::Value::Int(id)), ("accessor", store::Value::Int(other)), ("mode", store::Value::Int(CHTMODE_CONVERSATIONALIST))];
+                tx.insert("channelMods", &sets)?;
+            }
+            Ok::<_, StoreError>(())
+        });
+        if let Err(e) = allowed {
+            error!("LSC.Invite: letting {other} into channel {id}: {err}", err = crate::logging::chain(&e));
+        }
     }
     let args = vec![Value::Int(me), Value::text(&my_name), Value::Int(gender), channel_id.clone()];
     let Some(answer) = ctx.world.lock().call(target, "LSC", "ChatInvite", args) else { return char_arg("ChtCharNotReachable") };
@@ -296,38 +344,43 @@ async fn invite(ctx: &Ctx<'_>, call: &Call) -> Outcome {
 
 /// Puts a mail in each mailbox and tells whoever is online to look:
 /// OnMessage(recipients, messageID, senderID, subject, created) (inbox.py:405).
-pub async fn deliver(
-    db: &impl tokio_postgres::GenericClient,
+pub fn deliver(
+    tx: &mut Tx<'_>,
     world: &crate::world::World,
     sender: i64,
     mailboxes: &[i64],
     subject: &str,
     body: &str,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<(), StoreError> {
     let created = crate::bulkdata::filetime_now();
     for mailbox in mailboxes {
-        let message_id: i32 = db
-            .query_one(
-                r#"WITH m AS (
-                       INSERT INTO evemail ("channelID","senderID","subject","created","read")
-                       VALUES ($1, $2, $3, $4, 0) RETURNING "messageID"
-                   )
-                   INSERT INTO "evemailDetails" ("messageID","mimeTypeID","attachment")
-                   SELECT "messageID", 1, $5 FROM m RETURNING "messageID""#,
-                &[&(*mailbox as i32), &(sender as i32), &subject, &created, &body],
-            )
-            .await?
-            .get(0);
+        let row = tx.insert(
+            "evemail",
+            &[
+                ("channelID", store::Value::Int(*mailbox)),
+                ("senderID", store::Value::Int(sender)),
+                ("subject", store::Value::Text(subject.into())),
+                ("created", store::Value::Int(created)),
+                ("read", store::Value::Int(0)),
+            ],
+        )?;
+        let message_id = tx.table("evemail").row(row).and_then(|r| r.int("messageID")).unwrap_or(0);
+        tx.insert(
+            "evemailDetails",
+            &[
+                ("messageID", store::Value::Int(message_id)),
+                ("mimeTypeID", store::Value::Int(1)),
+                ("attachment", store::Value::Text(body.into())),
+            ],
+        )?;
         // Who reads this mailbox: a pilot, a corporation, or a list's members.
-        let readers: Vec<i64> = db
-            .query(
-                r#"SELECT $1::int UNION SELECT "charID" FROM "channelChars" WHERE "channelID" = $1 AND "charID" <> 0"#,
-                &[&(*mailbox as i32)],
-            )
-            .await?
-            .iter()
-            .map(|r| r.get::<_, i32>(0) as i64)
-            .collect();
+        let mut readers: Vec<i64> = vec![*mailbox];
+        readers.extend(
+            tx.table("channelChars")
+                .find(&["channelID"], &[store::Value::Int(*mailbox)])
+                .filter_map(|r| r.int("charID"))
+                .filter(|c| *c != 0),
+        );
         let w = world.lock();
         let mut clients: Vec<i64> = readers.iter().flat_map(|r| w.clients_of(*r)).collect();
         clients.extend(w.corp_members(*mailbox));
@@ -335,7 +388,7 @@ pub async fn deliver(
         clients.dedup();
         let args = Value::Tuple(vec![
             Value::List(vec![Value::Int(*mailbox)]),
-            Value::Int(message_id as i64),
+            Value::Int(message_id),
             Value::Int(sender),
             Value::text(subject),
             Value::Long(created),
@@ -355,22 +408,33 @@ async fn message_details(ctx: &Ctx<'_>, channel_id: i64, message_id: i64) -> Val
     if !mailboxes.contains(&channel_id) {
         return Value::None;
     }
-    let sql = r#"SELECT "channelID","messageID","senderID","subject","created","read" FROM "evemail"
-                  WHERE "channelID" = $1 AND "messageID" = $2"#;
-    let Some(r) = ctx.query_one(sql, &[&(channel_id as i32), &(message_id as i32)]).await else { return Value::None };
-    let mut message = crate::svc::rows::line(&r);
-    let sql = r#"SELECT d."attachmentID", d."messageID", m."mimeType", d."attachment"
-                   FROM "evemailDetails" d JOIN "evemailMimeType" m ON m."mimeTypeID" = d."mimeTypeID"
-                  WHERE d."messageID" = $1 ORDER BY d."attachmentID""#;
-    let rows = ctx.query(sql, &[&(message_id as i32)]).await;
+    // The mime types are static data.
+    let mimes = crate::sde::table("evemailMimeType");
+    let found = ctx.store.read(|db| {
+        let r = db.table("evemail").get_id(message_id).filter(|r| r.int("channelID") == Some(channel_id))?;
+        let message = r.line(&MESSAGE[..6]);
+        let mut details: Vec<Row> = db.table("evemailDetails").find(&["messageID"], &[store::Value::Int(message_id)]).collect();
+        details.sort_by_key(|d| d.int("attachmentID"));
+        let attachments: Vec<(String, Vec<Value>)> = details
+            .iter()
+            .flat_map(move |d| {
+                d.int("mimeTypeID").into_iter().flat_map(move |id| mimes.find("mimeTypeID", id)).map(move |m| {
+                    let mime = m.text("mimeType").unwrap_or_default().to_string();
+                    let line = vec![d.cell("attachmentID"), d.cell("messageID"), m.cell("mimeType"), d.cell("attachment")];
+                    (mime, line)
+                })
+            })
+            .collect();
+        Some((message, attachments))
+    });
+    let Some((mut message, rows)) = found else { return Value::None };
     let mut body = Value::text("");
     let mut attachments = Vec::new();
-    for r in &rows {
-        let mime: String = r.get(2);
+    for (mime, line) in rows {
         if mime == "text/plain" && body == Value::text("") {
-            body = Value::text(r.get::<_, String>(3));
+            body = line[3].clone();
         } else {
-            attachments.push(crate::svc::rows::row(ATTACHMENT, crate::svc::rows::line(r)));
+            attachments.push(crate::svc::rows::row(ATTACHMENT, line));
         }
     }
     message.push(body);
@@ -383,16 +447,21 @@ async fn mark_messages_read(ctx: &Ctx<'_>, arg: Option<&Value>) -> Value {
     if ids.is_empty() {
         return Value::None;
     }
-    let mailboxes: Vec<i32> =
-        own_entity_ids(ctx).into_iter().filter_map(|id| i32::try_from(id).ok()).collect();
-    let sql = r#"UPDATE "evemail" SET "read" = 1
-                  WHERE "messageID" = ANY($1)
-                    AND ("channelID" = ANY($2)
-                         OR "channelID" IN (SELECT cc."channelID"
-                                              FROM "channelChars" cc
-                                              JOIN "channels" c ON c."channelID" = cc."channelID"
-                                             WHERE cc."charID" = $3 AND c."mailingList" <> 0))"#;
-    if let Err(e) = ctx.db.execute(sql, &[&ids, &mailboxes, &(char_id as i32)]).await {
+    let marked = ctx.store.write(|tx| {
+        let mut mailboxes = own_entity_ids(ctx);
+        mailboxes.extend(mailing_lists(tx.db(), char_id));
+        let unread: Vec<store::RowId> = ids
+            .iter()
+            .filter_map(|id| tx.table("evemail").get_id(*id))
+            .filter(|r| r.int("channelID").is_some_and(|c| mailboxes.contains(&c)))
+            .map(|r| r.id)
+            .collect();
+        for row in unread {
+            tx.update("evemail", row, &[("read", store::Value::Int(1))])?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = marked {
         error!("LSC.MarkMessagesRead({} ids): {err}", ids.len(), err = crate::logging::chain(&e));
     }
     Value::None
@@ -403,22 +472,34 @@ async fn delete_messages(ctx: &Ctx<'_>, channel_id: i64, arg: Option<&Value>) ->
     if ids.is_empty() {
         return Value::None;
     }
-    let Ok(channel) = i32::try_from(channel_id) else { return Value::None };
     if !own_entity_ids(ctx).contains(&channel_id) {
         warn!("LSC.DeleteMessages: channel {channel_id} is not one of the caller's");
         return Value::None;
     }
-    let sql = r#"DELETE FROM "evemail" WHERE "messageID" = ANY($1) AND "channelID" = $2"#;
-    if let Err(e) = ctx.db.execute(sql, &[&ids, &channel]).await {
+    let deleted = ctx.store.write(|tx| {
+        let rows: Vec<store::RowId> = ids
+            .iter()
+            .filter_map(|id| tx.table("evemail").get_id(*id))
+            .filter(|r| r.int("channelID") == Some(channel_id))
+            .map(|r| r.id)
+            .collect();
+        for row in rows {
+            tx.delete("evemail", row)?;
+        }
+        Ok::<_, StoreError>(())
+    });
+    if let Err(e) = deleted {
         error!("LSC.DeleteMessages({channel_id}): {err}", err = crate::logging::chain(&e));
     }
     Value::None
 }
 
-fn id_list(arg: Option<&Value>) -> Vec<i32> {
-    arg.and_then(|v| v.seq())
-        .map(|s| s.iter().filter_map(|v| v.as_i64()).filter_map(|v| i32::try_from(v).ok()).collect())
-        .unwrap_or_default()
+/// The message IDs a call names, each once.
+fn id_list(arg: Option<&Value>) -> Vec<i64> {
+    let mut ids: Vec<i64> = arg.and_then(|v| v.seq()).map(|s| s.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 async fn join_channels(ctx: &Ctx<'_>, arg: Option<&Value>) -> Value {
@@ -545,46 +626,18 @@ fn refused(channel_id: Value, why: &str) -> Value {
 }
 
 async fn channel_info(ctx: &Ctx<'_>, channel_id: i64) -> Option<(Vec<Value>, i64)> {
-    let sql = r#"SELECT "channelID","ownerID","displayName","motd","comparisonKey",
-                        "memberless","password","mailingList","cspa","temporary",
-                        "mode","subscribed","estimatedMemberCount","languageRestriction"
-                   FROM "channels" WHERE "channelID" = $1"#;
-    match ctx.db.query(sql, &[&(channel_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => {
-            let mode = int(&rows[0], 10).unwrap_or(CHTMODE_LISTENER);
-            Some((channel_line(&rows[0], false), mode))
-        }
-        Ok(_) => {
-            if own_entity_ids(ctx).contains(&channel_id) {
-                Some((synthetic_mailbox(channel_id), CHTMODE_LISTENER))
-            } else {
-                None
-            }
-        }
-        Err(e) => {
-            error!("LSC channel {channel_id}: {err}", err = crate::logging::chain(&e));
-            None
-        }
-    }
+    let found = ctx.store.read(|db| {
+        db.table("channels").get_id(channel_id).map(|r| (channel_line(&r, false), r.int("mode").unwrap_or(CHTMODE_LISTENER)))
+    });
+    found.or_else(|| own_entity_ids(ctx).contains(&channel_id).then(|| (synthetic_mailbox(channel_id), CHTMODE_LISTENER)))
 }
 
-fn channel_line(r: &PgRow, hide_password: bool) -> Vec<Value> {
-    vec![
-        Value::int_or_none(int(r, 0)),
-        Value::int_or_none(int(r, 1)),
-        text(r, 2).map_or(Value::None, Value::text),
-        text(r, 3).map_or(Value::None, Value::text),
-        text(r, 4).map_or(Value::None, Value::text),
-        Value::int_or_none(int(r, 5)),
-        if hide_password { Value::None } else { text(r, 6).map_or(Value::None, Value::text) },
-        Value::int_or_none(int(r, 7)),
-        Value::int_or_none(int(r, 8)),
-        Value::int_or_none(int(r, 9)),
-        Value::int_or_none(int(r, 10)),
-        Value::int_or_none(int(r, 11)),
-        Value::int_or_none(int(r, 12)),
-        Value::int_or_none(int(r, 13)),
-    ]
+fn channel_line(r: &Row, hide_password: bool) -> Vec<Value> {
+    let mut line = r.line(CHANNEL_HEADER);
+    if hide_password {
+        line[IX_PASSWORD] = Value::None;
+    }
+    line
 }
 
 fn synthetic_mailbox(owner_id: i64) -> Vec<Value> {
@@ -608,35 +661,32 @@ fn synthetic_mailbox(owner_id: i64) -> Vec<Value> {
 
 async fn get_channels(ctx: &Ctx<'_>) -> Value {
     let Some(char_id) = ctx.session.char_id else { return rowset(CHANNEL_HEADER, Vec::new()) };
-    let p_char = char_id as i32;
-    let p_corp = ctx.session.corp_id.unwrap_or(-1) as i32;
-    let p_alliance = ctx.session.alliance_id.unwrap_or(-1) as i32;
+    let p_corp = ctx.session.corp_id.unwrap_or(-1);
+    let p_alliance = ctx.session.alliance_id.unwrap_or(-1);
+    let owners = [char_id, p_corp, p_alliance, OWNER_SYSTEM];
 
-    let sql = r#"SELECT c."channelID",c."ownerID",c."displayName",c."motd",
-                        c."comparisonKey",c."memberless",c."password",c."mailingList",
-                        c."cspa",c."temporary",c."mode",c."subscribed",
-                        c."estimatedMemberCount", c."languageRestriction",
-                        (cc."charID" IS NOT NULL) AS "isMember"
-                   FROM "channels" c
-                   LEFT JOIN "channelChars" cc
-                          ON cc."channelID" = c."channelID" AND cc."charID" = $1
-                  WHERE c."ownerID" IN ($1, $2, $3, $4) OR cc."charID" IS NOT NULL
-                  ORDER BY c."channelID""#;
+    // Each channel the caller may see, and whether they are a member.
+    let mut found: Vec<(i64, Vec<Value>, bool)> = ctx.store.read(|db| {
+        let members = db.table("channelChars");
+        db.table("channels")
+            .rows()
+            .filter_map(|c| {
+                let id = c.int("channelID")?;
+                let member = members.get(&[store::Value::Int(id), store::Value::Int(char_id)]).is_some();
+                let owned = c.int("ownerID").is_some_and(|o| owners.contains(&o));
+                (owned || member).then(|| (id, channel_line(&c, true), member))
+            })
+            .collect()
+    });
+    found.sort_by_key(|(id, _, _)| *id);
 
     let mut lines = Vec::new();
     let mut seen: Vec<i64> = Vec::new();
-    match ctx.db.query(sql, &[&p_char, &p_corp, &p_alliance, &OWNER_SYSTEM]).await {
-        Ok(rows) => {
-            for r in &rows {
-                let id = int(r, 0).unwrap_or(0);
-                seen.push(id);
-                let mut line = channel_line(r, true);
-                let subscribed = (int(r, 14) == Some(1)) || own_entity_ids(ctx).contains(&id);
-                line[IX_SUBSCRIBED] = Value::Int(subscribed as i64);
-                lines.push(Value::List(line));
-            }
-        }
-        Err(e) => error!("LSC GetChannels: {err}", err = crate::logging::chain(&e)),
+    for (id, mut line, member) in found {
+        seen.push(id);
+        let subscribed = member || own_entity_ids(ctx).contains(&id);
+        line[IX_SUBSCRIBED] = Value::Int(subscribed as i64);
+        lines.push(Value::List(line));
     }
 
     for id in own_entity_ids(ctx) {
@@ -660,36 +710,31 @@ async fn get_members(ctx: &Ctx<'_>, arg: Option<&Value>) -> Value {
 }
 
 async fn members_for(ctx: &Ctx<'_>, channel_id: i64, me: Option<&Vec<Value>>) -> Value {
-    let sql = r#"SELECT cc."charID",cc."corpID",cc."allianceID",cc."role",
-                        ch."characterName",ch."typeID"
-                   FROM "channelChars" cc
-                   LEFT JOIN "character_" ch ON ch."characterID" = cc."charID"
-                  WHERE cc."channelID" = $1
-                  ORDER BY cc."charID""#;
-
     let my_id = ctx.session.char_id.unwrap_or(0);
-    let mut lines = Vec::new();
     let mut have_self = false;
-    match ctx.db.query(sql, &[&(channel_id as i32)]).await {
-        Ok(rows) => {
-            for r in &rows {
-                let id = int(r, 0).unwrap_or(0);
+    // The primary key (channelID, charID) gives them in charID order.
+    let mut lines: Vec<Value> = ctx.store.read(|db| {
+        let characters = db.table("character_");
+        db.table("channelChars")
+            .find(&["channelID"], &[store::Value::Int(channel_id)])
+            .map(|r| {
+                let id = r.int("charID").unwrap_or(0);
                 have_self |= id == my_id;
-                lines.push(Value::List(vec![
+                let ch = characters.get_id(id);
+                Value::List(vec![
                     Value::Int(id),
-                    Value::int_or_none(nonzero(int(r, 1))),
-                    Value::int_or_none(nonzero(int(r, 2))),
-                    Value::Long(int(r, 3).unwrap_or(0)),
+                    Value::int_or_none(nonzero(r.int("corpID"))),
+                    Value::int_or_none(nonzero(r.int("allianceID"))),
+                    Value::Long(r.int("role").unwrap_or(0)),
                     owner_hint(
                         id,
-                        text(r, 4).unwrap_or_default(),
-                        int(r, 5).unwrap_or(0),
+                        ch.and_then(|c| c.text("characterName")).unwrap_or_default().to_string(),
+                        ch.and_then(|c| c.int("typeID")).unwrap_or(0),
                     ),
-                ]));
-            }
-        }
-        Err(e) => error!("LSC members of {channel_id}: {err}", err = crate::logging::chain(&e)),
-    }
+                ])
+            })
+            .collect()
+    });
     if !have_self {
         if let Some(m) = me {
             lines.push(Value::List(m.clone()));
@@ -720,20 +765,20 @@ async fn local_members(ctx: &Ctx<'_>, channel_id: &Value, me: Option<&Vec<Value>
     };
     let mut lines: Vec<Value> = me.map(|m| vec![Value::List(m.clone())]).unwrap_or_default();
     if !players.is_empty() {
-        let ids: Vec<i32> = players.iter().map(|(c, _)| *c as i32).collect();
-        let sql = r#"SELECT c."characterID", c."corporationID", co."allianceID", c."characterName", c."typeID"
-                       FROM "character_" c LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
-                      WHERE c."characterID" = ANY($1)"#;
-        match ctx.db.query(sql, &[&ids]).await {
-            Ok(rows) => {
-                for r in &rows {
-                    let id = int(r, 0).unwrap_or(0);
-                    let role = players.iter().find(|(c, _)| *c == id).map_or(ROLE_LOGIN | ROLE_PLAYER, |(_, role)| *role);
-                    lines.push(member_line(id, int(r, 1), nonzero(int(r, 2)), role, text(r, 3).unwrap_or_default(), int(r, 4).unwrap_or(0)));
-                }
+        let mut ids: Vec<i64> = players.iter().map(|(c, _)| *c).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ctx.store.read(|db| {
+            let corporations = db.table("corporation");
+            for c in ids.iter().filter_map(|id| db.table("character_").get_id(*id)) {
+                let id = c.int("characterID").unwrap_or(0);
+                let role = players.iter().find(|(c, _)| *c == id).map_or(ROLE_LOGIN | ROLE_PLAYER, |(_, role)| *role);
+                let corp = c.int("corporationID");
+                let alliance = corp.and_then(|co| corporations.get_id(co)).and_then(|co| co.int("allianceID"));
+                let name = c.text("characterName").unwrap_or_default().to_string();
+                lines.push(member_line(id, corp, nonzero(alliance), role, name, c.int("typeID").unwrap_or(0)));
             }
-            Err(e) => error!("Local members: {err}", err = crate::logging::chain(&e)),
-        }
+        });
     }
     for b in bots.into_iter().filter(|b| b.char_id != my_id) {
         lines.push(member_line(b.char_id, Some(b.corp_id), b.alliance_id, ROLE_LOGIN | ROLE_PLAYER, b.name, b.type_id));
@@ -764,19 +809,12 @@ pub fn bot_who(b: &LocalBot) -> Value {
 
 async fn self_member(ctx: &Ctx<'_>) -> Option<Vec<Value>> {
     let char_id = ctx.session.char_id?;
-    let sql = r#"SELECT "characterName","typeID" FROM "character_"
-                   WHERE "characterID" = $1"#;
-    let (name, type_id) = match ctx.db.query(sql, &[&(char_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => (
-            text(&rows[0], 0).unwrap_or_default(),
-            int(&rows[0], 1).unwrap_or(0),
-        ),
-        Ok(_) => (String::new(), 0),
-        Err(e) => {
-            error!("LSC self member {char_id}: {err}", err = crate::logging::chain(&e));
-            (String::new(), 0)
-        }
-    };
+    let (name, type_id) = ctx.store.read(|db| {
+        db.table("character_")
+            .get_id(char_id)
+            .map(|r| (r.text("characterName").unwrap_or_default().to_string(), r.int("typeID").unwrap_or(0)))
+            .unwrap_or_default()
+    });
     Some(vec![
         Value::Int(char_id),
         Value::int_or_none(ctx.session.corp_id),
@@ -795,28 +833,25 @@ fn owner_hint(owner_id: i64, name: String, type_id: i64) -> Value {
 }
 
 async fn acl_for(ctx: &Ctx<'_>, channel_id: i64, default_mode: i64) -> Value {
-    let sql = r#"SELECT "accessor","mode","untilWhen","reason","admin","originalMode"
-                   FROM "channelMods" WHERE "channelID" = $1
-                  ORDER BY "id""#;
-    let mut lines = Vec::new();
     let mut has_default = false;
-    match ctx.db.query(sql, &[&(channel_id as i32)]).await {
-        Ok(rows) => {
-            for r in &rows {
-                let accessor = int(r, 0);
+    let mut lines: Vec<Value> = ctx.store.read(|db| {
+        let mut mods: Vec<Row> = db.table("channelMods").find(&["channelID"], &[store::Value::Int(channel_id)]).collect();
+        mods.sort_by_key(|r| r.int("id"));
+        mods.iter()
+            .map(|r| {
+                let accessor = r.int("accessor");
                 has_default |= accessor.is_none();
-                lines.push(Value::List(vec![
+                Value::List(vec![
                     Value::int_or_none(accessor),
-                    Value::int_or_none(int(r, 1)),
-                    int(r, 2).map(Value::Long).unwrap_or(Value::None),
-                    text(r, 3).map_or(Value::None, Value::text),
-                    text(r, 4).map_or(Value::None, Value::text),
-                    Value::int_or_none(int(r, 5)),
-                ]));
-            }
-        }
-        Err(e) => error!("LSC acl of {channel_id}: {err}", err = crate::logging::chain(&e)),
-    }
+                    Value::int_or_none(r.int("mode")),
+                    r.int("untilWhen").map(Value::Long).unwrap_or(Value::None),
+                    r.text("reason").map_or(Value::None, Value::text),
+                    r.text("admin").map_or(Value::None, Value::text),
+                    Value::int_or_none(r.int("originalMode")),
+                ])
+            })
+            .collect()
+    });
     if !has_default {
         lines.insert(
             0,
@@ -845,55 +880,85 @@ fn nonzero(v: Option<i64>) -> Option<i64> {
     v.filter(|n| *n != 0)
 }
 
-fn me(ctx: &Ctx<'_>) -> i32 {
-    ctx.session.char_id.unwrap_or(0) as i32
+fn me(ctx: &Ctx<'_>) -> i64 {
+    ctx.session.char_id.unwrap_or(0)
 }
 
-fn flag(call: &Call, name: &str) -> i16 {
-    i16::from(call.kwarg(name).and_then(|v| v.as_i64()).unwrap_or(0) != 0)
+fn flag(call: &Call, name: &str) -> i64 {
+    i64::from(call.kwarg(name).and_then(|v| v.as_i64()).unwrap_or(0) != 0)
+}
+
+/// Sets columns of channel `channel_id` if the caller owns it and `also`
+/// holds for it: whether it did.
+fn set_owned(ctx: &Ctx<'_>, channel_id: i64, sets: store::Sets, also: impl Fn(&Row) -> bool, what: &str) -> bool {
+    let char_id = me(ctx);
+    let updated = ctx.store.write(|tx| {
+        let owned = tx.table("channels").get_id(channel_id).filter(|c| c.int("ownerID") == Some(char_id) && also(c));
+        let Some(id) = owned.map(|c| c.id) else { return Ok(false) };
+        tx.update("channels", id, sets)?;
+        Ok::<_, StoreError>(true)
+    });
+    updated.unwrap_or_else(|e| {
+        error!("LSC.{what}({channel_id}): {err}", err = crate::logging::chain(&e));
+        false
+    })
 }
 
 /// CreateChannel(displayName, joinExisting=1, memberless=0, mailingList=0,
 /// temporary=False): lscengine unpacks (info, acl, memberList).
 async fn create_channel(ctx: &Ctx<'_>, call: &Call) -> Value {
     let name = call.arg_text(0).unwrap_or_default();
+    let key = name.to_lowercase();
     let char_id = me(ctx);
-    let existing = if flag(call, "joinExisting") != 0 {
-        let sql = r#"SELECT "channelID" FROM "channels"
-                      WHERE "comparisonKey" = lower($1) AND "temporary" = 0 LIMIT 1"#;
-        ctx.query_one(sql, &[&name]).await.and_then(|r| int(&r, 0))
-    } else {
-        None
-    };
-    let channel_id = match existing {
-        Some(id) => id,
-        None => {
-            let sql = r#"INSERT INTO "channels" ("ownerID","displayName","motd","comparisonKey",
-                                                 "memberless","mailingList","temporary","mode",
-                                                 "estimatedMemberCount")
-                         VALUES ($1, $2, '', lower($2), $3, $4, $5, $6, 1)
-                         RETURNING "channelID""#;
-            let mode = CHTMODE_CONVERSATIONALIST as i16;
-            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 6] = [
-                &char_id,
-                &name,
-                &flag(call, "memberless"),
-                &flag(call, "mailingList"),
-                &flag(call, "temporary"),
-                &mode,
-            ];
-            match ctx.query_one(sql, &params).await.and_then(|r| int(&r, 0)) {
-                Some(id) => id,
-                None => return Value::None,
-            }
+    let join_existing = flag(call, "joinExisting") != 0;
+    let made = ctx.store.write(|tx| {
+        let existing = if join_existing {
+            tx.table("channels")
+                .rows()
+                .find(|c| c.text("comparisonKey") == Some(key.as_str()) && c.int("temporary") == Some(0))
+                .and_then(|c| c.int("channelID"))
+        } else {
+            None
+        };
+        if let Some(id) = existing {
+            return Ok((id, true));
+        }
+        let row = tx.insert(
+            "channels",
+            &[
+                ("ownerID", store::Value::Int(char_id)),
+                ("displayName", store::Value::Text(name.as_str().into())),
+                ("motd", store::Value::Text("".into())),
+                ("comparisonKey", store::Value::Text(key.as_str().into())),
+                ("memberless", store::Value::Int(flag(call, "memberless"))),
+                ("mailingList", store::Value::Int(flag(call, "mailingList"))),
+                ("temporary", store::Value::Int(flag(call, "temporary"))),
+                ("mode", store::Value::Int(CHTMODE_CONVERSATIONALIST)),
+                ("estimatedMemberCount", store::Value::Int(1)),
+            ],
+        )?;
+        Ok::<_, StoreError>((tx.table("channels").row(row).and_then(|c| c.int("channelID")).unwrap_or(0), false))
+    });
+    let (channel_id, existed) = match made {
+        Ok(made) => made,
+        Err(e) => {
+            error!("LSC.CreateChannel({name:?}): {err}", err = crate::logging::chain(&e));
+            return Value::None;
         }
     };
-    let role = (if existing.is_some() { CHTMODE_CONVERSATIONALIST } else { CHTMODE_CREATOR }) as i32;
-    let sql = r#"INSERT INTO "channelChars" ("channelID","charID","corpID","allianceID","role")
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING"#;
-    let corp = ctx.session.corp_id.unwrap_or(0) as i32;
-    let alliance = ctx.session.alliance_id.unwrap_or(0) as i32;
-    ctx.execute(sql, &[&(channel_id as i32), &char_id, &corp, &alliance, &role]).await;
+    let role = if existed { CHTMODE_CONVERSATIONALIST } else { CHTMODE_CREATOR };
+    let corp = ctx.session.corp_id.unwrap_or(0);
+    let alliance = ctx.session.alliance_id.unwrap_or(0);
+    let sets = [
+        ("channelID", store::Value::Int(channel_id)),
+        ("charID", store::Value::Int(char_id)),
+        ("corpID", store::Value::Int(corp)),
+        ("allianceID", store::Value::Int(alliance)),
+        ("role", store::Value::Int(role)),
+    ];
+    if let Err(e) = ctx.store.write(|tx| tx.insert_or_ignore("channelChars", &sets)) {
+        error!("LSC.CreateChannel: joining {channel_id}: {err}", err = crate::logging::chain(&e));
+    }
 
     let Some((line, default_mode)) = channel_info(ctx, channel_id).await else { return Value::None };
     let acl = acl_for(ctx, channel_id, default_mode).await;
@@ -905,64 +970,68 @@ async fn create_channel(ctx: &Ctx<'_>, call: &Call) -> Value {
 /// newPassword=): the channel settings dialog. Owner only; the password changes
 /// only if oldPassword matches.
 async fn configure(ctx: &Ctx<'_>, call: &Call) -> Outcome {
-    let channel_id = call.arg_id(0) as i32;
-    let char_id = me(ctx);
+    let channel_id = call.arg_id(0);
     let text_kw = |name: &str| call.kwarg(name).and_then(|v| v.as_string());
     let int_kw = |name: &str| call.kwarg(name).and_then(|v| v.as_i64());
     if let Some(value) = int_kw("languageRestriction") {
-        let result = set_language_restriction(ctx, i64::from(channel_id), value).await;
+        let result = set_language_restriction(ctx, channel_id, value).await;
         if !matches!(result, Outcome::Value(_)) { return result; }
     }
     if let Some(name) = text_kw("displayName") {
-        let sql = r#"UPDATE "channels" SET "displayName" = $3, "comparisonKey" = lower($3)
-                      WHERE "channelID" = $1 AND "ownerID" = $2"#;
-        ctx.execute(sql, &[&channel_id, &char_id, &name]).await;
+        let sets = [("displayName", store::Value::Text(name.as_str().into())), ("comparisonKey", store::Value::Text(name.to_lowercase().into()))];
+        set_owned(ctx, channel_id, &sets, |_| true, "Configure");
     }
     if let Some(motd) = text_kw("motd") {
-        let sql = r#"UPDATE "channels" SET "motd" = $3 WHERE "channelID" = $1 AND "ownerID" = $2"#;
-        ctx.execute(sql, &[&channel_id, &char_id, &motd]).await;
+        set_owned(ctx, channel_id, &[("motd", store::Value::Text(motd.into()))], |_| true, "Configure");
     }
     for column in ["cspa", "memberless"] {
         if let Some(v) = int_kw(column) {
-            let sql = format!(
-                r#"UPDATE "channels" SET "{column}" = $3 WHERE "channelID" = $1 AND "ownerID" = $2"#
-            );
-            ctx.execute(&sql, &[&channel_id, &char_id, &(v as i16)]).await;
+            set_owned(ctx, channel_id, &[(column, store::Value::Int(v))], |_| true, "Configure");
         }
     }
     if call.kwarg("newPassword").is_some() {
         let new = text_kw("newPassword").filter(|p| !p.is_empty());
         let old = text_kw("oldPassword").unwrap_or_default();
-        let sql = r#"UPDATE "channels" SET "password" = $3
-                      WHERE "channelID" = $1 AND "ownerID" = $2 AND COALESCE("password", '') = $4"#;
-        ctx.execute(sql, &[&channel_id, &char_id, &new, &old]).await;
+        let password = new.map_or(store::Value::Null, |p| store::Value::Text(p.into()));
+        set_owned(ctx, channel_id, &[("password", password)], |c| c.text("password").unwrap_or("") == old, "Configure");
     }
     Outcome::Value(Value::None)
 }
 
 async fn access_control(ctx: &Ctx<'_>, call: &Call) -> Value {
-    let channel_id = call.arg_id(0) as i32;
-    let accessor = call.arg_id(1) as i32;
-    let mode = call.arg_i64(2).unwrap_or(CHTMODE_NOTSPECIFIED) as i32;
+    let channel_id = call.arg_id(0);
+    let accessor = call.arg_id(1);
+    let mode = call.arg_i64(2).unwrap_or(CHTMODE_NOTSPECIFIED);
     let until = call.arg_i64(3);
     let reason = call.arg_text(4);
     let char_id = me(ctx);
 
-    let allowed = channel_id == char_id || {
-        let sql = format!(r#"SELECT 1 FROM "channels" WHERE "channelID" = $1 AND ({OPERATOR_TEST})"#);
-        ctx.query_one(&sql, &[&channel_id, &char_id]).await.is_some()
-    };
+    let allowed = channel_id == char_id
+        || ctx.store.read(|db| db.table("channels").get_id(channel_id).is_some_and(|c| operates(db, &c, char_id)));
     if !allowed {
         warn!("AccessControl on channel {channel_id} by a non-operator");
         return Value::None;
     }
-    let clear = r#"DELETE FROM "channelMods" WHERE "channelID" = $1 AND "accessor" = $2"#;
-    ctx.execute(clear, &[&channel_id, &accessor]).await;
-    if i64::from(mode) != CHTMODE_NOTSPECIFIED {
-        let sql = r#"INSERT INTO "channelMods" ("channelID","accessor","mode","untilWhen","reason","admin")
-                     VALUES ($1, $2, $3, $4, $5,
-                             (SELECT "characterName" FROM "character_" WHERE "characterID" = $6))"#;
-        ctx.execute(sql, &[&channel_id, &accessor, &mode, &until, &reason, &char_id]).await;
+    let cleared = ctx.store.write(|tx| tx.delete_where("channelMods", &["channelID", "accessor"], &[store::Value::Int(channel_id), store::Value::Int(accessor)]));
+    if let Err(e) = cleared {
+        error!("LSC.AccessControl({channel_id}, {accessor}): {err}", err = crate::logging::chain(&e));
+    }
+    if mode != CHTMODE_NOTSPECIFIED {
+        let set = ctx.store.write(|tx| {
+            let admin = tx.table("character_").get_id(char_id).map_or(store::Value::Null, |c| c.value("characterName").clone());
+            let sets = [
+                ("channelID", store::Value::Int(channel_id)),
+                ("accessor", store::Value::Int(accessor)),
+                ("mode", store::Value::Int(mode)),
+                ("untilWhen", until.map_or(store::Value::Null, store::Value::Int)),
+                ("reason", reason.as_deref().map_or(store::Value::Null, |r| store::Value::Text(r.into()))),
+                ("admin", admin),
+            ];
+            tx.insert("channelMods", &sets)
+        });
+        if let Err(e) = set {
+            error!("LSC.AccessControl({channel_id}, {accessor}): {err}", err = crate::logging::chain(&e));
+        }
     }
     Value::None
 }

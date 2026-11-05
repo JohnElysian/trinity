@@ -1,0 +1,10009 @@
+{
+ "sequences": [
+  {
+   "name": "account_accountID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "agtCharMissions_missionID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "alscLog_logID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "billsReceivable_billID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "bookmarks_bookmarkID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "channelMods_id_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "chrOwnerNote_noteID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "contract_bids_id_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "contract_items_id_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "courierMissions_missionID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "crpVoteCases_voteCaseID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "crpWars_warID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "dyn_id_seq",
+   "start": 140000000,
+   "increment": 1,
+   "min": 100000000,
+   "max": 1999999999
+  },
+  {
+   "name": "evemailDetails_attachmentID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "evemail_messageID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "factory_folder_seq",
+   "start": 68000001,
+   "increment": 1,
+   "min": 68000000,
+   "max": 69999999
+  },
+  {
+   "name": "insuranceContracts_contractID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "killLog_killID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "launched_drone_generation",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "maintenance_generation",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "market_journal_refID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "market_orders_orderID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "market_transactions_transactionID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "office_folder_seq",
+   "start": 66000001,
+   "increment": 1,
+   "min": 66000000,
+   "max": 67999999
+  },
+  {
+   "name": "petitionCategoryProperties_propertyID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "petitionLog_logID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "petitionMessages_messageID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "petitions_petitionID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "player_channel_seq",
+   "start": 2000000000,
+   "increment": 1,
+   "min": 2000000000,
+   "max": 2147483647
+  },
+  {
+   "name": "portalReceipts_generation_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "ramJobs_jobID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 2147483647
+  },
+  {
+   "name": "ship_logout_generation",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "standingTransactions_eventID_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "station_arrival_generation",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  },
+  {
+   "name": "trade_session_seq",
+   "start": 64000001,
+   "increment": 1,
+   "min": 64000000,
+   "max": 65999999
+  },
+  {
+   "name": "travelReceipts_generation_seq",
+   "start": 1,
+   "increment": 1,
+   "min": 1,
+   "max": 9223372036854775807
+  }
+ ],
+ "tables": [
+  {
+   "name": "account",
+   "columns": [
+    {
+     "name": "accountID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "account_accountID_seq"
+     }
+    },
+    {
+     "name": "accountName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "password",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "role",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "passwordAlgo",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": "plain"
+     }
+    },
+    {
+     "name": "banned",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "lastLogin",
+     "type": "bigint"
+    },
+    {
+     "name": "languageID",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": "EN"
+     }
+    }
+   ],
+   "primaryKey": [
+    "accountID"
+   ],
+   "indexes": [
+    {
+     "name": "account_accountName_key",
+     "columns": [
+      "accountName"
+     ],
+     "unique": true
+    }
+   ]
+  },
+  {
+   "name": "accountBalance",
+   "columns": [
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "accountKey",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "ownerID",
+    "accountKey"
+   ]
+  },
+  {
+   "name": "agtCharMissions",
+   "columns": [
+    {
+     "name": "missionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "agtCharMissions_missionID_seq"
+     }
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "agentID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "kind",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "state",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "name",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer"
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "cargoID",
+     "type": "integer"
+    },
+    {
+     "name": "destinationID",
+     "type": "integer"
+    },
+    {
+     "name": "siteX",
+     "type": "double"
+    },
+    {
+     "name": "siteY",
+     "type": "double"
+    },
+    {
+     "name": "siteZ",
+     "type": "double"
+    },
+    {
+     "name": "reward",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "bonus",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "bonusSeconds",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "offeredAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "acceptedAt",
+     "type": "bigint"
+    },
+    {
+     "name": "expiresAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "closedAt",
+     "type": "bigint"
+    }
+   ],
+   "primaryKey": [
+    "missionID"
+   ],
+   "indexes": [
+    {
+     "name": "agtCharMissions_char_ix",
+     "columns": [
+      "characterID",
+      "state"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "agtMissionGroups",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "divisionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "level",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "missionID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "corporationID",
+    "divisionID",
+    "level"
+   ],
+   "indexes": [
+    {
+     "name": "agtMissionGroups_divisionID_idx",
+     "columns": [
+      "divisionID"
+     ]
+    },
+    {
+     "name": "agtMissionGroups_missionID_idx",
+     "columns": [
+      "missionID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "agtMissionTypes",
+   "columns": [
+    {
+     "name": "missionTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "missionTypeName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "missionTypeID"
+   ]
+  },
+  {
+   "name": "agtMissions",
+   "columns": [
+    {
+     "name": "missionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "missionName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "missionLevel",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "missionTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "importantMission",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "missionID"
+   ],
+   "indexes": [
+    {
+     "name": "agtMissions_missionLevel_idx",
+     "columns": [
+      "missionLevel"
+     ]
+    },
+    {
+     "name": "agtMissions_missionTypeID_idx",
+     "columns": [
+      "missionTypeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "agtOfferGroups",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "divisionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "level",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "offerID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "corporationID",
+    "divisionID",
+    "level"
+   ],
+   "indexes": [
+    {
+     "name": "agtOfferGroups_divisionID_idx",
+     "columns": [
+      "divisionID"
+     ]
+    },
+    {
+     "name": "agtOfferGroups_offerID_idx",
+     "columns": [
+      "offerID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "agtOfferRequired",
+   "columns": [
+    {
+     "name": "offerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "offerID",
+    "typeID"
+   ],
+   "indexes": [
+    {
+     "name": "agtOfferRequired_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "agtOfferReward",
+   "columns": [
+    {
+     "name": "offerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "offerID",
+    "typeID"
+   ],
+   "indexes": [
+    {
+     "name": "agtOfferReward_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "agtOffers",
+   "columns": [
+    {
+     "name": "offerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "offerName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "offerLevel",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "loyaltyPoints",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "requiredISK",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rewardISK",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "offerText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "offerAcceptedText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "offerID"
+   ],
+   "indexes": [
+    {
+     "name": "agtOffers_offerLevel_idx",
+     "columns": [
+      "offerLevel"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "allianceApplications",
+   "columns": [
+    {
+     "name": "allianceID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "applicationText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "applicationDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "state",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "allianceID"
+     ],
+     "references": "alliances",
+     "referencedColumns": [
+      "allianceID"
+     ]
+    }
+   ],
+   "primaryKey": [
+    "allianceID",
+    "corporationID"
+   ],
+   "indexes": [
+    {
+     "name": "allianceapps_corp_ix",
+     "columns": [
+      "corporationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "allianceMembers",
+   "columns": [
+    {
+     "name": "allianceID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "chosenExecutorID",
+     "type": "integer"
+    },
+    {
+     "name": "startDate",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "allianceID"
+     ],
+     "references": "alliances",
+     "referencedColumns": [
+      "allianceID"
+     ]
+    }
+   ],
+   "primaryKey": [
+    "corporationID"
+   ],
+   "indexes": [
+    {
+     "name": "allianceMembers_alliance_corp_uq",
+     "columns": [
+      "allianceID",
+      "corporationID"
+     ],
+     "unique": true
+    },
+    {
+     "name": "alliancemembers_alliance_ix",
+     "columns": [
+      "allianceID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "allianceRelationships",
+   "columns": [
+    {
+     "name": "fromID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "toID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "relationship",
+     "type": "smallint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "fromID",
+    "toID"
+   ],
+   "indexes": [
+    {
+     "name": "alliancerel_to_ix",
+     "columns": [
+      "toID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "alliance_shortnames",
+   "columns": [
+    {
+     "name": "allianceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "shortName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "allianceID"
+   ]
+  },
+  {
+   "name": "alliances",
+   "columns": [
+    {
+     "name": "allianceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "allianceName",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "shortName",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "url",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "executorCorpID",
+     "type": "integer"
+    },
+    {
+     "name": "creatorCorpID",
+     "type": "integer"
+    },
+    {
+     "name": "creatorCharID",
+     "type": "integer"
+    },
+    {
+     "name": "dictatorial",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startDate",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "memberCount",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "allianceID"
+   ],
+   "indexes": [
+    {
+     "name": "alliances_shortname_uq",
+     "columns": [
+      "shortName"
+     ],
+     "unique": true
+    },
+    {
+     "name": "alliances_executor_ix",
+     "columns": [
+      "executorCorpID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "alscLog",
+   "columns": [
+    {
+     "name": "logID",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "alscLog_logID_seq"
+     }
+    },
+    {
+     "name": "containerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "logDateTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "inventoryMgrLocationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "flag",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "actorID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "actionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "status",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "arg1",
+     "type": "integer"
+    },
+    {
+     "name": "arg2",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "logID"
+   ],
+   "indexes": [
+    {
+     "name": "alsclog_container_ix",
+     "columns": [
+      "containerID",
+      "logID"
+     ]
+    },
+    {
+     "name": "alsclog_date_ix",
+     "columns": [
+      "containerID",
+      "logDateTime"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "billsReceivable",
+   "columns": [
+    {
+     "name": "billID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "billsReceivable_billID_seq"
+     }
+    },
+    {
+     "name": "billTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "debtorID",
+     "type": "integer"
+    },
+    {
+     "name": "creditorID",
+     "type": "integer"
+    },
+    {
+     "name": "amount",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "dueDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "interest",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "externalID",
+     "type": "integer"
+    },
+    {
+     "name": "paid",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "externalID2",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": -1
+     }
+    }
+   ],
+   "primaryKey": [
+    "billID"
+   ],
+   "indexes": [
+    {
+     "name": "billsreceivable_creditor_ix",
+     "columns": [
+      "creditorID",
+      "paid"
+     ]
+    },
+    {
+     "name": "billsreceivable_debtor_ix",
+     "columns": [
+      "debtorID",
+      "paid"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "bookmarkVouchers",
+   "columns": [
+    {
+     "name": "voucherID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "flag",
+     "type": "integer"
+    },
+    {
+     "name": "memo",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "created",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "x",
+     "type": "double"
+    },
+    {
+     "name": "y",
+     "type": "double"
+    },
+    {
+     "name": "z",
+     "type": "double"
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "note",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "voucherID"
+   ]
+  },
+  {
+   "name": "bookmarks",
+   "columns": [
+    {
+     "name": "bookmarkID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "bookmarks_bookmarkID_seq"
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "flag",
+     "type": "integer",
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "memo",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "created",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "x",
+     "type": "double",
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "y",
+     "type": "double",
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "z",
+     "type": "double",
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "note",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "bookmarkID"
+   ],
+   "indexes": [
+    {
+     "name": "bookmarks_owner_idx",
+     "columns": [
+      "ownerID"
+     ]
+    },
+    {
+     "name": "bookmarks_owner_ix",
+     "columns": [
+      "ownerID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "botGroups",
+   "columns": [
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "kind",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "regionID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "ownerID"
+   ]
+  },
+  {
+   "name": "botRegionDensity",
+   "columns": [
+    {
+     "name": "regionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "factor",
+     "type": "real",
+     "notNull": true,
+     "default": {
+      "value": 1.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "regionID"
+   ]
+  },
+  {
+   "name": "botRelations",
+   "columns": [
+    {
+     "name": "sideID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "charID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "heat",
+     "type": "real",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "favor",
+     "type": "real",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "flags",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "updatedAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "sideID",
+    "charID"
+   ]
+  },
+  {
+   "name": "botStock",
+   "columns": [
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "quantity",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "stationID",
+    "typeID"
+   ]
+  },
+  {
+   "name": "bots",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "role",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "homeStationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "share",
+     "type": "real",
+     "notNull": true
+    },
+    {
+     "name": "turf",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "tier",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID"
+   ]
+  },
+  {
+   "name": "bounties",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "bounty",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "placedAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "ownerID"
+   ]
+  },
+  {
+   "name": "channelChars",
+   "columns": [
+    {
+     "name": "channelID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corpID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "charID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "allianceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "role",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "extra",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "channelID",
+    "charID"
+   ],
+   "indexes": [
+    {
+     "name": "channelChars_allianceID_idx",
+     "columns": [
+      "allianceID"
+     ]
+    },
+    {
+     "name": "channelChars_charID_idx",
+     "columns": [
+      "charID"
+     ]
+    },
+    {
+     "name": "channelChars_corpID_idx",
+     "columns": [
+      "corpID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "channelMods",
+   "columns": [
+    {
+     "name": "id",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "channelMods_id_seq"
+     }
+    },
+    {
+     "name": "channelID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "accessor",
+     "type": "integer"
+    },
+    {
+     "name": "mode",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "untilWhen",
+     "type": "bigint"
+    },
+    {
+     "name": "originalMode",
+     "type": "integer"
+    },
+    {
+     "name": "admin",
+     "type": "text"
+    },
+    {
+     "name": "reason",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "id"
+   ],
+   "indexes": [
+    {
+     "name": "channelMods_channelID_idx",
+     "columns": [
+      "channelID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "channelTypes",
+   "columns": [
+    {
+     "name": "channelTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "channelTypeName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "defaultName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "channelTypeID"
+   ]
+  },
+  {
+   "name": "channels",
+   "columns": [
+    {
+     "name": "channelID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "player_channel_seq"
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "displayName",
+     "type": "text"
+    },
+    {
+     "name": "motd",
+     "type": "text"
+    },
+    {
+     "name": "comparisonKey",
+     "type": "text"
+    },
+    {
+     "name": "memberless",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "password",
+     "type": "text"
+    },
+    {
+     "name": "mailingList",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "cspa",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "temporary",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "mode",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "subscribed",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "estimatedMemberCount",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "languageRestriction",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "channelID"
+   ]
+  },
+  {
+   "name": "channelsStatic",
+   "columns": [
+    {
+     "name": "channelID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "displayName",
+     "type": "text"
+    },
+    {
+     "name": "motd",
+     "type": "text"
+    },
+    {
+     "name": "comparisonKey",
+     "type": "text"
+    },
+    {
+     "name": "memberless",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "password",
+     "type": "text"
+    },
+    {
+     "name": "mailingList",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "cspa",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "temporary",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "mode",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "subscribed",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "estimatedMemberCount",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "channelID"
+   ]
+  },
+  {
+   "name": "characterStatic",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "characterName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "accountID",
+     "type": "integer"
+    },
+    {
+     "name": "title",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "bounty",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "securityRating",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "petitionMessage",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "logonMinutes",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "createDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "raceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "bloodlineID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "gender",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "accessoryID",
+     "type": "integer"
+    },
+    {
+     "name": "beardID",
+     "type": "integer"
+    },
+    {
+     "name": "costumeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "decoID",
+     "type": "integer"
+    },
+    {
+     "name": "eyebrowsID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "eyesID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "hairID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "lipstickID",
+     "type": "integer"
+    },
+    {
+     "name": "makeupID",
+     "type": "integer"
+    },
+    {
+     "name": "skinID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "backgroundID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "lightID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "headRotation1",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "headRotation2",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "headRotation3",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "eyeRotation1",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "eyeRotation2",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "eyeRotation3",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "camPos1",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "camPos2",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "camPos3",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "morph1e",
+     "type": "double"
+    },
+    {
+     "name": "morph1n",
+     "type": "double"
+    },
+    {
+     "name": "morph1s",
+     "type": "double"
+    },
+    {
+     "name": "morph1w",
+     "type": "double"
+    },
+    {
+     "name": "morph2e",
+     "type": "double"
+    },
+    {
+     "name": "morph2n",
+     "type": "double"
+    },
+    {
+     "name": "morph2s",
+     "type": "double"
+    },
+    {
+     "name": "morph2w",
+     "type": "double"
+    },
+    {
+     "name": "morph3e",
+     "type": "double"
+    },
+    {
+     "name": "morph3n",
+     "type": "double"
+    },
+    {
+     "name": "morph3s",
+     "type": "double"
+    },
+    {
+     "name": "morph3w",
+     "type": "double"
+    },
+    {
+     "name": "morph4e",
+     "type": "double"
+    },
+    {
+     "name": "morph4n",
+     "type": "double"
+    },
+    {
+     "name": "morph4s",
+     "type": "double"
+    },
+    {
+     "name": "morph4w",
+     "type": "double"
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "constellationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "regionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID"
+   ],
+   "indexes": [
+    {
+     "name": "characterStatic_accessoryID_idx",
+     "columns": [
+      "accessoryID"
+     ]
+    },
+    {
+     "name": "characterStatic_accountID_idx",
+     "columns": [
+      "accountID"
+     ]
+    },
+    {
+     "name": "characterStatic_backgroundID_idx",
+     "columns": [
+      "backgroundID"
+     ]
+    },
+    {
+     "name": "characterStatic_beardID_idx",
+     "columns": [
+      "beardID"
+     ]
+    },
+    {
+     "name": "characterStatic_characterName_key",
+     "columns": [
+      "characterName"
+     ],
+     "unique": true
+    },
+    {
+     "name": "characterStatic_costumeID_idx",
+     "columns": [
+      "costumeID"
+     ]
+    },
+    {
+     "name": "characterStatic_decoID_idx",
+     "columns": [
+      "decoID"
+     ]
+    },
+    {
+     "name": "characterStatic_eyebrowsID_idx",
+     "columns": [
+      "eyebrowsID"
+     ]
+    },
+    {
+     "name": "characterStatic_eyesID_idx",
+     "columns": [
+      "eyesID"
+     ]
+    },
+    {
+     "name": "characterStatic_hairID_idx",
+     "columns": [
+      "hairID"
+     ]
+    },
+    {
+     "name": "characterStatic_lightID_idx",
+     "columns": [
+      "lightID"
+     ]
+    },
+    {
+     "name": "characterStatic_lipstickID_idx",
+     "columns": [
+      "lipstickID"
+     ]
+    },
+    {
+     "name": "characterStatic_makeupID_idx",
+     "columns": [
+      "makeupID"
+     ]
+    },
+    {
+     "name": "characterStatic_skinID_idx",
+     "columns": [
+      "skinID"
+     ]
+    },
+    {
+     "name": "characterStatic_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "character_",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "characterName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "accountID",
+     "type": "integer"
+    },
+    {
+     "name": "title",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "bounty",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "securityRating",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "petitionMessage",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "logonMinutes",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "createDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "raceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "bloodlineID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "gender",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "accessoryID",
+     "type": "integer"
+    },
+    {
+     "name": "beardID",
+     "type": "integer"
+    },
+    {
+     "name": "costumeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "decoID",
+     "type": "integer"
+    },
+    {
+     "name": "eyebrowsID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "eyesID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "hairID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "lipstickID",
+     "type": "integer"
+    },
+    {
+     "name": "makeupID",
+     "type": "integer"
+    },
+    {
+     "name": "skinID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "backgroundID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "lightID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "headRotation1",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "headRotation2",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "headRotation3",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "eyeRotation1",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "eyeRotation2",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "eyeRotation3",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "camPos1",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "camPos2",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "camPos3",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "morph1e",
+     "type": "double"
+    },
+    {
+     "name": "morph1n",
+     "type": "double"
+    },
+    {
+     "name": "morph1s",
+     "type": "double"
+    },
+    {
+     "name": "morph1w",
+     "type": "double"
+    },
+    {
+     "name": "morph2e",
+     "type": "double"
+    },
+    {
+     "name": "morph2n",
+     "type": "double"
+    },
+    {
+     "name": "morph2s",
+     "type": "double"
+    },
+    {
+     "name": "morph2w",
+     "type": "double"
+    },
+    {
+     "name": "morph3e",
+     "type": "double"
+    },
+    {
+     "name": "morph3n",
+     "type": "double"
+    },
+    {
+     "name": "morph3s",
+     "type": "double"
+    },
+    {
+     "name": "morph3w",
+     "type": "double"
+    },
+    {
+     "name": "morph4e",
+     "type": "double"
+    },
+    {
+     "name": "morph4n",
+     "type": "double"
+    },
+    {
+     "name": "morph4s",
+     "type": "double"
+    },
+    {
+     "name": "morph4w",
+     "type": "double"
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "constellationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "regionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "deletePrepareDateTime",
+     "type": "bigint"
+    },
+    {
+     "name": "baseID",
+     "type": "integer"
+    },
+    {
+     "name": "shipID",
+     "type": "integer"
+    },
+    {
+     "name": "titleMask",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "divisionID",
+     "type": "integer"
+    },
+    {
+     "name": "squadronID",
+     "type": "integer"
+    },
+    {
+     "name": "online",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "lastOnline",
+     "type": "bigint"
+    },
+    {
+     "name": "lastCloneJump",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ancestryID",
+     "type": "integer"
+    },
+    {
+     "name": "schoolID",
+     "type": "integer"
+    },
+    {
+     "name": "careerID",
+     "type": "integer"
+    },
+    {
+     "name": "careerSpecialityID",
+     "type": "integer"
+    },
+    {
+     "name": "corpAccountKey",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1000
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID"
+   ],
+   "indexes": [
+    {
+     "name": "character__accountID_idx",
+     "columns": [
+      "accountID"
+     ]
+    },
+    {
+     "name": "character__characterName_key",
+     "columns": [
+      "characterName"
+     ],
+     "unique": true
+    },
+    {
+     "name": "character__typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    },
+    {
+     "name": "character_corp_ix",
+     "columns": [
+      "corporationID"
+     ]
+    },
+    {
+     "name": "character_corp_title_ix",
+     "columns": [
+      "corporationID",
+      "titleMask"
+     ]
+    },
+    {
+     "name": "character__delete_prepare_idx",
+     "columns": [
+      "deletePrepareDateTime"
+     ]
+    },
+    {
+     "name": "character__ship_idx",
+     "columns": [
+      "shipID"
+     ]
+    },
+    {
+     "name": "character_online_ix",
+     "columns": [
+      "online"
+     ]
+    },
+    {
+     "name": "character_solarsystem_ix",
+     "columns": [
+      "solarSystemID"
+     ]
+    },
+    {
+     "name": "character_station_ix",
+     "columns": [
+      "stationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "character_booster_refresh",
+   "columns": [
+    {
+     "name": "character",
+     "type": "integer",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "character"
+     ],
+     "references": "character_",
+     "referencedColumns": [
+      "characterID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "character"
+   ]
+  },
+  {
+   "name": "character_boosters",
+   "columns": [
+    {
+     "name": "item",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "character",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "type_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "slot",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "started",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "expires",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "character"
+     ],
+     "references": "character_",
+     "referencedColumns": [
+      "characterID"
+     ],
+     "onDelete": "cascade"
+    },
+    {
+     "columns": [
+      "item"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "checks": [
+    "booster_expires_after_start",
+    "booster_slot_positive"
+   ],
+   "primaryKey": [
+    "item"
+   ],
+   "indexes": [
+    {
+     "name": "character_boosters_character_slot_key",
+     "columns": [
+      "character",
+      "slot"
+     ],
+     "unique": true
+    },
+    {
+     "name": "character_boosters_expiry",
+     "columns": [
+      "expires"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrAgentLoyalty",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "agentID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "loyaltyPoints",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "agentID"
+   ]
+  },
+  {
+   "name": "chrAgentResearch",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "agentID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "pointsPerDay",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "points",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "researchStartDate",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "agentID"
+   ]
+  },
+  {
+   "name": "chrCorporationRoles",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corprole",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtAll",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtBase",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtHQ",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtOther",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRoles",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRolesAtHQ",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRolesAtBase",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRolesAtOther",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID"
+   ]
+  },
+  {
+   "name": "chrEmployment",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startDate",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "corporationID",
+    "startDate"
+   ],
+   "indexes": [
+    {
+     "name": "chrEmployment_corporationID_idx",
+     "columns": [
+      "corporationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrJumpClones",
+   "columns": [
+    {
+     "name": "jumpCloneID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "jumpCloneID"
+   ],
+   "indexes": [
+    {
+     "name": "chrJumpClones_location",
+     "columns": [
+      "locationID"
+     ]
+    },
+    {
+     "name": "chrJumpClones_owner",
+     "columns": [
+      "ownerID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrKillRights",
+   "columns": [
+    {
+     "name": "fromID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "toID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "whenTimestamp",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "fromID",
+    "toID"
+   ],
+   "indexes": [
+    {
+     "name": "chrkillrights_to_ix",
+     "columns": [
+      "toID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrLoyaltyPoints",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "loyaltyPoints",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "checks": [
+    "loyalty_points_not_negative"
+   ],
+   "primaryKey": [
+    "characterID",
+    "corporationID"
+   ]
+  },
+  {
+   "name": "chrMissionState",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "missionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "missionState",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "expirationTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "missionID"
+   ],
+   "indexes": [
+    {
+     "name": "chrMissionState_missionID_idx",
+     "columns": [
+      "missionID"
+     ]
+    },
+    {
+     "name": "chrmissionstate_char_ix",
+     "columns": [
+      "characterID",
+      "missionState"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrNPCStandings",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "fromID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "standing",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "fromID"
+   ],
+   "indexes": [
+    {
+     "name": "chrnpcstandings_from_ix",
+     "columns": [
+      "fromID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrNotes",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "note",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "itemID"
+   ]
+  },
+  {
+   "name": "chrOffers",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "offerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "expirationTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "offerID"
+   ],
+   "indexes": [
+    {
+     "name": "chrOffers_offerID_idx",
+     "columns": [
+      "offerID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrOwnerNote",
+   "columns": [
+    {
+     "name": "noteID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "chrOwnerNote_noteID_seq"
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "label",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "note",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "noteID"
+   ],
+   "indexes": [
+    {
+     "name": "chrOwnerNote_ownerID_idx",
+     "columns": [
+      "ownerID"
+     ]
+    },
+    {
+     "name": "chrownernote_owner_ix",
+     "columns": [
+      "ownerID",
+      "noteID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrStandings",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "toID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "standing",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "toID"
+   ],
+   "indexes": [
+    {
+     "name": "chrstandings_to_ix",
+     "columns": [
+      "toID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "chrSystemVisits",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "visits",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "lastDateTime",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "solarSystemID"
+   ]
+  },
+  {
+   "name": "chrTutorialState",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "tutorialID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "pageID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "eventTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "elapsedSeconds",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "updatedAt",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "tutorialID"
+   ]
+  },
+  {
+   "name": "cloakCooldowns",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "targetingAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "readyAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "itemID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    },
+    {
+     "columns": [
+      "shipID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ],
+   "indexes": [
+    {
+     "name": "cloakCooldowns_ship",
+     "columns": [
+      "shipID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "contract_bids",
+   "columns": [
+    {
+     "name": "id",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "contract_bids_id_seq"
+     }
+    },
+    {
+     "name": "contractID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "bidderID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "amount",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "dateBid",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "forCorp",
+     "type": "boolean",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "contractID"
+     ],
+     "references": "contracts",
+     "referencedColumns": [
+      "contractID"
+     ]
+    }
+   ],
+   "primaryKey": [
+    "id"
+   ],
+   "indexes": [
+    {
+     "name": "contract_bids_contract",
+     "columns": [
+      "contractID",
+      "id"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "contract_items",
+   "columns": [
+    {
+     "name": "id",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "contract_items_id_seq"
+     }
+    },
+    {
+     "name": "contractID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "inCrate",
+     "type": "boolean",
+     "notNull": true
+    },
+    {
+     "name": "parentID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "copy",
+     "type": "integer"
+    },
+    {
+     "name": "materialLevel",
+     "type": "integer"
+    },
+    {
+     "name": "productivityLevel",
+     "type": "integer"
+    },
+    {
+     "name": "bpRuns",
+     "type": "integer"
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "contractID"
+     ],
+     "references": "contracts",
+     "referencedColumns": [
+      "contractID"
+     ]
+    }
+   ],
+   "primaryKey": [
+    "id"
+   ],
+   "indexes": [
+    {
+     "name": "contract_items_contract",
+     "columns": [
+      "contractID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "contract_notifications",
+   "columns": [
+    {
+     "name": "contractID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "contractID"
+     ],
+     "references": "contracts",
+     "referencedColumns": [
+      "contractID"
+     ]
+    }
+   ],
+   "primaryKey": [
+    "contractID",
+    "ownerID"
+   ]
+  },
+  {
+   "name": "contracts",
+   "columns": [
+    {
+     "name": "contractID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "type",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "issuerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "issuerCorpID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "forCorp",
+     "type": "boolean",
+     "notNull": true
+    },
+    {
+     "name": "availability",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "assigneeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "acceptorID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "dateIssued",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "dateExpired",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "dateAccepted",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "numDays",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "dateCompleted",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startStationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "startSolarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "startRegionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "endStationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "endSolarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "endRegionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "price",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "reward",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "collateral",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "title",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "volume",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "status",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "issuerAllianceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "issuerWalletKey",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1000
+     }
+    },
+    {
+     "name": "acceptorWalletKey",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1000
+     }
+    },
+    {
+     "name": "acceptorCorp",
+     "type": "boolean",
+     "notNull": true,
+     "default": {
+      "value": false
+     }
+    },
+    {
+     "name": "crateID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sourceLocation",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "sourceFlag",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "deleted",
+     "type": "boolean",
+     "notNull": true,
+     "default": {
+      "value": false
+     }
+    },
+    {
+     "name": "deposit",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "salesTax",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "taxRate",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "taxCap",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "contractID"
+   ],
+   "indexes": [
+    {
+     "name": "contracts_issuer",
+     "columns": [
+      "issuerID",
+      "status"
+     ]
+    },
+    {
+     "name": "contracts_corporation",
+     "columns": [
+      "issuerCorpID",
+      "status"
+     ]
+    },
+    {
+     "name": "contracts_assignee",
+     "columns": [
+      "assigneeID",
+      "status"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "corporation",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "corporationName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "tickerName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "url",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "taxRate",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "minimumJoinStanding",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "corporationType",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "hasPlayerPersonnelManager",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sendCharTerminationMessage",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "creatorID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ceoID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "raceID",
+     "type": "integer"
+    },
+    {
+     "name": "allianceID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "shares",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 1000
+     }
+    },
+    {
+     "name": "memberCount",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "memberLimit",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 10
+     }
+    },
+    {
+     "name": "allowedMemberRaceIDs",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "graphicID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "shape1",
+     "type": "integer"
+    },
+    {
+     "name": "shape2",
+     "type": "integer"
+    },
+    {
+     "name": "shape3",
+     "type": "integer"
+    },
+    {
+     "name": "color1",
+     "type": "integer"
+    },
+    {
+     "name": "color2",
+     "type": "integer"
+    },
+    {
+     "name": "color3",
+     "type": "integer"
+    },
+    {
+     "name": "typeface",
+     "type": "text"
+    },
+    {
+     "name": "division1",
+     "type": "text"
+    },
+    {
+     "name": "division2",
+     "type": "text"
+    },
+    {
+     "name": "division3",
+     "type": "text"
+    },
+    {
+     "name": "division4",
+     "type": "text"
+    },
+    {
+     "name": "division5",
+     "type": "text"
+    },
+    {
+     "name": "division6",
+     "type": "text"
+    },
+    {
+     "name": "division7",
+     "type": "text"
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "corporationID"
+   ],
+   "indexes": [
+    {
+     "name": "corporation_ceo_ix",
+     "columns": [
+      "ceoID"
+     ]
+    },
+    {
+     "name": "corporation_alliance_ix",
+     "columns": [
+      "allianceID"
+     ]
+    },
+    {
+     "name": "corporation_station_ix",
+     "columns": [
+      "stationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "corporationStatic",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "corporationName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "tickerName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "url",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "taxRate",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "minimumJoinStanding",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "corporationType",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "hasPlayerPersonnelManager",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sendCharTerminationMessage",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "creatorID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ceoID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "raceID",
+     "type": "integer"
+    },
+    {
+     "name": "allianceID",
+     "type": "integer"
+    },
+    {
+     "name": "shares",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "memberCount",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "memberLimit",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "allowedMemberRaceIDs",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "graphicID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "shape1",
+     "type": "integer"
+    },
+    {
+     "name": "shape2",
+     "type": "integer"
+    },
+    {
+     "name": "shape3",
+     "type": "integer"
+    },
+    {
+     "name": "color1",
+     "type": "integer"
+    },
+    {
+     "name": "color2",
+     "type": "integer"
+    },
+    {
+     "name": "color3",
+     "type": "integer"
+    },
+    {
+     "name": "typeface",
+     "type": "text"
+    },
+    {
+     "name": "division1",
+     "type": "text"
+    },
+    {
+     "name": "division2",
+     "type": "text"
+    },
+    {
+     "name": "division3",
+     "type": "text"
+    },
+    {
+     "name": "division4",
+     "type": "text"
+    },
+    {
+     "name": "division5",
+     "type": "text"
+    },
+    {
+     "name": "division6",
+     "type": "text"
+    },
+    {
+     "name": "division7",
+     "type": "text"
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "corporationID"
+   ]
+  },
+  {
+   "name": "corporation_wallets",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "accountKey",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "checks": [
+    "corporation_wallet_division",
+    "corporation_wallet_not_negative"
+   ],
+   "primaryKey": [
+    "corporationID",
+    "accountKey"
+   ]
+  },
+  {
+   "name": "courierMissions",
+   "columns": [
+    {
+     "name": "missionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "courierMissions_missionID_seq"
+     }
+    },
+    {
+     "name": "kind",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "state",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "availabilityID",
+     "type": "integer"
+    },
+    {
+     "name": "inOrder",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "issuerID",
+     "type": "integer"
+    },
+    {
+     "name": "assigneeID",
+     "type": "integer"
+    },
+    {
+     "name": "acceptFee",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "acceptorID",
+     "type": "integer"
+    },
+    {
+     "name": "dateIssued",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "dateExpires",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "dateAccepted",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "dateCompleted",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "totalReward",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "tracking",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "pickupStationID",
+     "type": "integer"
+    },
+    {
+     "name": "craterID",
+     "type": "integer"
+    },
+    {
+     "name": "dropStationID",
+     "type": "integer"
+    },
+    {
+     "name": "volume",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "pickupSolarSystemID",
+     "type": "integer"
+    },
+    {
+     "name": "pickupRegionID",
+     "type": "integer"
+    },
+    {
+     "name": "dropSolarSystemID",
+     "type": "integer"
+    },
+    {
+     "name": "dropRegionID",
+     "type": "integer"
+    },
+    {
+     "name": "price",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer"
+    },
+    {
+     "name": "regionID",
+     "type": "integer"
+    },
+    {
+     "name": "solarsystemID",
+     "type": "integer"
+    },
+    {
+     "name": "stationID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "missionID"
+   ],
+   "indexes": [
+    {
+     "name": "couriermissions_acceptor_ix",
+     "columns": [
+      "acceptorID",
+      "state"
+     ]
+    },
+    {
+     "name": "couriermissions_assignee_ix",
+     "columns": [
+      "assigneeID",
+      "state"
+     ]
+    },
+    {
+     "name": "couriermissions_issuer_ix",
+     "columns": [
+      "issuerID"
+     ]
+    },
+    {
+     "name": "couriermissions_pickup_ix",
+     "columns": [
+      "pickupStationID",
+      "dateExpires"
+     ]
+    },
+    {
+     "name": "couriermissions_region_ix",
+     "columns": [
+      "pickupRegionID",
+      "dateExpires"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpApplications",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "applicationText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "applicationDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "status",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "corporationID",
+    "characterID"
+   ],
+   "indexes": [
+    {
+     "name": "crpapplications_char_ix",
+     "columns": [
+      "characterID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpCharShares",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "shares",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "characterID",
+    "corporationID"
+   ],
+   "indexes": [
+    {
+     "name": "crpcharshares_corp_ix",
+     "columns": [
+      "corporationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpItemLocks",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "lockedAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "corporationID",
+    "itemID"
+   ],
+   "indexes": [
+    {
+     "name": "crpitemlocks_location_ix",
+     "columns": [
+      "locationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpOffices",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "officeFolderID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rentalSlot",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "corporationID",
+    "officeFolderID"
+   ],
+   "indexes": [
+    {
+     "name": "crpOffices_itemID_idx",
+     "columns": [
+      "itemID"
+     ]
+    },
+    {
+     "name": "crpoffices_station_ix",
+     "columns": [
+      "stationID"
+     ]
+    },
+    {
+     "name": "crpOffices_rentalSlot",
+     "columns": [
+      "stationID",
+      "rentalSlot"
+     ],
+     "where": "rental_slot_set",
+     "unique": true
+    }
+   ]
+  },
+  {
+   "name": "crpRecruitmentAdTypes",
+   "columns": [
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeMask",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "typeName",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "groupID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "groupName",
+     "type": "text",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "typeID"
+   ],
+   "indexes": [
+    {
+     "name": "crpRecruitmentAdTypes_typeMask_key",
+     "columns": [
+      "typeMask"
+     ],
+     "unique": true
+    }
+   ]
+  },
+  {
+   "name": "crpRecruitmentAds",
+   "columns": [
+    {
+     "name": "adID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "raceMask",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "typeMask",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "skillPoints",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "createDateTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "expiryDateTime",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "adID"
+   ],
+   "checks": [
+    "recruitment_skill_points_in_range"
+   ],
+   "indexes": [
+    {
+     "name": "crpRecruitmentAds_corp",
+     "columns": [
+      "corporationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpSanctionedActions",
+   "columns": [
+    {
+     "name": "voteCaseID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "timeActioned",
+     "type": "bigint"
+    },
+    {
+     "name": "actedUpon",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "inEffect",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "reason",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "optionID",
+     "type": "integer"
+    },
+    {
+     "name": "expires",
+     "type": "bigint"
+    },
+    {
+     "name": "timeActedUpon",
+     "type": "bigint"
+    },
+    {
+     "name": "timeRescended",
+     "type": "bigint"
+    }
+   ],
+   "primaryKey": [
+    "voteCaseID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "voteCaseID"
+     ],
+     "references": "crpVoteCases",
+     "referencedColumns": [
+      "voteCaseID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "indexes": [
+    {
+     "name": "crpsanctioned_corp_ix",
+     "columns": [
+      "corporationID",
+      "inEffect"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpTitles",
+   "columns": [
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "titleID",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "titleName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "roles",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRoles",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtHQ",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRolesAtHQ",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtBase",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRolesAtBase",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rolesAtOther",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "grantableRolesAtOther",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "corporationID",
+    "titleID"
+   ]
+  },
+  {
+   "name": "crpVoteCases",
+   "columns": [
+    {
+     "name": "voteCaseID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "crpVoteCases_voteCaseID_seq"
+     }
+    },
+    {
+     "name": "corporationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "voteType",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "voteCaseText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "startDateTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "endDateTime",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "voteCaseID"
+   ],
+   "indexes": [
+    {
+     "name": "crpvotecases_corp_ix",
+     "columns": [
+      "corporationID",
+      "endDateTime"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpVoteOptions",
+   "columns": [
+    {
+     "name": "voteCaseID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "optionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "optionText",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "parameter",
+     "type": "integer"
+    },
+    {
+     "name": "parameter1",
+     "type": "integer"
+    },
+    {
+     "name": "parameter2",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "voteCaseID",
+    "optionID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "voteCaseID"
+     ],
+     "references": "crpVoteCases",
+     "referencedColumns": [
+      "voteCaseID"
+     ],
+     "onDelete": "cascade"
+    }
+   ]
+  },
+  {
+   "name": "crpVotes",
+   "columns": [
+    {
+     "name": "voteCaseID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "optionID",
+     "type": "integer",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "voteCaseID",
+    "characterID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "voteCaseID"
+     ],
+     "references": "crpVoteCases",
+     "referencedColumns": [
+      "voteCaseID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "indexes": [
+    {
+     "name": "crpvotes_char_ix",
+     "columns": [
+      "characterID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "crpWars",
+   "columns": [
+    {
+     "name": "warID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "crpWars_warID_seq"
+     }
+    },
+    {
+     "name": "declaredByID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "againstID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "timeDeclared",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "timeFinished",
+     "type": "bigint"
+    },
+    {
+     "name": "retracted",
+     "type": "bigint"
+    },
+    {
+     "name": "mutual",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "billID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "warID"
+   ],
+   "indexes": [
+    {
+     "name": "crpwars_against_ix",
+     "columns": [
+      "againstID"
+     ]
+    },
+    {
+     "name": "crpwars_declaredby_ix",
+     "columns": [
+      "declaredByID"
+     ]
+    },
+    {
+     "name": "crpwars_active_ix",
+     "columns": [
+      "timeDeclared"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "deadspaceComplexes",
+   "columns": [
+    {
+     "name": "complexID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "level",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "seed",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "x",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "y",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "z",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "rooms",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "cleared",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "spawnedAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "expires",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "complexID"
+   ]
+  },
+  {
+   "name": "droneState",
+   "columns": [
+    {
+     "name": "droneID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "controllerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "activityState",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "controllerOwnerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "droneID"
+   ]
+  },
+  {
+   "name": "entity",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "dyn_id_seq"
+     }
+    },
+    {
+     "name": "itemName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "flag",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "contraband",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "singleton",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "x",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "y",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "z",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "customInfo",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ],
+   "indexes": [
+    {
+     "name": "entity_loc_flag_owner_ix",
+     "columns": [
+      "locationID",
+      "flag",
+      "ownerID"
+     ]
+    },
+    {
+     "name": "entity_owner_loc_flag_ix",
+     "columns": [
+      "ownerID",
+      "locationID",
+      "flag"
+     ]
+    },
+    {
+     "name": "entity_owner_type_ix",
+     "columns": [
+      "ownerID",
+      "typeID"
+     ]
+    },
+    {
+     "name": "entity_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "entityStatic",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "itemName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "locationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "flag",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "contraband",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "singleton",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "x",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "y",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "z",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "customInfo",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ],
+   "indexes": [
+    {
+     "name": "entityStatic_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "entity_attributes",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "attributeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "valueInt",
+     "type": "bigint"
+    },
+    {
+     "name": "valueFloat",
+     "type": "double"
+    }
+   ],
+   "primaryKey": [
+    "itemID",
+    "attributeID"
+   ],
+   "indexes": [
+    {
+     "name": "entity_attributes_attributeID_idx",
+     "columns": [
+      "attributeID"
+     ]
+    }
+   ],
+   "checks": [
+    "entity_attributes_one_value"
+   ]
+  },
+  {
+   "name": "eveEncyclTypes",
+   "columns": [
+    {
+     "name": "encyclopediaTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "encyclopediaTypeName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "encyclopediaTypeID"
+   ]
+  },
+  {
+   "name": "eveNames",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "itemName",
+     "type": "text"
+    },
+    {
+     "name": "categoryID",
+     "type": "integer"
+    },
+    {
+     "name": "groupID",
+     "type": "integer"
+    },
+    {
+     "name": "typeID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ],
+   "indexes": [
+    {
+     "name": "eveNames_categoryID_idx",
+     "columns": [
+      "categoryID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "eveStaticOwners",
+   "columns": [
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "ownerID"
+   ],
+   "indexes": [
+    {
+     "name": "eveStaticOwners_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "eveStaticOwnersStatic",
+   "columns": [
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerName",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "ownerID"
+   ],
+   "indexes": [
+    {
+     "name": "eveStaticOwnersStatic_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "evemail",
+   "columns": [
+    {
+     "name": "channelID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "messageID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "evemail_messageID_seq"
+     }
+    },
+    {
+     "name": "senderID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "subject",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "created",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "read",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "messageID"
+   ],
+   "indexes": [
+    {
+     "name": "evemail_channel_created_ix",
+     "columns": [
+      "channelID",
+      "created"
+     ]
+    },
+    {
+     "name": "evemail_sender_ix",
+     "columns": [
+      "senderID"
+     ]
+    },
+    {
+     "name": "evemail_unread_ix",
+     "columns": [
+      "channelID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "evemailDetails",
+   "columns": [
+    {
+     "name": "attachmentID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "evemailDetails_attachmentID_seq"
+     }
+    },
+    {
+     "name": "messageID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "mimeTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "attachment",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "attachmentID"
+   ],
+   "indexes": [
+    {
+     "name": "evemailDetails_messageID_idx",
+     "columns": [
+      "messageID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "insuranceContracts",
+   "columns": [
+    {
+     "name": "contractID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "insuranceContracts_contractID_seq"
+     }
+    },
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "startDate",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "endDate",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "fraction",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "amount",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "payout",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "isCorp",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "contractID"
+   ],
+   "indexes": [
+    {
+     "name": "insuranceContracts_ship_uq",
+     "columns": [
+      "shipID"
+     ],
+     "unique": true
+    },
+    {
+     "name": "insurancecontracts_end_ix",
+     "columns": [
+      "endDate"
+     ]
+    },
+    {
+     "name": "insurancecontracts_owner_ix",
+     "columns": [
+      "ownerID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "invBlueprints",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "copy",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "materialLevel",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "productivityLevel",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "licensedProductionRunsRemaining",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": -1
+     }
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ]
+  },
+  {
+   "name": "invOreInfo",
+   "columns": [
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "yieldBonus",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "minToRefine",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "typeID"
+   ]
+  },
+  {
+   "name": "invOreYield",
+   "columns": [
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "yieldTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "yieldPercent",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "typeID",
+    "yieldTypeID"
+   ],
+   "indexes": [
+    {
+     "name": "invOreYield_yieldTypeID_idx",
+     "columns": [
+      "yieldTypeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "jumpBridgeLinks",
+   "columns": [
+    {
+     "name": "sourceID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "destinationID",
+     "type": "integer",
+     "notNull": true
+    }
+   ],
+   "checks": [
+    "jump_bridge_not_to_itself"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "destinationID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    },
+    {
+     "columns": [
+      "sourceID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "sourceID"
+   ],
+   "indexes": [
+    {
+     "name": "jumpBridgeLinks_destinationID_key",
+     "columns": [
+      "destinationID"
+     ],
+     "unique": true
+    }
+   ]
+  },
+  {
+   "name": "killLog",
+   "columns": [
+    {
+     "name": "killID",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "killLog_killID_seq"
+     }
+    },
+    {
+     "name": "killTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "victimCharID",
+     "type": "integer"
+    },
+    {
+     "name": "victimCorpID",
+     "type": "integer"
+    },
+    {
+     "name": "victimAllianceID",
+     "type": "integer"
+    },
+    {
+     "name": "victimShipTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "victimItemID",
+     "type": "integer"
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "locationID",
+     "type": "integer"
+    },
+    {
+     "name": "finalBlowID",
+     "type": "integer"
+    },
+    {
+     "name": "totalDamage",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "isPodKill",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "killBlob",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "primaryKey": [
+    "killID"
+   ],
+   "indexes": [
+    {
+     "name": "killLog_victimItemID_ix",
+     "columns": [
+      "victimItemID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "killLogParticipants",
+   "columns": [
+    {
+     "name": "killID",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "corporationID",
+     "type": "integer"
+    },
+    {
+     "name": "allianceID",
+     "type": "integer"
+    },
+    {
+     "name": "shipTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "weaponTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "damageDone",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "finalBlow",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "securityStatus",
+     "type": "double"
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "killID"
+     ],
+     "references": "killLog",
+     "referencedColumns": [
+      "killID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "killID",
+    "ownerID"
+   ]
+  },
+  {
+   "name": "launched_drone_state",
+   "columns": [
+    {
+     "name": "drone_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "generation",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "launched_drone_generation"
+     }
+    },
+    {
+     "name": "revision",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "owner_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "system_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "state",
+     "type": "text",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "drone_id"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "drone_id"
+   ],
+   "indexes": [
+    {
+     "name": "launched_drone_system",
+     "columns": [
+      "system_id"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "maintenance_custody",
+   "columns": [
+    {
+     "name": "item_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "generation",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "maintenance_generation"
+     }
+    },
+    {
+     "name": "host_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "owner_id",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "flag",
+     "type": "integer",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "item_id"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "item_id"
+   ]
+  },
+  {
+   "name": "mapActivity",
+   "columns": [
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "kind",
+     "type": "smallint",
+     "notNull": true
+    },
+    {
+     "name": "eventTime",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "indexes": [
+    {
+     "name": "mapActivity_time",
+     "columns": [
+      "eventTime"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "mapDenormalize",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer"
+    },
+    {
+     "name": "groupID",
+     "type": "integer"
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer"
+    },
+    {
+     "name": "constellationID",
+     "type": "integer"
+    },
+    {
+     "name": "regionID",
+     "type": "integer"
+    },
+    {
+     "name": "orbitID",
+     "type": "integer"
+    },
+    {
+     "name": "x",
+     "type": "double"
+    },
+    {
+     "name": "y",
+     "type": "double"
+    },
+    {
+     "name": "z",
+     "type": "double"
+    },
+    {
+     "name": "radius",
+     "type": "double"
+    },
+    {
+     "name": "itemName",
+     "type": "text"
+    },
+    {
+     "name": "security",
+     "type": "double"
+    },
+    {
+     "name": "celestialIndex",
+     "type": "integer"
+    },
+    {
+     "name": "orbitIndex",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ],
+   "indexes": [
+    {
+     "name": "mapDenormalize_solarSystemID_idx",
+     "columns": [
+      "solarSystemID"
+     ]
+    },
+    {
+     "name": "mapDenormalize_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "mapSolarSystems",
+   "columns": [
+    {
+     "name": "regionID",
+     "type": "integer"
+    },
+    {
+     "name": "constellationID",
+     "type": "integer"
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "solarSystemName",
+     "type": "text"
+    },
+    {
+     "name": "x",
+     "type": "double"
+    },
+    {
+     "name": "y",
+     "type": "double"
+    },
+    {
+     "name": "z",
+     "type": "double"
+    },
+    {
+     "name": "xMin",
+     "type": "double"
+    },
+    {
+     "name": "xMax",
+     "type": "double"
+    },
+    {
+     "name": "yMin",
+     "type": "double"
+    },
+    {
+     "name": "yMax",
+     "type": "double"
+    },
+    {
+     "name": "zMin",
+     "type": "double"
+    },
+    {
+     "name": "zMax",
+     "type": "double"
+    },
+    {
+     "name": "luminosity",
+     "type": "double"
+    },
+    {
+     "name": "border",
+     "type": "integer"
+    },
+    {
+     "name": "fringe",
+     "type": "integer"
+    },
+    {
+     "name": "corridor",
+     "type": "integer"
+    },
+    {
+     "name": "hub",
+     "type": "integer"
+    },
+    {
+     "name": "international",
+     "type": "integer"
+    },
+    {
+     "name": "regional",
+     "type": "integer"
+    },
+    {
+     "name": "constellation",
+     "type": "integer"
+    },
+    {
+     "name": "security",
+     "type": "double"
+    },
+    {
+     "name": "factionID",
+     "type": "integer"
+    },
+    {
+     "name": "radius",
+     "type": "double"
+    },
+    {
+     "name": "sunTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "securityClass",
+     "type": "text"
+    },
+    {
+     "name": "allianceID",
+     "type": "integer"
+    },
+    {
+     "name": "sovereigntyLevel",
+     "type": "integer"
+    },
+    {
+     "name": "sovereigntyDateTime",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "solarSystemID"
+   ]
+  },
+  {
+   "name": "market_history",
+   "columns": [
+    {
+     "name": "regionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "historyDate",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "lowPrice",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "highPrice",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "avgPrice",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "volume",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "orders",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "regionID",
+    "typeID",
+    "historyDate"
+   ],
+   "indexes": [
+    {
+     "name": "market_history_scan_ix",
+     "columns": [
+      "typeID",
+      "regionID",
+      "historyDate"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "market_journal",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "refID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "market_journal_refID_seq"
+     }
+    },
+    {
+     "name": "transDate",
+     "type": "bigint"
+    },
+    {
+     "name": "refTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerID1",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "ownerID2",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "argID1",
+     "type": "text"
+    },
+    {
+     "name": "accountID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "amount",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "balance",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "reason",
+     "type": "text"
+    },
+    {
+     "name": "accountKey",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "refID"
+   ],
+   "indexes": [
+    {
+     "name": "market_journal_owner1_ix",
+     "columns": [
+      "ownerID1"
+     ]
+    },
+    {
+     "name": "market_journal_owner2_ix",
+     "columns": [
+      "ownerID2"
+     ]
+    },
+    {
+     "name": "market_journal_owner_ix",
+     "columns": [
+      "characterID",
+      "accountKey",
+      "transDate"
+     ]
+    },
+    {
+     "name": "market_journal_ref_ix",
+     "columns": [
+      "refTypeID"
+     ]
+    },
+    {
+     "name": "market_journal_reftype_ix",
+     "columns": [
+      "refTypeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "market_orders",
+   "columns": [
+    {
+     "name": "orderID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "market_orders_orderID_seq"
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "charID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "regionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "range",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "bid",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "price",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "volEntered",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "volRemaining",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "issued",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "orderState",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "minVolume",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "contraband",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "accountID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "duration",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "isCorp",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "escrow",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "jumps",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "walletOwnerID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "starterSeed",
+     "type": "boolean",
+     "notNull": true,
+     "default": {
+      "value": false
+     }
+    }
+   ],
+   "primaryKey": [
+    "orderID"
+   ],
+   "indexes": [
+    {
+     "name": "market_orders_hot_ix",
+     "columns": [
+      "typeID",
+      "regionID",
+      "bid",
+      "price"
+     ]
+    },
+    {
+     "name": "market_orders_regionID_idx",
+     "columns": [
+      "regionID"
+     ]
+    },
+    {
+     "name": "market_orders_solarSystemID_idx",
+     "columns": [
+      "solarSystemID"
+     ]
+    },
+    {
+     "name": "market_orders_stationID_idx",
+     "columns": [
+      "stationID"
+     ]
+    },
+    {
+     "name": "market_orders_station_type_ix",
+     "columns": [
+      "stationID",
+      "typeID"
+     ]
+    },
+    {
+     "name": "market_orders_system_type_ix",
+     "columns": [
+      "solarSystemID",
+      "typeID"
+     ]
+    },
+    {
+     "name": "market_orders_typeID_idx",
+     "columns": [
+      "typeID"
+     ]
+    },
+    {
+     "name": "market_orders_type_region_ix",
+     "columns": [
+      "typeID",
+      "regionID",
+      "bid",
+      "price"
+     ]
+    },
+    {
+     "name": "market_starter_seed_unique",
+     "columns": [
+      "stationID",
+      "typeID",
+      "bid"
+     ],
+     "where": "starter_seed",
+     "unique": true
+    },
+    {
+     "name": "market_orders_char_ix",
+     "columns": [
+      "charID"
+     ]
+    },
+    {
+     "name": "market_open_matching",
+     "columns": [
+      "regionID",
+      "typeID",
+      "bid",
+      "price",
+      "issued"
+     ]
+    },
+    {
+     "name": "market_npc_prices",
+     "columns": [
+      "typeID",
+      "price"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "market_transactions",
+   "columns": [
+    {
+     "name": "transactionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "market_transactions_transactionID_seq"
+     }
+    },
+    {
+     "name": "transactionDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "price",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "transactionType",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "clientID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "regionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "characterID",
+     "type": "integer"
+    },
+    {
+     "name": "corporationID",
+     "type": "integer"
+    },
+    {
+     "name": "isCorp",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "accountKey",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1000
+     }
+    },
+    {
+     "name": "journalRefID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "transactionID"
+   ],
+   "indexes": [
+    {
+     "name": "market_transactions_regionID_idx",
+     "columns": [
+      "regionID"
+     ]
+    },
+    {
+     "name": "market_tx_char_ix",
+     "columns": [
+      "characterID",
+      "transactionID"
+     ]
+    },
+    {
+     "name": "market_tx_station_ix",
+     "columns": [
+      "stationID"
+     ]
+    },
+    {
+     "name": "market_tx_type_ix",
+     "columns": [
+      "typeID",
+      "transactionDateTime"
+     ]
+    },
+    {
+     "name": "market_tx_corp_ix",
+     "columns": [
+      "corporationID",
+      "transactionID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "moonScans",
+   "columns": [
+    {
+     "name": "charID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "moonID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "scannedAt",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "charID",
+    "moonID"
+   ]
+  },
+  {
+   "name": "outpostConstruction",
+   "columns": [
+    {
+     "name": "platformID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "ownerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "builderID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startedAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "doneAt",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "platformID"
+   ]
+  },
+  {
+   "name": "ownerStandings",
+   "columns": [
+    {
+     "name": "fromID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "toID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "standing",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "reason",
+     "type": "text"
+    },
+    {
+     "name": "setAt",
+     "type": "bigint"
+    }
+   ],
+   "primaryKey": [
+    "fromID",
+    "toID"
+   ],
+   "indexes": [
+    {
+     "name": "ownerstandings_to_ix",
+     "columns": [
+      "toID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "pendingShipLogouts",
+   "columns": [
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "generation",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "ship_logout_generation"
+     }
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "shipID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "shipID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "indexes": [
+    {
+     "name": "pendingShipLogouts_character",
+     "columns": [
+      "characterID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "pendingShipLosses",
+   "columns": [
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "occupied",
+     "type": "boolean",
+     "notNull": true
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "loss",
+     "type": "text",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "shipID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "shipID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "indexes": [
+    {
+     "name": "pendingShipLosses_character",
+     "columns": [
+      "characterID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "pendingStationArrivals",
+   "columns": [
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "sourceSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "generation",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "station_arrival_generation"
+     }
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "loss",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "shipID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "shipID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "indexes": [
+    {
+     "name": "pendingStationArrivals_character",
+     "columns": [
+      "characterID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "petitionCategories",
+   "columns": [
+    {
+     "name": "categoryID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "displayName",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "escalatesTo",
+     "type": "integer"
+    },
+    {
+     "name": "parentCategoryID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    }
+   ],
+   "primaryKey": [
+    "categoryID"
+   ]
+  },
+  {
+   "name": "petitionCategoryGroups",
+   "columns": [
+    {
+     "name": "parentCategoryID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "displayName",
+     "type": "text",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "parentCategoryID"
+   ]
+  },
+  {
+   "name": "petitionCategoryProperties",
+   "columns": [
+    {
+     "name": "categoryID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "k",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "orderID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "propertyID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "petitionCategoryProperties_propertyID_seq"
+     }
+    },
+    {
+     "name": "required",
+     "type": "boolean",
+     "notNull": true,
+     "default": {
+      "value": true
+     }
+    },
+    {
+     "name": "description",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "inputType",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": "EditBox"
+     }
+    },
+    {
+     "name": "inputInfo",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "categoryID"
+     ],
+     "references": "petitionCategories",
+     "referencedColumns": [
+      "categoryID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "categoryID",
+    "k"
+   ],
+   "indexes": [
+    {
+     "name": "petition_property_id",
+     "columns": [
+      "propertyID"
+     ],
+     "unique": true
+    }
+   ]
+  },
+  {
+   "name": "petitionLog",
+   "columns": [
+    {
+     "name": "logID",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "petitionLog_logID_seq"
+     }
+    },
+    {
+     "name": "petitionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "logDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "actorID",
+     "type": "integer"
+    },
+    {
+     "name": "actionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "message",
+     "type": "text"
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "petitionID"
+     ],
+     "references": "petitions",
+     "referencedColumns": [
+      "petitionID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "logID"
+   ]
+  },
+  {
+   "name": "petitionMessages",
+   "columns": [
+    {
+     "name": "messageID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "petitionMessages_messageID_seq"
+     }
+    },
+    {
+     "name": "petitionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "senderID",
+     "type": "integer"
+    },
+    {
+     "name": "isPetitionee",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "text",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "created",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "read",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "comment",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "petitionID"
+     ],
+     "references": "petitions",
+     "referencedColumns": [
+      "petitionID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "messageID"
+   ],
+   "indexes": [
+    {
+     "name": "petitionmessages_pet_ix",
+     "columns": [
+      "petitionID",
+      "messageID"
+     ]
+    },
+    {
+     "name": "petitionmessages_unread_ix",
+     "columns": [
+      "petitionID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "petitionProperties",
+   "columns": [
+    {
+     "name": "petitionID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "k",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "v",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "petitionID"
+     ],
+     "references": "petitions",
+     "referencedColumns": [
+      "petitionID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "petitionID",
+    "k"
+   ]
+  },
+  {
+   "name": "petitionQueues",
+   "columns": [
+    {
+     "name": "queueID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "queueName",
+     "type": "text",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "queueID"
+   ]
+  },
+  {
+   "name": "petitions",
+   "columns": [
+    {
+     "name": "petitionID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "petitions_petitionID_seq"
+     }
+    },
+    {
+     "name": "petitionerID",
+     "type": "integer"
+    },
+    {
+     "name": "accountID",
+     "type": "integer"
+    },
+    {
+     "name": "categoryID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "queueID",
+     "type": "integer"
+    },
+    {
+     "name": "subject",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "petition",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "claimed",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "claimedBy",
+     "type": "integer"
+    },
+    {
+     "name": "closed",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "closedAt",
+     "type": "bigint"
+    },
+    {
+     "name": "deleted",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "escalatesTo",
+     "type": "integer"
+    },
+    {
+     "name": "combatLog",
+     "type": "text"
+    },
+    {
+     "name": "chatLog",
+     "type": "text"
+    },
+    {
+     "name": "rating",
+     "type": "integer"
+    },
+    {
+     "name": "ratingComment",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "ratingDateTime",
+     "type": "bigint"
+    }
+   ],
+   "primaryKey": [
+    "petitionID"
+   ],
+   "indexes": [
+    {
+     "name": "petitions_petitioner_ix",
+     "columns": [
+      "petitionerID"
+     ]
+    },
+    {
+     "name": "petitions_queue_ix",
+     "columns": [
+      "queueID",
+      "closed"
+     ]
+    },
+    {
+     "name": "petitions_claimed_ix",
+     "columns": [
+      "claimedBy"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "portalReceipts",
+   "columns": [
+    {
+     "name": "generation",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "portalReceipts_generation_seq"
+     }
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "intent",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "state",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "completedAt",
+     "type": "bigint"
+    },
+    {
+     "name": "loss",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "generation"
+   ],
+   "checks": [
+    "portal_receipt_state"
+   ],
+   "indexes": [
+    {
+     "name": "portalReceipts_active_ship",
+     "columns": [
+      "shipID"
+     ],
+     "where": "state_active",
+     "unique": true
+    },
+    {
+     "name": "portalReceipts_pending_character",
+     "columns": [
+      "characterID"
+     ],
+     "where": "state_pending"
+    }
+   ]
+  },
+  {
+   "name": "posLinks",
+   "columns": [
+    {
+     "name": "sourceID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "destinationID",
+     "type": "integer",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "sourceID",
+    "typeID"
+   ]
+  },
+  {
+   "name": "posStructures",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "state",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stateTimestamp",
+     "type": "bigint"
+    },
+    {
+     "name": "controlTowerID",
+     "type": "integer"
+    },
+    {
+     "name": "moonID",
+     "type": "integer"
+    },
+    {
+     "name": "lastFuel",
+     "type": "bigint"
+    },
+    {
+     "name": "claim",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "claimSince",
+     "type": "bigint"
+    },
+    {
+     "name": "password",
+     "type": "text",
+     "notNull": true,
+     "default": {
+      "value": ""
+     }
+    },
+    {
+     "name": "allowCorp",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "allowAlliance",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sentryStanding",
+     "type": "double"
+    },
+    {
+     "name": "sentryStatus",
+     "type": "double"
+    },
+    {
+     "name": "sentryStandingDrop",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sentryStatusDrop",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sentryAggression",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "sentryWar",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "deployAnchor",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "deployUnanchor",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "deployOnline",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "deployOffline",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "useViewPut",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "useViewPutTake",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "useUse",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "shieldCharge",
+     "type": "double"
+    },
+    {
+     "name": "armorDamage",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "hullDamage",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "provisionType",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ]
+  },
+  {
+   "name": "ramAssemblyLineStationCostLogs",
+   "columns": [
+    {
+     "name": "assemblyLineTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "logDateTime",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "_usage",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "costPerHour",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "assemblyLineTypeID",
+    "stationID",
+    "logDateTime"
+   ],
+   "indexes": [
+    {
+     "name": "ramAssemblyLineStationCostLogs_stationID_idx",
+     "columns": [
+      "stationID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ramAssemblyLineStations",
+   "columns": [
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "assemblyLineTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer"
+    },
+    {
+     "name": "stationTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "ownerID",
+     "type": "integer"
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer"
+    },
+    {
+     "name": "regionID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "stationID",
+    "assemblyLineTypeID"
+   ]
+  },
+  {
+   "name": "ramAssemblyLines",
+   "columns": [
+    {
+     "name": "assemblyLineID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "assemblyLineTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "containerID",
+     "type": "integer"
+    },
+    {
+     "name": "nextFreeTime",
+     "type": "bigint"
+    },
+    {
+     "name": "UIGroupingID",
+     "type": "integer"
+    },
+    {
+     "name": "costInstall",
+     "type": "double"
+    },
+    {
+     "name": "costPerHour",
+     "type": "double"
+    },
+    {
+     "name": "restrictionMask",
+     "type": "integer"
+    },
+    {
+     "name": "discountPerGoodStandingPoint",
+     "type": "double"
+    },
+    {
+     "name": "surchargePerBadStandingPoint",
+     "type": "double"
+    },
+    {
+     "name": "minimumStanding",
+     "type": "double"
+    },
+    {
+     "name": "minimumCharSecurity",
+     "type": "double"
+    },
+    {
+     "name": "minimumCorpSecurity",
+     "type": "double"
+    },
+    {
+     "name": "maximumCharSecurity",
+     "type": "double"
+    },
+    {
+     "name": "maximumCorpSecurity",
+     "type": "double"
+    },
+    {
+     "name": "ownerID",
+     "type": "integer"
+    },
+    {
+     "name": "oldContainerID",
+     "type": "integer"
+    },
+    {
+     "name": "oldOwnerID",
+     "type": "integer"
+    },
+    {
+     "name": "activityID",
+     "type": "integer"
+    }
+   ],
+   "primaryKey": [
+    "assemblyLineID"
+   ]
+  },
+  {
+   "name": "ramInstallationTypeDefaultContents",
+   "columns": [
+    {
+     "name": "installationTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "assemblyLineTypeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "UIGroupingID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "quantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "costInstall",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "costPerHour",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "restrictionMask",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "discountPerGoodStandingPoint",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "surchargePerBadStandingPoint",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "minimumStanding",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "minimumCharSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "minimumCorpSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "maximumCharSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "maximumCorpSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "installationTypeID"
+   ],
+   "indexes": [
+    {
+     "name": "ramInstallationTypeDefaultContents_assemblyLineTypeID_idx",
+     "columns": [
+      "assemblyLineTypeID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ramJobs",
+   "columns": [
+    {
+     "name": "jobID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "seq": "ramJobs_jobID_seq"
+     }
+    },
+    {
+     "name": "assemblyLineID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "installerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "creator",
+     "type": "integer"
+    },
+    {
+     "name": "installedItemID",
+     "type": "integer"
+    },
+    {
+     "name": "installedItemTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "installedItemOwnerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "installedItemQuantity",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "installedItemProductivityLevel",
+     "type": "integer"
+    },
+    {
+     "name": "installedItemMaterialLevel",
+     "type": "integer"
+    },
+    {
+     "name": "installedItemLicensedProductionRunsRemaining",
+     "type": "integer"
+    },
+    {
+     "name": "containerID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "containerTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "containerLocationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "installedInSolarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "activityID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "outputTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "outputFlag",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 4
+     }
+    },
+    {
+     "name": "outputLocationID",
+     "type": "integer"
+    },
+    {
+     "name": "runs",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 1
+     }
+    },
+    {
+     "name": "licensedProductionRuns",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "installTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "beginProductionTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "endProductionTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "completed",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "completedStatus",
+     "type": "smallint"
+    },
+    {
+     "name": "charAddedCost",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "jobID"
+   ],
+   "indexes": [
+    {
+     "name": "ramjobs_container_ix",
+     "columns": [
+      "containerID"
+     ]
+    },
+    {
+     "name": "ramjobs_installer_ix",
+     "columns": [
+      "installerID",
+      "completed"
+     ]
+    },
+    {
+     "name": "ramjobs_line_ix",
+     "columns": [
+      "assemblyLineID"
+     ]
+    },
+    {
+     "name": "ramjobs_owner_ix",
+     "columns": [
+      "installedItemOwnerID",
+      "completed"
+     ]
+    },
+    {
+     "name": "ramjobs_pending_ix",
+     "columns": [
+      "endProductionTime"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "rentalInfo",
+   "columns": [
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "slotNumber",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "renterID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "typeID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "rentPeriodInDays",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "periodCost",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "billID",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "balanceDueDate",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "discontinue",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "publiclyAvailable",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "startDate",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    }
+   ],
+   "primaryKey": [
+    "stationID",
+    "slotNumber"
+   ],
+   "indexes": [
+    {
+     "name": "rentalinfo_renter_ix",
+     "columns": [
+      "renterID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "secureContainers",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "config",
+     "type": "integer",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "passwordGeneral",
+     "type": "text"
+    },
+    {
+     "name": "passwordConfig",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ]
+  },
+  {
+   "name": "shipSpaceMotion",
+   "columns": [
+    {
+     "name": "itemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "tick",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "savedAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "state",
+     "type": "text",
+     "notNull": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "itemID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ],
+   "primaryKey": [
+    "itemID"
+   ]
+  },
+  {
+   "name": "staStations",
+   "columns": [
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "security",
+     "type": "integer"
+    },
+    {
+     "name": "dockingCostPerVolume",
+     "type": "double"
+    },
+    {
+     "name": "maxShipVolumeDockable",
+     "type": "integer"
+    },
+    {
+     "name": "officeRentalCost",
+     "type": "integer"
+    },
+    {
+     "name": "operationID",
+     "type": "integer"
+    },
+    {
+     "name": "stationTypeID",
+     "type": "integer"
+    },
+    {
+     "name": "corporationID",
+     "type": "integer"
+    },
+    {
+     "name": "solarSystemID",
+     "type": "integer"
+    },
+    {
+     "name": "constellationID",
+     "type": "integer"
+    },
+    {
+     "name": "regionID",
+     "type": "integer"
+    },
+    {
+     "name": "stationName",
+     "type": "text"
+    },
+    {
+     "name": "x",
+     "type": "double"
+    },
+    {
+     "name": "y",
+     "type": "double"
+    },
+    {
+     "name": "z",
+     "type": "double"
+    },
+    {
+     "name": "reprocessingEfficiency",
+     "type": "double"
+    },
+    {
+     "name": "reprocessingStationsTake",
+     "type": "double"
+    },
+    {
+     "name": "reprocessingHangarFlag",
+     "type": "integer"
+    },
+    {
+     "name": "capitalStation",
+     "type": "text"
+    },
+    {
+     "name": "ownershipDateTime",
+     "type": "text"
+    },
+    {
+     "name": "upgradeLevel",
+     "type": "integer"
+    },
+    {
+     "name": "customServiceMask",
+     "type": "integer"
+    },
+    {
+     "name": "description",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "stationID"
+   ],
+   "indexes": [
+    {
+     "name": "staStations_solarSystemID_idx",
+     "columns": [
+      "solarSystemID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "standingTransactions",
+   "columns": [
+    {
+     "name": "eventID",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "standingTransactions_eventID_seq"
+     }
+    },
+    {
+     "name": "eventTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "eventDateTime",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "fromID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "toID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "originalFromID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "originalToID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "modification",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "int_1",
+     "type": "integer"
+    },
+    {
+     "name": "int_2",
+     "type": "integer"
+    },
+    {
+     "name": "int_3",
+     "type": "integer"
+    },
+    {
+     "name": "msg",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "eventID"
+   ],
+   "indexes": [
+    {
+     "name": "standingtx_pair_ix",
+     "columns": [
+      "fromID",
+      "toID",
+      "eventID"
+     ]
+    },
+    {
+     "name": "standingtx_to_ix",
+     "columns": [
+      "toID",
+      "eventID"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "stationServiceRules",
+   "columns": [
+    {
+     "name": "stationID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "serviceID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "minimumStanding",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": -10.0
+     }
+    },
+    {
+     "name": "minimumCharSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": -10.0
+     }
+    },
+    {
+     "name": "maximumCharSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 10.0
+     }
+    },
+    {
+     "name": "minimumCorpSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": -10.0
+     }
+    },
+    {
+     "name": "maximumCorpSecurity",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 10.0
+     }
+    },
+    {
+     "name": "discountPerGoodStandingPoint",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    },
+    {
+     "name": "surchargePerBadStandingPoint",
+     "type": "double",
+     "notNull": true,
+     "default": {
+      "value": 0.0
+     }
+    }
+   ],
+   "primaryKey": [
+    "stationID",
+    "serviceID"
+   ]
+  },
+  {
+   "name": "travelReceipts",
+   "columns": [
+    {
+     "name": "generation",
+     "type": "bigint",
+     "notNull": true,
+     "default": {
+      "seq": "travelReceipts_generation_seq"
+     }
+    },
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "shipTypeID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "source",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "destination",
+     "type": "text",
+     "notNull": true
+    },
+    {
+     "name": "state",
+     "type": "smallint",
+     "notNull": true,
+     "default": {
+      "value": 0
+     }
+    },
+    {
+     "name": "createdAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "completedAt",
+     "type": "bigint"
+    },
+    {
+     "name": "loss",
+     "type": "text"
+    }
+   ],
+   "primaryKey": [
+    "generation"
+   ],
+   "checks": [
+    "travel_receipt_state"
+   ],
+   "indexes": [
+    {
+     "name": "travelReceipts_pending_ship",
+     "columns": [
+      "shipID"
+     ],
+     "where": "state_pending",
+     "unique": true
+    },
+    {
+     "name": "travelReceipts_pending_pilot",
+     "columns": [
+      "characterID"
+     ],
+     "where": "state_pending",
+     "unique": true
+    }
+   ]
+  }
+ ]
+}

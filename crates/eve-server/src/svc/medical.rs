@@ -7,10 +7,10 @@
 //! corporation's station.
 
 use eve_marshal::Value;
-use tokio_postgres::GenericClient;
 use tracing::{error, info};
 
 use crate::services::{Ctx, Outcome};
+use crate::store::{self, Db, Row, StoreError, Tx};
 
 pub const GROUP_CLONE: i32 = 23;
 pub const TYPE_CLONE_ALPHA: i64 = 164;
@@ -18,51 +18,54 @@ pub const TYPE_CLONE_ALPHA: i64 = 164;
 const REF_CLONE: i32 = 8;
 
 /// The station the clone waits in, if one was chosen.
-pub async fn home_station(db: &impl GenericClient, char_id: i64) -> Result<Option<i64>, tokio_postgres::Error> {
-    let row = db
-        .query_opt(
-            r#"SELECT e."customInfo" FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                WHERE e."ownerID" = $1 AND t."groupID" = $2
-                ORDER BY e."itemID" DESC LIMIT 1"#,
-            &[&(char_id as i32), &GROUP_CLONE],
-        )
-        .await?;
-    Ok(row.and_then(|r| r.get::<_, Option<String>>(0)).and_then(|s| s.trim().parse().ok()))
+pub fn home_station(db: &Db, char_id: i64) -> Result<Option<i64>, StoreError> {
+    Ok(latest_clone(db, char_id).and_then(|r| r.text("customInfo")).and_then(|s| s.trim().parse().ok()))
 }
 
 /// Gives the character a clone of `type_id` waiting at `home`, in place of
 /// whatever clone it had.
-pub async fn replace_clone(db: &impl GenericClient, char_id: i64, type_id: i64, home: Option<i64>) -> Result<(), tokio_postgres::Error> {
-    db.execute(
-        r#"DELETE FROM entity e USING "invTypes" t
-            WHERE t."typeID" = e."typeID" AND e."ownerID" = $1 AND t."groupID" = $2"#,
-        &[&(char_id as i32), &GROUP_CLONE],
-    )
-    .await?;
-    db.execute(
-        r#"INSERT INTO entity ("itemName","typeID","ownerID","locationID","flag","singleton","quantity","customInfo")
-           VALUES ('', $2, $1, $1, 0, 1, 1, $3)"#,
-        &[&(char_id as i32), &(type_id as i32), &home.map(|h| h.to_string())],
-    )
-    .await?;
+pub fn replace_clone(tx: &mut Tx<'_>, char_id: i64, type_id: i64, home: Option<i64>) -> Result<(), StoreError> {
+    let old: Vec<store::RowId> = clones(tx.db(), char_id).map(|r| r.id).collect();
+    for id in old {
+        tx.delete("entity", id)?;
+    }
+    tx.insert(
+        "entity",
+        &[
+            ("itemName", store::Value::Text("".into())),
+            ("typeID", store::Value::Int(type_id)),
+            ("ownerID", store::Value::Int(char_id)),
+            ("locationID", store::Value::Int(char_id)),
+            ("flag", store::Value::Int(0)),
+            ("singleton", store::Value::Int(1)),
+            ("quantity", store::Value::Int(1)),
+            ("customInfo", home.map_or(store::Value::Null, |h| store::Value::Text(h.to_string().into()))),
+        ],
+    )?;
     Ok(())
 }
 
-async fn clone_type(db: &impl GenericClient, char_id: i64) -> Result<Option<i64>, tokio_postgres::Error> {
-    let row = db
-        .query_opt(
-            r#"SELECT e."typeID" FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
-                WHERE e."ownerID" = $1 AND t."groupID" = $2 ORDER BY e."itemID" DESC LIMIT 1"#,
-            &[&(char_id as i32), &GROUP_CLONE],
-        )
-        .await?;
-    Ok(row.map(|r| r.get::<_, i32>(0) as i64))
+/// The character's items of the Clone group.
+fn clones(db: &Db, char_id: i64) -> impl Iterator<Item = Row<'_>> {
+    let types = crate::sde::get().types_in_group(GROUP_CLONE as i64);
+    db.table("entity")
+        .find(&["ownerID"], &[store::Value::Int(char_id)])
+        .filter(move |r| r.int("typeID").is_some_and(|t| types.contains(&(t as i32))))
+}
+
+/// The character's newest clone (the highest itemID).
+fn latest_clone(db: &Db, char_id: i64) -> Option<Row<'_>> {
+    clones(db, char_id).max_by_key(|r| r.int("itemID"))
+}
+
+fn clone_type(db: &Db, char_id: i64) -> Option<i64> {
+    latest_clone(db, char_id).and_then(|r| r.int("typeID"))
 }
 
 /// character.GetHomeStation: the clone's station, else the corporation's.
 pub async fn get_home_station(ctx: &Ctx<'_>) -> Value {
     let chosen = match ctx.session.char_id {
-        Some(char_id) => home_station(ctx.db, char_id).await.unwrap_or_else(|e| {
+        Some(char_id) => ctx.store.read(|db| home_station(db, char_id)).unwrap_or_else(|e| {
             error!("character.GetHomeStation: {}", crate::logging::chain(&e));
             None
         }),
@@ -78,11 +81,10 @@ pub async fn set_home_station(ctx: &Ctx<'_>, station_id: i64) -> Outcome {
     if ctx.session.station_id != Some(station_id) {
         return Outcome::custom("You can only move your clone to the station you are in.");
     }
-    let result = async {
-        let grade = clone_type(ctx.db, char_id).await?.unwrap_or(TYPE_CLONE_ALPHA);
-        replace_clone(ctx.db, char_id, grade, Some(station_id)).await
-    }
-    .await;
+    let result = ctx.store.write(|tx| {
+        let grade = clone_type(tx.db(), char_id).unwrap_or(TYPE_CLONE_ALPHA);
+        replace_clone(tx, char_id, grade, Some(station_id))
+    });
     match result {
         Ok(()) => {
             info!("{char_id} moved their clone to {station_id}");
@@ -100,13 +102,16 @@ pub async fn set_home_station(ctx: &Ctx<'_>, station_id: i64) -> Outcome {
 pub async fn set_clone_type(ctx: &Ctx<'_>, type_id: i64) -> Outcome {
     use crate::svc::wallet::{move_cash, Payment, Transfer};
     let Some(char_id) = ctx.session.char_id else { return Outcome::custom("No character.") };
-    let sql = r#"SELECT "basePrice" FROM "invTypes" WHERE "typeID" = $1 AND "groupID" = $2"#;
-    let Some(price) = ctx.query_one(sql, &[&(type_id as i32), &GROUP_CLONE]).await.map(|r| r.get::<_, f64>(0)) else {
+    let clone = crate::sde::table("invTypes")
+        .get("typeID", type_id as i32 as i64)
+        .filter(|t| t.int("groupID") == Some(GROUP_CLONE as i64));
+    // Every clone grade has a price (the Alpha's is 0).
+    let Some(price) = clone.map(|t| t.float("basePrice").expect("a clone grade without a basePrice")) else {
         return Outcome::custom("That is not a clone.");
     };
     let arg = type_id.to_string();
     let payment = Payment { payer: char_id, payee: None, amount: price, ref_type: REF_CLONE, arg_id1: &arg, reason: "" };
-    match move_cash(ctx.db_url, payment).await {
+    match move_cash(ctx.store, payment).await {
         Ok(()) => {}
         Err(Transfer::NotEnough { need, have }) => return Outcome::not_enough_money(need, have),
         Err(Transfer::NoSuchOwner) => return Outcome::custom("There is no wallet to pay from."),
@@ -115,11 +120,10 @@ pub async fn set_clone_type(ctx: &Ctx<'_>, type_id: i64) -> Outcome {
             return Outcome::custom("The clone could not be paid for.");
         }
     }
-    let result = async {
-        let home = home_station(ctx.db, char_id).await?;
-        replace_clone(ctx.db, char_id, type_id, home).await
-    }
-    .await;
+    let result = ctx.store.write(|tx| {
+        let home = home_station(tx.db(), char_id)?;
+        replace_clone(tx, char_id, type_id, home)
+    });
     if let Err(e) = result {
         error!("installing clone {type_id} for {char_id}: {}", crate::logging::chain(&e));
         return Outcome::custom("The clone could not be installed.");

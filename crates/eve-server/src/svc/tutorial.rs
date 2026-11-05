@@ -1,32 +1,42 @@
 use eve_marshal::Value;
 use tracing::error;
 
+use crate::sde;
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{key_val, lines, rowset};
+use crate::store::{StoreError, Tx, Value as Cell};
+use crate::svc::rows::{key_val, rowset};
 
 pub async fn tutorial_svc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let arg = |i: usize| call.arg_i64(i);
     let value = match call.method.as_str() {
-        "GetTutorials" => get_tutorials(ctx).await,
-        "GetCriterias" => get_criterias(ctx).await,
-        "GetTutorialInfo" => tutorial_info(ctx, arg(0).unwrap_or(0)).await,
-        "GetTutorialVersionInfo" => tutorial_info(ctx, arg(0).unwrap_or(0)).await,
+        "GetTutorials" => get_tutorials(),
+        "GetCriterias" => get_criterias(),
+        "GetTutorialInfo" => tutorial_info(arg(0).unwrap_or(0)),
+        "GetTutorialVersionInfo" => tutorial_info(arg(0).unwrap_or(0)),
 
         "LogAppClosed" | "LogClosed" | "LogAborted" | "LogCompleted" => return Some(log_progress(call,ctx).await),
-        "GetCharacterTutorialState" => ctx.rowset(&["tutorialID","pageID","eventTypeID"],
-            r#"SELECT "tutorialID","pageID","eventTypeID" FROM "chrTutorialState" WHERE "characterID"=$1 ORDER BY "updatedAt","tutorialID""#,
-            &[&(ctx.session.char_id.unwrap_or(0) as i32)]).await,
+        "GetCharacterTutorialState" => character_state(ctx),
 
         _ => return None,
     };
     Some(Outcome::Value(value))
 }
 
-pub async fn ensure(db:&tokio_postgres::Client) -> Result<(),tokio_postgres::Error> {
-    db.batch_execute(r#"CREATE TABLE IF NOT EXISTS "chrTutorialState" (
-        "characterID" integer NOT NULL,"tutorialID" integer NOT NULL,"pageID" integer NOT NULL,
-        "eventTypeID" integer NOT NULL,"elapsedSeconds" bigint NOT NULL,"updatedAt" bigint NOT NULL,
-        PRIMARY KEY ("characterID","tutorialID"))"#).await
+/// The tutorial progress table is the store's own now: nothing to make.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// Where the character is in each tutorial, the longest untouched first.
+fn character_state(ctx: &Ctx<'_>) -> Value {
+    const HEADER: &[&str] = &["tutorialID", "pageID", "eventTypeID"];
+    let character = ctx.session.char_id.unwrap_or(0);
+    let lines = ctx.store.read(|db| {
+        let mut rows: Vec<_> = db.table("chrTutorialState").find(&["characterID"], &[Cell::Int(character)]).collect();
+        rows.sort_by_key(|r| (r.int("updatedAt"), r.int("tutorialID")));
+        rows.iter().map(|r| Value::List(r.line(HEADER))).collect()
+    });
+    rowset(HEADER, lines)
 }
 
 async fn log_progress(call:&Call,ctx:&Ctx<'_>) -> Outcome {
@@ -38,11 +48,18 @@ async fn log_progress(call:&Call,ctx:&Ctx<'_>) -> Outcome {
     // original event IDs for both resumable close events are unavailable;
     // 0 represents their shared client-visible nonterminal behavior.
     let event=match call.method.as_str(){"LogCompleted"=>155i32,"LogAborted"=>158,_=>0};
-    let result=ctx.db.execute(r#"INSERT INTO "chrTutorialState" ("characterID","tutorialID","pageID","eventTypeID","elapsedSeconds","updatedAt")
-        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT ("characterID","tutorialID") DO UPDATE
-        SET "pageID"=$3,"eventTypeID"=CASE WHEN "chrTutorialState"."eventTypeID" IN (155,158) AND $4=0
-            THEN "chrTutorialState"."eventTypeID" ELSE $4 END,"elapsedSeconds"=$5,"updatedAt"=$6"#,
-        &[&(character as i32),&tutorial,&page,&event,&elapsed,&crate::bulkdata::filetime_now()]).await;
+    let now=crate::bulkdata::filetime_now();
+    let result=ctx.store.write(|tx| {
+        let key=[Cell::Int(character),Cell::Int(i64::from(tutorial))];
+        // A close after a finish or a disable keeps that ending.
+        let kept=|old:Option<i64>| match old {Some(e@(155|158)) if event==0=>e,_=>i64::from(event)};
+        match tx.table("chrTutorialState").get(&key).map(|r|(r.id,r.int("eventTypeID"))) {
+            Some((row,old))=>tx.update("chrTutorialState",row,&[("pageID",Cell::Int(i64::from(page))),("eventTypeID",Cell::Int(kept(old))),
+                ("elapsedSeconds",Cell::Int(elapsed)),("updatedAt",Cell::Int(now))]),
+            None=>tx.insert("chrTutorialState",&[("characterID",key[0].clone()),("tutorialID",key[1].clone()),("pageID",Cell::Int(i64::from(page))),
+                ("eventTypeID",Cell::Int(i64::from(event))),("elapsedSeconds",Cell::Int(elapsed)),("updatedAt",Cell::Int(now))]).map(|_|()),
+        }
+    });
     match result {
         Ok(_)=>Outcome::Value(Value::None),
         Err(e)=>{error!("saving tutorial progress: {}",crate::logging::chain(&e));Outcome::custom("Tutorial progress could not be saved.")}
@@ -59,28 +76,38 @@ fn alias_source(id: i32) -> i32 {
     ALIASES.iter().find(|(a, _)| *a == id).map_or(id, |(_, s)| *s)
 }
 
-async fn get_tutorials(ctx: &Ctx<'_>) -> Value {
+/// A tutorial's row under the ID it is asked by.
+fn tutorial_line(id: i32, tutorial: &sde::Row) -> Value {
+    let mut line = vec![Value::Int(id as i64)];
+    line.extend(tutorial.line(&["tutorialVName", "nextTutorialID"]));
+    Value::List(line)
+}
+
+/// Every tutorial, and each alias the data has no tutorial for under its
+/// source's name and successor, by ID.
+fn get_tutorials() -> Value {
     const HEADER: &[&str] = &["tutorialID", "tutorialVName", "nextTutorialID"];
-    let sql = r#"SELECT "tutorialID","tutorialVName","nextTutorialID" FROM tutorials
-                 UNION ALL
-                 SELECT a.alias, t."tutorialVName", t."nextTutorialID"
-                   FROM unnest($1::integer[], $2::integer[]) AS a(alias, source)
-                   JOIN tutorials t ON t."tutorialID" = a.source
-                  WHERE NOT EXISTS (SELECT 1 FROM tutorials x WHERE x."tutorialID" = a.alias)
-                 ORDER BY 1"#;
-    let aliases: Vec<i32> = ALIASES.iter().map(|(a, _)| *a).collect();
-    let sources: Vec<i32> = ALIASES.iter().map(|(_, s)| *s).collect();
-    ctx.rowset(HEADER, sql, &[&aliases, &sources]).await
+    let tutorials = sde::table("tutorials");
+    let mut found: Vec<(Option<i64>, Value)> =
+        tutorials.rows().map(|t| (t.int("tutorialID"), Value::List(t.line(HEADER)))).collect();
+    for (alias, source) in ALIASES {
+        if tutorials.get("tutorialID", *alias as i64).is_some() {
+            continue;
+        }
+        found.extend(tutorials.find("tutorialID", *source as i64).map(|t| (Some(*alias as i64), tutorial_line(*alias, &t))));
+    }
+    found.sort_by_key(|(id, _)| *id);
+    rowset(HEADER, found.into_iter().map(|(_, line)| line).collect())
 }
 
-async fn get_criterias(ctx: &Ctx<'_>) -> Value {
+fn get_criterias() -> Value {
     const HEADER: &[&str] = &["criteriaID", "criteriaName", "messageText", "audioPath"];
-    let sql = r#"SELECT "criteriaID","criteriaName","messageText","audioPath"
-                   FROM tutorial_criteria ORDER BY "criteriaID""#;
-    ctx.rowset(HEADER, sql, &[]).await
+    let mut found: Vec<sde::Row> = sde::table("tutorial_criteria").rows().collect();
+    found.sort_by_key(|r| r.int("criteriaID"));
+    rowset(HEADER, found.iter().map(|r| Value::List(r.line(HEADER))).collect())
 }
 
-async fn tutorial_info(ctx: &Ctx<'_>, tutorial_id: i64) -> Value {
+fn tutorial_info(tutorial_id: i64) -> Value {
     const TUTORIAL_HEADER: &[&str] = &["tutorialID", "tutorialVName", "nextTutorialID"];
     const PAGE_HEADER: &[&str] =
         &["pageID", "pageNumber", "pageName", "text", "imagePath", "audioPath"];
@@ -88,46 +115,39 @@ async fn tutorial_info(ctx: &Ctx<'_>, tutorial_id: i64) -> Value {
     const PAGE_CRITERIA_HEADER: &[&str] = &["pageID", "criteriaID"];
 
     // An aliased tutorial shows its source's pages under its own ID.
+    let tutorials = sde::table("tutorials");
     let asked = tutorial_id as i32;
-    let id = if ctx.query_one(r#"SELECT 1 FROM tutorials WHERE "tutorialID"=$1"#,&[&asked]).await.is_some() {
+    let id = if tutorials.get("tutorialID", asked as i64).is_some() {
         asked
     } else {alias_source(asked)};
 
-    let tutorial_sql = r#"SELECT $2::integer,"tutorialVName","nextTutorialID"
-                            FROM tutorials WHERE "tutorialID" = $1"#;
-    let tutorial_rows = match ctx.db.query(tutorial_sql, &[&id, &asked]).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("GetTutorialInfo({tutorial_id}): {err}", err = crate::logging::chain(&e));
-            return Value::None;
-        }
-    };
-    if tutorial_rows.is_empty() {
+    let tutorial: Vec<Value> = tutorials.find("tutorialID", id as i64).map(|t| tutorial_line(asked, &t)).collect();
+    if tutorial.is_empty() {
         return Value::None;
     }
 
-    let page_sql = r#"SELECT "pageID","pageNumber","pageName","text","imagePath","audioPath"
-                        FROM tutorial_pages WHERE "tutorialID" = $1 ORDER BY "pageNumber""#;
+    let mut pages: Vec<sde::Row> = sde::table("tutorial_pages").find("tutorialID", id as i64).collect();
+    pages.sort_by_key(|p| p.int("pageNumber"));
 
-    let criteria_sql = r#"SELECT "criteriaID" FROM tutorials_criterias
-                           WHERE "tutorialID" = $1 ORDER BY "criteriaID""#;
+    let mut criterias: Vec<sde::Row> = sde::table("tutorials_criterias").find("tutorialID", id as i64).collect();
+    criterias.sort_by_key(|c| c.int("criteriaID"));
 
-    let page_criteria_sql = r#"SELECT pc."pageID", pc."criteriaID"
-                                 FROM tutorial_page_criteria pc
-                                 JOIN tutorial_pages p ON p."pageID" = pc."pageID"
-                                WHERE p."tutorialID" = $1
-                                ORDER BY p."pageNumber", pc."criteriaID""#;
-
-    let pages = ctx.rowset(PAGE_HEADER, page_sql, &[&id]).await;
-    let criterias = ctx.rowset(CRITERIA_HEADER, criteria_sql, &[&id]).await;
-    let pagecriterias =
-        ctx.rowset(PAGE_CRITERIA_HEADER, page_criteria_sql, &[&id]).await;
+    // The criteria of the tutorial's pages, by page number, then criterion.
+    let page_criteria = sde::table("tutorial_page_criteria");
+    let mut pagecriterias: Vec<(Option<i64>, Option<i64>, Value)> = pages
+        .iter()
+        .flat_map(|p| {
+            let found = p.int("pageID").into_iter().flat_map(|id| page_criteria.find("pageID", id));
+            found.map(|pc| (p.int("pageNumber"), pc.int("criteriaID"), Value::List(pc.line(PAGE_CRITERIA_HEADER))))
+        })
+        .collect();
+    pagecriterias.sort_by_key(|(page, criterion, _)| (*page, *criterion));
 
     key_val(vec![
-        ("tutorial", rowset(TUTORIAL_HEADER, lines(&tutorial_rows))),
-        ("pages", pages),
-        ("criterias", criterias),
-        ("pagecriterias", pagecriterias),
+        ("tutorial", rowset(TUTORIAL_HEADER, tutorial)),
+        ("pages", rowset(PAGE_HEADER, pages.iter().map(|p| Value::List(p.line(PAGE_HEADER))).collect())),
+        ("criterias", rowset(CRITERIA_HEADER, criterias.iter().map(|c| Value::List(c.line(CRITERIA_HEADER))).collect())),
+        ("pagecriterias", rowset(PAGE_CRITERIA_HEADER, pagecriterias.into_iter().map(|(_, _, line)| line).collect())),
     ])
 }
 
@@ -136,8 +156,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE disposable imported database"]
-    async fn progress_survives_reconnect_and_close_preserves_completion() {
+    async fn progress_is_kept_and_close_preserves_completion() {
         let fixture = crate::test_support::Database::load().await;
         let character = fixture.id().await;
         let session = crate::session::Session { char_id: Some(character as i64), ..Default::default() };
@@ -150,9 +169,11 @@ mod tests {
             assert!(matches!(tutorial_svc(&call(method, tutorial, page), &ctx).await, Some(Outcome::Value(Value::None))));
         }
         assert!(matches!(tutorial_svc(&call("LogClosed", 5, -1), &ctx).await, Some(Outcome::UserError { .. })));
-        let connection = crate::db::connect(&fixture.url).await.unwrap();
-        let rows = connection.query(r#"SELECT "tutorialID","pageID","eventTypeID","elapsedSeconds" FROM "chrTutorialState" WHERE "characterID"=$1 ORDER BY "tutorialID""#, &[&character]).await.unwrap();
-        let saved: Vec<(i32, i32, i32, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect();
+        let saved: Vec<(i64, i64, i64, i64)> = fixture.store.read(|db| {
+            let mut rows: Vec<_> = db.table("chrTutorialState").find(&["characterID"], &[Cell::Int(i64::from(character))]).collect();
+            rows.sort_by_key(|r| r.int("tutorialID"));
+            rows.iter().map(|r| (r.int("tutorialID").unwrap(), r.int("pageID").unwrap(), r.int("eventTypeID").unwrap(), r.int("elapsedSeconds").unwrap())).collect()
+        });
         assert_eq!(saved, vec![(5, 2, 0, 47), (7, 8, 155, 47), (9, 1, 158, 47)]);
         let read = Call { service: "tutorialSvc".into(), method: "GetCharacterTutorialState".into(), args: vec![], kwargs: vec![] };
         let expected = rowset(&["tutorialID", "pageID", "eventTypeID"], vec![

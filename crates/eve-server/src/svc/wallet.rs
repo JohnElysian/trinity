@@ -2,12 +2,12 @@ use eve_marshal::Value;
 #[path="wallet_accounts.rs"]
 mod accounts;
 pub use accounts::{can_take,post_account,select_account};
-use tokio_postgres::types::ToSql;
 use tracing::{error, info};
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::CORP_ROLE_ACCOUNTANT;
-use crate::svc::rows::{cell, float, int, rowset, text};
+use crate::store::{self, Db, Row, Store, StoreError, Tx};
+use crate::svc::rows::rowset;
 
 const JOURNAL_BATCH: i64 = 25;
 
@@ -33,13 +33,13 @@ pub async fn account(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
                 return Some(Outcome::custom("You do not have access to that corporation wallet."));
             }
             if corp && key!=1000 {
-                let balance=ctx.query_one(r#"SELECT balance FROM corporation_wallets WHERE "corporationID"=$1 AND "accountKey"=$2"#,
-                    &[&(ctx.session.corp_id.unwrap_or(0) as i32),&key]).await.map(|r|r.get::<_,f64>(0)).unwrap_or(0.0);
+                let corp_id=ctx.session.corp_id.unwrap_or(0);
+                let balance=ctx.store.read(|db|db.table("corporation_wallets").get(&[store::Value::Int(corp_id),store::Value::Int(i64::from(key))]).and_then(|r|r.float("balance"))).unwrap_or(0.0);
                 Value::Double(balance)
             } else {cash_balance(ctx, corp).await}
         }
-        "GetKeyMap" => key_map(ctx).await,
-        "GetRefTypes" => ref_types(ctx).await,
+        "GetKeyMap" => key_map(),
+        "GetRefTypes" => ref_types(),
         "GetJournal" => {
             if call.arg_id(3)!=0 && ctx.session.corp_role() & (1|256|1024)==0 {
                 return Some(Outcome::custom("Corporation journals require an accounting role."));
@@ -53,7 +53,7 @@ pub async fn account(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 
 pub async fn bill_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
-        "GetBillTypes" => bill_types(ctx).await,
+        "GetBillTypes" => bill_types(),
         "CharGetBills" => bills(ctx, ctx.session.char_id, Side::Payable).await,
         "CharGetBillsReceivable" => bills(ctx, ctx.session.char_id, Side::Receivable).await,
         "GetCorporationBills" => bills(ctx, ctx.session.corp_id, Side::Payable).await,
@@ -95,25 +95,39 @@ async fn pay_bill(ctx: &Ctx<'_>, bill_id: i64, corp: bool) -> Outcome {
 /// Pays `debtor`'s open bill `bill_id` to its creditor out of `payer`'s
 /// wallet (the debtor's own, or an alliance's executor corporation's).
 pub async fn settle_bill(ctx: &Ctx<'_>, bill_id: i64, debtor: i64, payer: i64) -> Outcome {
-    let result: Result<(), Outcome> = async {
-        let mut client=crate::db::connect(ctx.db_url).await.map_err(|e|crate::svc::membership::db_failed("connecting to pay the bill",e))?;
-        let tx=client.transaction().await.map_err(|e|crate::svc::membership::db_failed("starting the payment",e))?;
-        let bill=tx.query_opt(r#"SELECT "creditorID",amount,"billTypeID" FROM "billsReceivable" WHERE "billID"=$1 AND "debtorID"=$2 AND paid=0 FOR UPDATE"#,&[&(bill_id as i32),&(debtor as i32)]).await.map_err(|e|crate::svc::membership::db_failed("reading the bill",e))?;
-        let Some(bill)=bill else {return Ok(())};
-        let creditor=int(&bill,0).unwrap_or(0); let amount=float(&bill,1).unwrap_or(f64::NAN);
-        if !amount.is_finite() || amount<0.0 {return Err(Outcome::custom("This bill has an invalid amount."))}
-        let ref_type=match int(&bill,2) {Some(BILL_TYPE_RENTAL)=>REF_OFFICE_RENTAL_FEE,Some(BILL_TYPE_WAR)=>REF_WAR_FEE,Some(BILL_TYPE_ALLIANCE_MAINTENANCE)=>REF_ALLIANCE_MAINTENANCE_FEE,_=>REF_CORPORATION_PAYMENT};
+    let paid = ctx.store.write(|tx| -> Result<_, Refused> {
+        let bill=tx.table("billsReceivable").get_id(bill_id)
+            .filter(|b|b.int("debtorID")==Some(debtor) && b.int("paid")==Some(0))
+            .map(|b|(b.id,b.int("creditorID"),b.float("amount"),b.int("billTypeID")));
+        let Some((row,creditor,amount,bill_type))=bill else {return Ok(None)};
+        let creditor=creditor.unwrap_or(0); let amount=amount.unwrap_or(f64::NAN);
+        if !amount.is_finite() || amount<0.0 {return Err(Refused(Outcome::custom("This bill has an invalid amount.")))}
+        let ref_type=match bill_type {Some(BILL_TYPE_RENTAL)=>REF_OFFICE_RENTAL_FEE,Some(BILL_TYPE_WAR)=>REF_WAR_FEE,Some(BILL_TYPE_ALLIANCE_MAINTENANCE)=>REF_ALLIANCE_MAINTENANCE_FEE,_=>REF_CORPORATION_PAYMENT};
         let bill_ref=bill_id.to_string();
         let entry=Entry {ref_type,payer,payee:creditor,arg_id1:&bill_ref,reason:""};
         let mut sides=vec![(payer,-amount),(creditor,amount)]; sides.sort_unstable_by_key(|(owner,_)|*owner);
-        for (owner,delta) in sides {post(&tx,owner,delta,&entry).await.map_err(crate::svc::membership::transfer_refused)?;}
-        tx.execute(r#"UPDATE "billsReceivable" SET paid=1 WHERE "billID"=$1"#,&[&(bill_id as i32)]).await.map_err(|e|crate::svc::membership::db_failed("marking the bill paid",e))?;
-        tx.commit().await.map_err(|e|crate::svc::membership::db_failed("committing the bill payment",e))?;
-        info!("bill {bill_id}: {payer} paid {amount} ISK of {debtor}'s to {creditor}");
-        notify_balance(ctx,payer).await; if creditor!=payer {notify_balance(ctx,creditor).await;}
-        Ok(())
-    }.await;
-    result.map_or_else(|refusal|refusal,|()|Outcome::Value(Value::None))
+        for (owner,delta) in sides {post(tx,owner,delta,&entry).map_err(|t|Refused(crate::svc::membership::transfer_refused(t)))?;}
+        tx.update("billsReceivable",row,&[("paid",store::Value::Int(1))]).map_err(|e|Refused(crate::svc::membership::db_failed("marking the bill paid",e)))?;
+        Ok(Some((creditor,amount)))
+    });
+    match paid {
+        Ok(Some((creditor,amount))) => {
+            info!("bill {bill_id}: {payer} paid {amount} ISK of {debtor}'s to {creditor}");
+            notify_balance(ctx,payer).await; if creditor!=payer {notify_balance(ctx,creditor).await;}
+            Outcome::Value(Value::None)
+        }
+        Ok(None) => Outcome::Value(Value::None),
+        Err(Refused(refusal)) => refusal,
+    }
+}
+
+/// Why a bill payment was refused (its changes undone).
+struct Refused(Outcome);
+
+impl From<StoreError> for Refused {
+    fn from(e: StoreError) -> Self {
+        Refused(crate::svc::membership::db_failed("paying the bill", e))
+    }
 }
 
 /// The wallet-transaction part of the `marketProxy` service.
@@ -126,79 +140,17 @@ pub async fn market_proxy(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 }
 
 async fn cash_balance(ctx: &Ctx<'_>, corp: bool) -> Value {
-    let (sql, owner) = if corp {
-        (
-            r#"SELECT "balance" FROM "corporation" WHERE "corporationID" = $1"#,
-            ctx.session.corp_id,
-        )
-    } else {
-        (
-            r#"SELECT "balance" FROM "character_" WHERE "characterID" = $1"#,
-            ctx.session.char_id,
-        )
-    };
+    let (table, owner) = if corp { ("corporation", ctx.session.corp_id) } else { ("character_", ctx.session.char_id) };
     let Some(owner) = owner else { return Value::Double(0.0) };
-    match ctx.db.query(sql, &[&(owner as i32)]).await {
-        Ok(rows) if !rows.is_empty() => {
-            Value::Double(float(&rows[0], 0).unwrap_or(0.0))
-        }
-        Ok(_) => Value::Double(0.0),
-        Err(e) => {
-            error!("GetCashBalance: {err}", err = crate::logging::chain(&e));
-            Value::Double(0.0)
-        }
-    }
+    Value::Double(ctx.store.read(|db| db.table(table).get_id(owner).and_then(|r| r.float("balance"))).unwrap_or(0.0))
 }
 
-async fn key_map(ctx: &Ctx<'_>) -> Value {
-    const HEADER: &[&str] = &["accountKey", "accountType", "accountName", "description"];
-    let sql = r#"SELECT "accountKey","accountType","accountName","description"
-                   FROM "market_keyMap" ORDER BY "accountKey""#;
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => {
-            let lines = rows
-                .iter()
-                .map(|r| {
-                    Value::List(vec![
-                        cell(r, 0),
-                        cell(r, 1),
-                        cell(r, 2),
-                        cell(r, 3),
-                    ])
-                })
-                .collect();
-            rowset(HEADER, lines)
-        }
-        Err(e) => {
-            error!("GetKeyMap: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+fn key_map() -> Value {
+    static_rowset("market_keyMap", &["accountKey", "accountType", "accountName", "description"])
 }
 
-async fn ref_types(ctx: &Ctx<'_>) -> Value {
-    const HEADER: &[&str] = &["refTypeID", "refTypeText", "description"];
-    let sql = r#"SELECT "refTypeID","refTypeText","description"
-                   FROM "market_refTypes" ORDER BY "refTypeID""#;
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => {
-            let lines = rows
-                .iter()
-                .map(|r| {
-                    Value::List(vec![
-                        cell(r, 0),
-                        cell(r, 1),
-                        cell(r, 2),
-                    ])
-                })
-                .collect();
-            rowset(HEADER, lines)
-        }
-        Err(e) => {
-            error!("GetRefTypes: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+fn ref_types() -> Value {
+    static_rowset("market_refTypes", &["refTypeID", "refTypeText", "description"])
 }
 
 async fn journal(call: &Call, ctx: &Ctx<'_>) -> Value {
@@ -207,92 +159,58 @@ async fn journal(call: &Call, ctx: &Ctx<'_>) -> Value {
         "reason", "accountKey",
     ];
 
-    let account_key = call.arg_i64(0).unwrap_or(1000) as i32;
+    let account_key = call.arg_i64(0).unwrap_or(1000);
     let from_date = call.arg_i64(1);
-    let ref_type_id = call.arg_i64(2).map(|v| v as i32);
+    let ref_type_id = call.arg_i64(2);
     let corp = call.arg_id(3) != 0;
-    let from_ref_id = call.arg_i64(4).map(|v| v as i32);
+    let from_ref_id = call.arg_i64(4);
     let reverse = call.arg_id(5) != 0;
 
     let owner = if corp { ctx.session.corp_id } else { ctx.session.char_id };
     let Some(owner) = owner else { return rowset(HEADER, Vec::new()) };
-    let owner = owner as i32;
 
-    let mut sql = String::from(
-        r#"SELECT "refID","transDate","refTypeID","ownerID1","ownerID2","argID1",
-                  "amount","balance","reason","accountKey"
-             FROM "market_journal"
-            WHERE "characterID" = $1 AND "accountKey" = $2"#,
-    );
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&owner, &account_key];
-    if let Some(d) = from_date.as_ref() {
-        sql.push_str(&format!(r#" AND "transDate" < ${}"#, params.len() + 1));
-        params.push(d);
+    let mut lines: Vec<Value> = ctx.store.read(|db| {
+        let mut rows: Vec<Row> = db
+            .table("market_journal")
+            .find(&["characterID", "accountKey"], &[store::Value::Int(owner), store::Value::Int(account_key)])
+            .filter(|r| from_date.is_none_or(|d| r.int("transDate").is_some_and(|t| t < d)))
+            .filter(|r| ref_type_id.is_none_or(|t| r.int("refTypeID") == Some(t)))
+            .filter(|r| from_ref_id.is_none_or(|id| r.int("refID").is_some_and(|r| r < id)))
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.int("refID")));
+        rows.iter()
+            .take(JOURNAL_BATCH as usize)
+            .map(|r| {
+                Value::List(vec![
+                    r.cell("refID"),
+                    r.cell("transDate"),
+                    r.cell("refTypeID"),
+                    r.cell("ownerID1"),
+                    r.cell("ownerID2"),
+                    text_id(r.text("argID1")),
+                    Value::Double(r.float("amount").unwrap_or(0.0)),
+                    Value::Double(r.float("balance").unwrap_or(0.0)),
+                    r.cell("reason"),
+                    r.cell("accountKey"),
+                ])
+            })
+            .collect()
+    });
+    if !reverse {
+        lines.reverse();
     }
-    if let Some(t) = ref_type_id.as_ref() {
-        sql.push_str(&format!(r#" AND "refTypeID" = ${}"#, params.len() + 1));
-        params.push(t);
-    }
-    if let Some(r) = from_ref_id.as_ref() {
-        sql.push_str(&format!(r#" AND "refID" < ${}"#, params.len() + 1));
-        params.push(r);
-    }
-    sql.push_str(&format!(r#" ORDER BY "refID" DESC LIMIT {}"#, JOURNAL_BATCH));
-
-    match ctx.db.query(sql.as_str(), &params[..]).await {
-        Ok(rows) => {
-            let mut lines: Vec<Value> = rows
-                .iter()
-                .map(|r| {
-                    Value::List(vec![
-                        cell(r, 0),
-                        cell(r, 1),
-                        cell(r, 2),
-                        cell(r, 3),
-                        cell(r, 4),
-                        text_id(text(r, 5)),
-                        Value::Double(float(r, 6).unwrap_or(0.0)),
-                        Value::Double(float(r, 7).unwrap_or(0.0)),
-                        cell(r, 8),
-                        cell(r, 9),
-                    ])
-                })
-                .collect();
-            if !reverse {
-                lines.reverse();
-            }
-            rowset(HEADER, lines)
-        }
-        Err(e) => {
-            error!("GetJournal: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+    rowset(HEADER, lines)
 }
 
-async fn bill_types(ctx: &Ctx<'_>) -> Value {
-    const HEADER: &[&str] = &["billTypeID", "billTypeName", "description"];
-    let sql = r#"SELECT "billTypeID","billTypeName","description"
-                   FROM "billTypes" ORDER BY "billTypeID""#;
-    match ctx.db.query(sql, &[]).await {
-        Ok(rows) => {
-            let lines = rows
-                .iter()
-                .map(|r| {
-                    Value::List(vec![
-                        cell(r, 0),
-                        cell(r, 1),
-                        cell(r, 2),
-                    ])
-                })
-                .collect();
-            rowset(HEADER, lines)
-        }
-        Err(e) => {
-            error!("GetBillTypes: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+fn bill_types() -> Value {
+    static_rowset("billTypes", &["billTypeID", "billTypeName", "description"])
+}
+
+/// A static table's columns as a rowset, by its first (integer key) column.
+fn static_rowset(table: &str, header: &[&str]) -> Value {
+    let mut rows: Vec<_> = crate::sde::table(table).rows().collect();
+    rows.sort_by_key(|r| r.int(header[0]));
+    rowset(header, rows.iter().map(|r| Value::List(r.line(header))).collect())
 }
 
 #[derive(Clone, Copy)]
@@ -309,52 +227,36 @@ pub async fn bills(ctx: &Ctx<'_>, owner: Option<i64>, side: Side) -> Value {
     ];
     let Some(owner) = owner else { return rowset(HEADER, Vec::new()) };
 
-    let sql = match side {
-        Side::Payable => {
-            r#"SELECT "billID","billTypeID","debtorID","creditorID","amount","dueDateTime",
-                      "interest","externalID","paid","externalID2"
-                 FROM "billsReceivable"
-                WHERE "debtorID" = $1 AND "creditorID" IS NOT NULL
-                      AND "billTypeID" IS NOT NULL
-                ORDER BY "billID""#
-        }
-        Side::Receivable => {
-            r#"SELECT "billID","billTypeID","debtorID","creditorID","amount","dueDateTime",
-                      "interest","externalID","paid","externalID2"
-                 FROM "billsReceivable"
-                WHERE "creditorID" = $1 AND "debtorID" IS NOT NULL
-                      AND "billTypeID" IS NOT NULL
-                ORDER BY "billID""#
-        }
+    let (by, other) = match side {
+        Side::Payable => ("debtorID", "creditorID"),
+        Side::Receivable => ("creditorID", "debtorID"),
     };
-
-    match ctx.db.query(sql, &[&(owner as i32)]).await {
-        Ok(rows) => {
-            let lines = rows
-                .iter()
-                .filter(|r| int(r, 8).unwrap_or(0) == 0)
-                .map(|r| {
-                    Value::List(vec![
-                        cell(r, 0),
-                        cell(r, 1),
-                        cell(r, 2),
-                        cell(r, 3),
-                        Value::Double(float(r, 4).unwrap_or(0.0)),
-                        int(r, 5).map_or(Value::None, Value::Long),
-                        Value::Double(float(r, 6).unwrap_or(0.0)),
-                        Value::Int(int(r, 7).unwrap_or(-1)),
-                        Value::Int(0),
-                        Value::Int(text(r, 9).and_then(|s| parse_i64(&s)).unwrap_or(-1)),
-                    ])
-                })
-                .collect();
-            rowset(HEADER, lines)
-        }
-        Err(e) => {
-            error!("bills: {err}", err = crate::logging::chain(&e));
-            rowset(HEADER, Vec::new())
-        }
-    }
+    let lines = ctx.store.read(|db| {
+        let mut rows: Vec<Row> = db
+            .table("billsReceivable")
+            .find(&[by], &[store::Value::Int(owner)])
+            .filter(|r| !r.value(other).is_null() && !r.value("billTypeID").is_null())
+            .collect();
+        rows.sort_by_key(|r| r.int("billID"));
+        rows.iter()
+            .filter(|r| r.int("paid").unwrap_or(0) == 0)
+            .map(|r| {
+                Value::List(vec![
+                    r.cell("billID"),
+                    r.cell("billTypeID"),
+                    r.cell("debtorID"),
+                    r.cell("creditorID"),
+                    Value::Double(r.float("amount").unwrap_or(0.0)),
+                    r.int("dueDateTime").map_or(Value::None, Value::Long),
+                    Value::Double(r.float("interest").unwrap_or(0.0)),
+                    Value::Int(r.int("externalID").unwrap_or(-1)),
+                    Value::Int(0),
+                    Value::Int(r.int("externalID2").unwrap_or(-1)),
+                ])
+            })
+            .collect()
+    });
+    rowset(HEADER, lines)
 }
 
 async fn transactions(ctx: &Ctx<'_>, call: &Call) -> Outcome {
@@ -367,34 +269,45 @@ async fn transactions(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     if corp && ctx.session.corp_role() & (crate::session::CORP_ROLE_DIRECTOR | CORP_ROLE_ACCOUNTANT | 1024) == 0 {
         return Outcome::custom("Corporation transactions require the Accountant or Junior Accountant role.");
     }
-    let owner = if corp { ctx.session.corp_id.unwrap_or(0) } else { me } as i32;
+    let owner = if corp { ctx.session.corp_id.unwrap_or(0) } else { me };
     let offset = usize::from(!call.method.contains("New"));
-    let int = |i| call.arg_i64(i + offset).and_then(|v| i32::try_from(v).ok());
+    // A filter outside the range of the integer column it compares with is
+    // no filter.
+    let int = |i| call.arg_i64(i + offset).filter(|v| i32::try_from(*v).is_ok());
     let number = |i| call.args.get(i + offset).and_then(Value::as_f64).filter(|v| v.is_finite());
-    let before = if offset == 1 { call.arg_i64(0).and_then(|v| i32::try_from(v).ok()) } else { None };
+    let before = if offset == 1 { call.arg_i64(0).filter(|v| i32::try_from(*v).is_ok()) } else { None };
     let kind = int(0); let type_id = int(1); let client_id = int(2); let quantity = int(3);
     let from = call.arg_i64(4 + offset); let maximum = number(5); let minimum = number(6);
     let account = if corp { int(7) } else { None }; let actor = if corp { int(8) } else { None };
-    let sql = r#"SELECT "transactionID","transactionDateTime","typeID",quantity,price,
-        "transactionType","clientID","regionID","stationID","characterID","isCorp","accountKey"
-        FROM market_transactions
-        WHERE (($2 AND "corporationID"=$1 AND "isCorp"=1) OR (NOT $2 AND "characterID"=$1))
-        AND ($3::int IS NULL OR "transactionID"<$3)
-        AND ($4::int IS NULL OR "transactionType"=$4)
-        AND ($5::int IS NULL OR "typeID"=$5)
-        AND ($6::int IS NULL OR "clientID"=$6)
-        AND ($7::int IS NULL OR quantity >= $7)
-        AND ($8::bigint IS NULL OR "transactionDateTime">=$8)
-        AND ($9::float8 IS NULL OR price <= $9) AND ($10::float8 IS NULL OR price >= $10)
-        AND ($11::int IS NULL OR "accountKey"=$11) AND ($12::int IS NULL OR "characterID"=$12)
-        ORDER BY "transactionID" DESC LIMIT 25"#;
-    match ctx.db.query(sql, &[&owner,&corp,&before,&kind,&type_id,&client_id,&quantity,&from,&maximum,&minimum,&account,&actor]).await {
-        Ok(rows) => Outcome::Value(rowset(HEADER, crate::svc::rows::lines(&rows))),
-        Err(error) => {
-            error!("market transactions: {}", crate::logging::chain(&error));
-            Outcome::custom("The wallet transaction history could not be loaded.")
-        }
-    }
+    let lines = ctx.store.read(|db| {
+        let table = db.table("market_transactions");
+        let mine: Box<dyn Iterator<Item = Row>> = if corp {
+            Box::new(table.find(&["corporationID"], &[store::Value::Int(owner)]).filter(|r| r.int("isCorp") == Some(1)))
+        } else {
+            table.find(&["characterID"], &[store::Value::Int(owner)])
+        };
+        let is = |r: &Row, col: &str, want: Option<i64>| want.is_none_or(|w| r.int(col) == Some(w));
+        let mut rows: Vec<Row> = mine
+            .filter(|r| before.is_none_or(|b| r.int("transactionID").is_some_and(|id| id < b)))
+            .filter(|r| is(r, "transactionType", kind) && is(r, "typeID", type_id) && is(r, "clientID", client_id))
+            .filter(|r| quantity.is_none_or(|q| r.int("quantity").is_some_and(|n| n >= q)))
+            .filter(|r| from.is_none_or(|f| r.int("transactionDateTime").is_some_and(|t| t >= f)))
+            .filter(|r| maximum.is_none_or(|m| r.float("price").is_some_and(|p| p <= m)))
+            .filter(|r| minimum.is_none_or(|m| r.float("price").is_some_and(|p| p >= m)))
+            .filter(|r| is(r, "accountKey", account) && is(r, "characterID", actor))
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.int("transactionID")));
+        rows.iter()
+            .take(25)
+            .map(|r| {
+                Value::List(r.line(&[
+                    "transactionID", "transactionDateTime", "typeID", "quantity", "price", "transactionType",
+                    "clientID", "regionID", "stationID", "characterID", "isCorp", "accountKey",
+                ]))
+            })
+            .collect()
+    });
+    Outcome::Value(rowset(HEADER, lines))
 }
 
 async fn give_cash(call: &Call, ctx: &Ctx<'_>, from_corp: bool) -> Outcome {
@@ -444,7 +357,7 @@ async fn give_cash(call: &Call, ctx: &Ctx<'_>, from_corp: bool) -> Outcome {
         (REF_PLAYER_DONATION, String::new())
     };
     let payment = Payment { payer, payee: Some(to_owner), amount, ref_type, arg_id1: &arg_id1, reason: &reason };
-    match move_cash(ctx.db_url, payment).await {
+    match move_cash(ctx.store, payment).await {
         Ok(()) => {
             info!(
                 "GiveCash{}: {payer} -> {to_owner}, {amount} ISK ({reason:?})",
@@ -469,11 +382,17 @@ async fn give_cash(call: &Call, ctx: &Ctx<'_>, from_corp: bool) -> Outcome {
 pub enum Transfer {
     NotEnough { need: f64, have: f64 },
     NoSuchOwner,
-    Db(tokio_postgres::Error),
+    Db(StoreError),
+}
+
+impl From<StoreError> for Transfer {
+    fn from(e: StoreError) -> Self {
+        Transfer::Db(e)
+    }
 }
 
 pub(crate) async fn notify_balance(ctx:&Ctx<'_>,owner:i64) {
-    let value=ctx.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1 UNION ALL SELECT balance FROM corporation WHERE "corporationID"=$1 LIMIT 1"#,&[&(owner as i32)]).await.and_then(|r|float(&r,0));
+    let value=ctx.store.read(|db|balance(db,"character_",owner).or_else(||balance(db,"corporation",owner)));
     if let Some(balance)=value {let w=ctx.world.lock();let mut clients=w.clients_of(owner);clients.extend(w.corp_members(owner));w.notify(&clients,"OnAccountChange",Value::Tuple(vec![Value::bytes("cash"),Value::Int(owner),Value::Double(balance)]));}
 }
 
@@ -481,20 +400,28 @@ pub(crate) async fn notify_balance(ctx:&Ctx<'_>,owner:i64) {
 mod transaction_tests {
     use super::*;
     #[tokio::test]
-    #[ignore="requires TRINITY_TEST_DATABASE disposable imported database"]
     async fn bill_payment_rolls_back_when_recipient_is_missing_and_cannot_be_paid_twice() {
         let fixture=crate::test_support::Database::load().await;
-        let payer=fixture.id().await; let payee=fixture.id().await;
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,1000)"#,&[&payer,&format!("Bill payer {payer}")]).await.unwrap();
-        let bill=fixture.db.query_one(r#"INSERT INTO "billsReceivable" ("debtorID","creditorID",amount,"billTypeID",paid) VALUES ($1,$2,100,2,0) RETURNING "billID""#,&[&payer,&payee]).await.unwrap().get::<_,i32>(0);
-        let session=crate::session::Session {char_id:Some(payer as i64),..Default::default()}; let ctx=fixture.ctx(&session);
-        assert!(!matches!(settle_bill(&ctx,bill as i64,payer as i64,payer as i64).await,Outcome::Value(_)));
-        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&payer]).await.unwrap().get(0);assert_eq!(balance,1000.0);
-        let paid=fixture.db.query_one(r#"SELECT paid FROM "billsReceivable" WHERE "billID"=$1"#,&[&bill]).await.unwrap();assert_eq!(int(&paid,0),Some(0));
-        fixture.db.execute(r#"INSERT INTO "character_" ("characterID","characterName",balance) VALUES ($1,$2,0)"#,&[&payee,&format!("Bill payee {payee}")]).await.unwrap();
-        let (a,b)=tokio::join!(settle_bill(&ctx,bill as i64,payer as i64,payer as i64),settle_bill(&ctx,bill as i64,payer as i64,payer as i64));
+        let payer=i64::from(fixture.id().await); let payee=i64::from(fixture.id().await);
+        fn character(tx:&mut Tx<'_>,id:i64,name:String,balance:f64)->Result<store::RowId,StoreError> {
+            tx.insert("character_",&[("characterID",store::Value::Int(id)),("characterName",store::Value::Text(name.into())),("balance",store::Value::Float(balance))])
+        }
+        fixture.store.write(|tx|character(tx,payer,format!("Bill payer {payer}"),1000.0)).unwrap();
+        let bill=fixture.store.write(|tx| {
+            let row=tx.insert("billsReceivable",&[("debtorID",store::Value::Int(payer)),("creditorID",store::Value::Int(payee)),("amount",store::Value::Float(100.0)),("billTypeID",store::Value::Int(2)),("paid",store::Value::Int(0))])?;
+            Ok::<_,StoreError>(tx.table("billsReceivable").row(row).and_then(|r|r.int("billID")).unwrap())
+        }).unwrap();
+        let session=crate::session::Session {char_id:Some(payer),..Default::default()}; let ctx=fixture.ctx(&session);
+        let balance=||fixture.store.read(|db|balance(db,"character_",payer));
+        let paid=||fixture.store.read(|db|db.table("billsReceivable").get_id(bill).and_then(|r|r.int("paid")));
+        assert!(!matches!(settle_bill(&ctx,bill,payer,payer).await,Outcome::Value(_)));
+        assert_eq!(balance(),Some(1000.0));
+        assert_eq!(paid(),Some(0));
+        fixture.store.write(|tx|character(tx,payee,format!("Bill payee {payee}"),0.0)).unwrap();
+        // Paying twice (once at the same time, now one after the other) pays once.
+        let (a,b)=tokio::join!(settle_bill(&ctx,bill,payer,payer),settle_bill(&ctx,bill,payer,payer));
         assert!(matches!(a,Outcome::Value(_)));assert!(matches!(b,Outcome::Value(_)));
-        let balance:f64=fixture.db.query_one(r#"SELECT balance FROM "character_" WHERE "characterID"=$1"#,&[&payer]).await.unwrap().get(0);assert_eq!(balance,900.0);
+        assert_eq!(balance(),Some(900.0));
     }
 }
 
@@ -509,17 +436,17 @@ pub struct Payment<'a> {
     pub reason: &'a str,
 }
 
-pub async fn move_cash(db_url: &str, p: Payment<'_>) -> Result<(), Transfer> {
-    let mut client = crate::db::connect(db_url).await.map_err(Transfer::Db)?;
-    let tx = client.transaction().await.map_err(Transfer::Db)?;
-    let entry = Entry { ref_type: p.ref_type, payer: p.payer, payee: p.payee.unwrap_or(0), arg_id1: p.arg_id1, reason: p.reason };
-    // Post in ID order so two opposite transfers cannot deadlock.
-    let mut sides: Vec<(i64, f64)> = std::iter::once((p.payer, -p.amount)).chain(p.payee.map(|id| (id, p.amount))).collect();
-    sides.sort_unstable_by_key(|(id, _)| *id);
-    for (owner, delta) in sides {
-        post(&tx, owner, delta, &entry).await?;
-    }
-    tx.commit().await.map_err(Transfer::Db)
+pub async fn move_cash(store: &Store, p: Payment<'_>) -> Result<(), Transfer> {
+    store.write(|tx| {
+        let entry = Entry { ref_type: p.ref_type, payer: p.payer, payee: p.payee.unwrap_or(0), arg_id1: p.arg_id1, reason: p.reason };
+        // Both sides post in ID order, so their journal lines do too.
+        let mut sides: Vec<(i64, f64)> = std::iter::once((p.payer, -p.amount)).chain(p.payee.map(|id| (id, p.amount))).collect();
+        sides.sort_unstable_by_key(|(id, _)| *id);
+        for (owner, delta) in sides {
+            post(tx, owner, delta, &entry)?;
+        }
+        Ok(())
+    })
 }
 
 /// What a journal line records about the payment it belongs to.
@@ -535,89 +462,58 @@ pub struct Entry<'a> {
 /// One side of a payment, inside the caller's transaction: add `delta` to
 /// `owner`'s wallet (a character or a corporation) and journal it. Refuses to
 /// go below zero. Returns the new balance.
-pub async fn post(
-    tx: &tokio_postgres::Transaction<'_>,
-    owner: i64,
-    delta: f64,
-    e: &Entry<'_>,
-) -> Result<f64, Transfer> {
-    let Some(have) = lock_balance(tx, owner).await? else { return Err(Transfer::NoSuchOwner) };
+pub fn post(tx: &mut Tx<'_>, owner: i64, delta: f64, e: &Entry<'_>) -> Result<f64, Transfer> {
+    let Some(have) = wallet_balance(tx.db(), owner) else { return Err(Transfer::NoSuchOwner) };
     if delta < 0.0 && have + delta < 0.0 {
         return Err(Transfer::NotEnough { need: -delta, have });
     }
-    add_balance(tx, owner, delta).await?;
     let balance = have + delta;
-    tx.execute(
-        r#"INSERT INTO market_journal
-               ("characterID","transDate","refTypeID","ownerID1","ownerID2","argID1",
-                "accountID","amount","balance","reason","accountKey")
-           VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$9,$10)"#,
+    add_balance(tx, owner, balance)?;
+    tx.insert(
+        "market_journal",
         &[
-            &(owner as i32),
-            &crate::bulkdata::filetime_now(),
-            &e.ref_type,
-            &(e.payer as i32),
-            &(e.payee as i32),
-            &e.arg_id1,
-            &delta,
-            &balance,
-            &e.reason,
-            &ACCOUNT_KEY_PERSONAL,
+            ("characterID", store::Value::Int(owner)),
+            ("transDate", store::Value::Int(crate::bulkdata::filetime_now())),
+            ("refTypeID", store::Value::Int(i64::from(e.ref_type))),
+            ("ownerID1", store::Value::Int(e.payer)),
+            ("ownerID2", store::Value::Int(e.payee)),
+            ("argID1", store::Value::Text(e.arg_id1.into())),
+            ("accountID", store::Value::Int(0)),
+            ("amount", store::Value::Float(delta)),
+            ("balance", store::Value::Float(balance)),
+            ("reason", store::Value::Text(e.reason.into())),
+            ("accountKey", store::Value::Int(i64::from(ACCOUNT_KEY_PERSONAL))),
         ],
-    )
-    .await
-    .map_err(Transfer::Db)?;
+    )?;
     Ok(balance)
 }
 
-async fn lock_balance(
-    tx: &tokio_postgres::Transaction<'_>,
-    owner: i64,
-) -> Result<Option<f64>, Transfer> {
-    let id = owner as i32;
-    if let Some(r) = tx
-        .query_opt(r#"SELECT balance FROM "corporation" WHERE "corporationID" = $1 FOR UPDATE"#, &[&id])
-        .await
-        .map_err(Transfer::Db)?
-    {
-        return Ok(Some(r.get(0)));
-    }
-    Ok(tx
-        .query_opt(r#"SELECT balance FROM "character_" WHERE "characterID" = $1 FOR UPDATE"#, &[&id])
-        .await
-        .map_err(Transfer::Db)?
-        .map(|r| r.get(0)))
+/// An owner's balance in `table` (`character_` or `corporation`).
+fn balance(db: &Db, table: &str, owner: i64) -> Option<f64> {
+    db.table(table).get_id(owner).and_then(|r| r.float("balance"))
 }
 
-async fn add_balance(
-    tx: &tokio_postgres::Transaction<'_>,
-    owner: i64,
-    delta: f64,
-) -> Result<(), Transfer> {
-    let id = owner as i32;
-    let n = tx
-        .execute(
-            r#"UPDATE "corporation" SET balance = balance + $2 WHERE "corporationID" = $1"#,
-            &[&id, &delta],
-        )
-        .await
-        .map_err(Transfer::Db)?;
-    if n == 0 {
-        tx.execute(
-            r#"UPDATE "character_" SET balance = balance + $2 WHERE "characterID" = $1"#,
-            &[&id, &delta],
-        )
-        .await
-        .map_err(Transfer::Db)?;
+/// A wallet's balance: a corporation's, else a character's.
+fn wallet_balance(db: &Db, owner: i64) -> Option<f64> {
+    if db.table("corporation").get_id(owner).is_some() {
+        return balance(db, "corporation", owner);
+    }
+    balance(db, "character_", owner)
+}
+
+/// Set the wallet's new balance: a corporation's if there is one, else a
+/// character's.
+fn add_balance(tx: &mut Tx<'_>, owner: i64, balance: f64) -> Result<(), StoreError> {
+    for table in ["corporation", "character_"] {
+        if let Some(row) = tx.table(table).get_id(owner).map(|r| r.id) {
+            return tx.update(table, row, &[("balance", store::Value::Float(balance))]);
+        }
     }
     Ok(())
 }
 
-
-
-
-fn text_id(v: Option<String>) -> Value {
-    match v.as_deref().and_then(parse_i64) {
+fn text_id(v: Option<&str>) -> Value {
+    match v.and_then(parse_i64) {
         Some(i) => Value::Int(i),
         None => Value::None,
     }

@@ -33,8 +33,8 @@ use crate::world::{Notification, Presence, Push, World};
 /// State shared by every connection.
 pub struct Server {
     pub table: StringTable,
-    pub db: crate::db::Shared,
-    pub db_url: String,
+    /// The live data.
+    pub store: Arc<crate::store::Store>,
     pub node_id: i64,
     pub bulk: BulkData,
     pub dogma: crate::dogma::Catalog,
@@ -55,10 +55,8 @@ pub enum ConnError {
     Proto(#[from] ProtoError),
     #[error(transparent)]
     Marshal(#[from] eve_marshal::Error),
-    #[error("database: {0}")]
-    Db(#[from] tokio_postgres::Error),
-    #[error("database recovery: {0}")]
-    DbRecovery(#[from] crate::db::AcquireError),
+    #[error("store: {0}")]
+    Db(#[from] crate::store::StoreError),
     #[error("{0}")]
     Protocol(String),
     /// We sent the client a close reason and are hanging up.
@@ -72,9 +70,6 @@ pub struct Conn {
     stream: TcpStream,
     reader: FrameReader,
     server: Arc<Server>,
-    /// Pinned for a complete handshake, RPC, or forced move. Never replaced
-    /// underneath an in-flight operation, including one awaiting COMMIT.
-    db: Arc<tokio_postgres::Client>,
     peer: SocketAddr,
     span: Span,
     client_id: i64,
@@ -100,7 +95,6 @@ impl Conn {
         Conn {
             stream,
             reader: FrameReader::new(),
-            db: server.db.snapshot(),
             server,
             peer,
             span,
@@ -154,12 +148,6 @@ impl Conn {
                     continue;
                 }
                 _ = docking_tick.tick(), if docking => {
-                    // An approach is not a dispatched transaction. Keep it
-                    // pending while the database is unavailable.
-                    if let Err(error)=self.refresh_database().await {
-                        warn!("docking database unavailable: {error}");
-                        continue;
-                    }
                     self.poll_docking().await?;
                     continue;
                 }
@@ -207,23 +195,18 @@ impl Conn {
         // Trades end when a trader goes.
         if let Some(char_id) = self.session.char_id {
             let server = Arc::clone(&self.server);
-            tokio::spawn(async move { crate::svc::pvptrade::left_station(&server.db_url, &server.world, char_id).await });
+            tokio::spawn(async move { crate::svc::pvptrade::left_station(&server.store, &server.world, char_id).await });
         }
         let channels=world.disconnect(self.client_id);
         let who=chat::who(&self.session);
         for (channel,members) in channels {chat::announce(&world,&members,&channel,"LeaveChannel",&who,Vec::new());}
         owned.into_iter().map(|(id,_)|id).collect::<Vec<_>>()
         };
-        // Until the marker commits, reconnect can reclaim the authoritative
-        // live hull. Afterwards it waits for the exact final snapshot. The
-        // heartbeat keeps either obligation if this connection task is lost.
+        // A hull free to go leaves space with its final snapshot saved. One
+        // kept live (an active cycle) can be reclaimed by a reconnect. The
+        // heartbeat keeps the obligation if this connection task is lost.
         for id in retained {
-            let saved:std::result::Result<(),tokio_postgres::Error> = async {
-                let mut db = crate::db::connect(&self.server.db_url).await?;
-                logout::retry_one(&self.server.world,&mut db,id).await?;
-                logout::retry_one(&self.server.world,&mut db,id).await
-            }.await;
-            if let Err(e) = saved { error!("saving disconnected ship {id}: {}",crate::logging::chain(&e)); }
+            if let Err(e) = logout::retry_one(&self.server.world,&self.server.store,id).await { error!("saving disconnected ship {id}: {}",crate::logging::chain(&e)); }
         }
     }
 
@@ -277,10 +260,6 @@ impl Conn {
 
     async fn handle_call(&mut self, req: &MachoPacket, call: &Call) -> Result {
         let started = Instant::now();
-        if let Err(error)=self.refresh_database().await {
-            warn!("request database unavailable: {error}");
-            return self.send_error(req,custom_error("The database is temporarily unavailable. Please try again shortly.")).await;
-        }
         let arg = |i: usize| call.arg_id(i);
         if call.service == "authentication" && call.method == "SetLanguageID" {
             return self.set_language_id(req, call).await;
@@ -291,7 +270,7 @@ impl Conn {
             let args=wallet_bind.as_ref().map(|(_,args)|args.as_slice()).unwrap_or(&call.args);
             if args.len()!=1 {return self.send_error(req,custom_error("Select one wallet division.")).await;}
             let key=args[0].as_i64().and_then(|key|i32::try_from(key).ok()).unwrap_or(0);
-            if let Err(why)=crate::svc::wallet::select_account(&self.db,&mut self.session,key).await {
+            if let Err(why)=crate::svc::wallet::select_account(&self.server.store,&mut self.session,key).await {
                 return self.send_error(req,custom_error(&why)).await;
             }
             self.send_session_change_from(&before).await?;
@@ -306,7 +285,7 @@ impl Conn {
                 || logout::blocked_character_in_memory(&self.server.world,pilot) {
                 return self.send_error(req,custom_error("Your ship's destruction is being recovered. Please try again shortly.")).await;
             }
-            match crate::losses::pending::blocked_character(&*self.db,pilot).await {
+            match self.server.store.read(|db|crate::losses::pending::blocked_character(db,pilot)) {
                 Ok(false)=>{},
                 Ok(true)=>return self.send_error(req,custom_error("Your station arrival is still being recovered. Reconnect after recovery completes.")).await,
                 Err(error)=>{
@@ -485,18 +464,12 @@ impl Conn {
 
     // ---- helpers -----------------------------------------------------------
 
-    async fn refresh_database(&mut self)->Result {
-        self.db=self.server.db.lease().await?;
-        Ok(())
-    }
-
     fn ctx(&self) -> Ctx<'_> {
         Ctx {
             bulk: &self.server.bulk,
             dogma: &self.server.dogma,
             session: &self.session,
-            db: &self.db,
-            db_url: &self.server.db_url,
+            store: &self.server.store,
             node_id: self.server.node_id,
             world: &self.server.world,
             client_id: self.client_id,
@@ -524,7 +497,7 @@ impl Conn {
         if before.char_id != self.session.char_id || before.solar_system_id2 != self.session.solar_system_id2 {
             if let (Some(character),Some(system)) = (self.session.char_id,self.session.solar_system_id2) {
                 let arrived = before.char_id == self.session.char_id && before.solar_system_id2.is_some();
-                if let Err(e) = crate::svc::map::record_visit(&self.db,character,system,arrived).await {
+                if let Err(e) = crate::svc::map::record_visit(&self.server.store,character,system,arrived).await {
                     warn!("recording system visit: {}",crate::logging::chain(&e));
                 }
             }

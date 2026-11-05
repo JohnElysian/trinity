@@ -1,122 +1,123 @@
 //! Corporation jump arrays. Wire shapes come from moonmining.py and
 //! menusvc.dis::JumpPortalBridgeMenu/BridgePortals/JumpThroughPortal.
-use super::{
-    jumps,
-    rows::{float, int},
-};
+use super::jumps;
 use crate::{
     ballpark::Vec3,
     services::{Ctx, Outcome},
     session::CORP_ROLE_DIRECTOR,
+    store::{self, Db, StoreError, Tx},
 };
 use eve_marshal::Value;
-use tokio_postgres::{Client, GenericClient};
 
-const GROUP_ARRAY: i32 = 707;
+const GROUP_ARRAY: i64 = 707;
 const STARBASE_CONFIG: i64 = 1 << 53;
 
-pub async fn ensure(db: &Client) -> Result<(), tokio_postgres::Error> {
-    db.batch_execute(
-        r#"CREATE TABLE IF NOT EXISTS "jumpBridgeLinks" (
-        "sourceID" integer PRIMARY KEY REFERENCES entity("itemID") ON DELETE CASCADE,
-        "destinationID" integer UNIQUE NOT NULL REFERENCES entity("itemID") ON DELETE CASCADE,
-        CHECK ("sourceID" <> "destinationID"))"#,
-    )
-    .await
+/// The links are kept in `jumpBridgeLinks`, which the store's schema defines.
+pub fn ensure(_tx: &mut Tx<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// A type's value of one attribute in dgmTypeAttribs, which keeps its
+/// values as text (every one of them a number, as `value::float8` read it).
+fn type_attrib(type_id: i64, attribute: i64) -> Option<f64> {
+    crate::sde::table("dgmTypeAttribs")
+        .find("typeID", type_id)
+        .find(|r| r.int("attributeID") == Some(attribute))
+        .and_then(|r| r.text("value")?.trim().parse().ok())
+}
+
+/// The corporation's structures of `types` that are starbase structures in a
+/// solar system, by system and then item.
+fn structures<'d>(db: &'d Db, corp: i64, types: &[i32]) -> Vec<store::Row<'d>> {
+    let mut rows: Vec<store::Row<'d>> = db
+        .table("entity")
+        .find(&["ownerID"], &[store::Value::Int(corp)])
+        .filter(|e| e.int("typeID").is_some_and(|t| types.contains(&(t as i32))))
+        .filter(|e| e.int("itemID").is_some_and(|id| db.table("posStructures").get_id(id).is_some()))
+        .filter(|e| e.int("locationID").is_some_and(|s| db.table("mapSolarSystems").get_id(s).is_some()))
+        .collect();
+    rows.sort_by_key(|e| (e.int("locationID"), e.int("itemID")));
+    rows
 }
 
 pub async fn towers(ctx: &Ctx<'_>) -> Value {
     let Some(corp) = ctx.session.corp_id else {
         return Value::List(Vec::new());
     };
-    let rows = ctx
-        .query(
-            r#"SELECT e."typeID", e."itemID", e."locationID" FROM entity e
-        JOIN "invTypes" t ON t."typeID" = e."typeID"
-        JOIN "posStructures" p ON p."itemID" = e."itemID"
-        JOIN "mapSolarSystems" s ON s."solarSystemID" = e."locationID"
-        WHERE e."ownerID" = $1 AND t."groupID" = 365 ORDER BY e."locationID",e."itemID""#,
-            &[&(corp as i32)],
+    ctx.store.read(|db| {
+        Value::List(
+            structures(db, corp, crate::sde::get().types_in_group(365))
+                .iter()
+                .map(|row| Value::Tuple(row.line(&["typeID", "itemID", "locationID"])))
+                .collect(),
         )
-        .await;
-    Value::List(
-        rows.iter()
-            .map(|row| Value::Tuple(super::rows::line(row)))
-            .collect(),
-    )
+    })
 }
 
-async fn arrays(
-    db: &impl GenericClient,
-    corp: i64,
-) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    db.query(
-        r#"SELECT e."locationID",e."itemID", remote."locationID",remote."itemID",remote."typeID"
-        FROM entity e JOIN "invTypes" t ON t."typeID"=e."typeID"
-        JOIN "posStructures" p ON p."itemID"=e."itemID"
-        JOIN "mapSolarSystems" s ON s."solarSystemID"=e."locationID"
-        LEFT JOIN "jumpBridgeLinks" link ON link."sourceID"=e."itemID"
-        LEFT JOIN entity remote ON remote."itemID"=link."destinationID"
-        WHERE e."ownerID"=$1 AND t."groupID"=$2 ORDER BY e."locationID",e."itemID""#,
-        &[&(corp as i32), &GROUP_ARRAY],
-    )
-    .await
+/// A jump array: its system, its ID, and the (system, ID, type) of the
+/// array it is linked to.
+struct Array {
+    system: i64,
+    id: i64,
+    link: Option<(i64, i64, i64)>,
+}
+
+fn arrays(db: &Db, corp: i64) -> Vec<Array> {
+    structures(db, corp, crate::sde::get().types_in_group(GROUP_ARRAY))
+        .iter()
+        .map(|e| {
+            let id = e.int("itemID").unwrap_or(0);
+            let link = db
+                .table("jumpBridgeLinks")
+                .get_id(id)
+                .and_then(|l| db.table("entity").get_id(l.int("destinationID")?))
+                .and_then(|remote| Some((remote.int("locationID")?, remote.int("itemID")?, remote.int("typeID")?)));
+            Array { system: e.int("locationID").unwrap_or(0), id, link }
+        })
+        .collect()
 }
 
 pub async fn list(ctx: &Ctx<'_>) -> Value {
     let Some(corp) = ctx.session.corp_id else {
         return Value::List(Vec::new());
     };
-    match arrays(ctx.db, corp).await {
-        Ok(rows) => Value::List(
-            rows.iter()
-                .map(|row| {
-                    let link = match (int(row, 2), int(row, 3), int(row, 4)) {
-                        (Some(system), Some(structure), Some(type_id)) => vec![(
-                            Value::Int(int(row, 1).unwrap()),
-                            Value::Tuple(vec![
-                                Value::Int(system),
-                                Value::Int(structure),
-                                Value::Int(type_id),
-                            ]),
-                        )],
-                        _ => Vec::new(),
-                    };
-                    Value::Tuple(vec![Value::Int(int(row, 0).unwrap()), Value::Dict(link)])
-                })
-                .collect(),
-        ),
-        Err(error) => {
-            tracing::error!("jump array listing: {}", crate::logging::chain(&error));
-            Value::List(Vec::new())
-        }
-    }
+    let arrays = ctx.store.read(|db| arrays(db, corp));
+    Value::List(
+        arrays
+            .iter()
+            .map(|array| {
+                let link = match array.link {
+                    Some((system, structure, type_id)) => vec![(
+                        Value::Int(array.id),
+                        Value::Tuple(vec![
+                            Value::Int(system),
+                            Value::Int(structure),
+                            Value::Int(type_id),
+                        ]),
+                    )],
+                    None => Vec::new(),
+                };
+                Value::Tuple(vec![Value::Int(array.system), Value::Dict(link)])
+            })
+            .collect(),
+    )
 }
 
 pub async fn linkable(ctx: &Ctx<'_>) -> Value {
     let Some(corp) = ctx.session.corp_id else {
         return Value::List(Vec::new());
     };
-    match arrays(ctx.db, corp).await {
-        Ok(rows) => Value::List(
-            rows.iter()
-                .filter(|row| int(row, 3).is_none())
-                .map(|row| {
-                    Value::Tuple(vec![
-                        Value::Int(int(row, 0).unwrap()),
-                        Value::Int(int(row, 1).unwrap()),
-                    ])
-                })
-                .collect(),
-        ),
-        Err(error) => {
-            tracing::error!("linkable jump arrays: {}", crate::logging::chain(&error));
-            Value::List(Vec::new())
-        }
-    }
+    let arrays = ctx.store.read(|db| arrays(db, corp));
+    Value::List(
+        arrays
+            .iter()
+            .filter(|array| array.link.is_none())
+            .map(|array| Value::Tuple(vec![Value::Int(array.system), Value::Int(array.id)]))
+            .collect(),
+    )
 }
 
-fn may_configure(ctx: &Ctx<'_>) -> Result<(i32, i32), String> {
+fn may_configure(ctx: &Ctx<'_>) -> Result<(i64, i64), String> {
     if !ctx.session.has_corp_role(CORP_ROLE_DIRECTOR) && !ctx.session.has_corp_role(STARBASE_CONFIG)
     {
         return Err("You need the Starbase Configuration role.".into());
@@ -126,7 +127,23 @@ fn may_configure(ctx: &Ctx<'_>) -> Result<(i32, i32), String> {
         .session
         .solar_system_id
         .ok_or("You must be in space to configure a jump bridge.")?;
-    Ok((corp as i32, system as i32))
+    Ok((corp, system))
+}
+
+/// Why a bridge change was refused, inside its store write: what the pilot
+/// is told.
+struct Refused(String);
+
+impl From<StoreError> for Refused {
+    fn from(error: StoreError) -> Self {
+        Refused(db_error(error))
+    }
+}
+
+impl From<&str> for Refused {
+    fn from(reason: &str) -> Self {
+        Refused(reason.into())
+    }
 }
 
 pub async fn install(ctx: &Ctx<'_>, local: i64, remote_system: i64, remote: i64) -> Outcome {
@@ -147,77 +164,81 @@ async fn install_inner(
     remote: i64,
 ) -> Result<(), String> {
     let (corp, system) = may_configure(ctx)?;
-    if local == remote || i64::from(system) == remote_system {
+    if local == remote || system == remote_system {
         return Err("A jump bridge must connect different systems.".into());
     }
-    let mut db = crate::db::connect(ctx.db_url).await.map_err(db_error)?;
-    let tx = db.transaction().await.map_err(db_error)?;
-    let rows = tx
-        .query(
-            r#"SELECT e."itemID",e."ownerID",e."locationID",p.state,
-            COALESCE(range.value::float8,0) FROM entity e
-        JOIN "invTypes" t ON t."typeID"=e."typeID" JOIN "posStructures" p ON p."itemID"=e."itemID"
-        LEFT JOIN "dgmTypeAttribs" range ON range."typeID"=e."typeID" AND range."attributeID"=867
-        WHERE e."itemID"=ANY($1) AND t."groupID"=707 ORDER BY e."itemID" FOR UPDATE OF p"#,
-            &[&vec![local as i32, remote as i32]],
-        )
-        .await
-        .map_err(db_error)?;
-    let a = rows
-        .iter()
-        .find(|row| int(row, 0) == Some(local))
-        .ok_or("The local jump array does not exist.")?;
-    let b = rows
-        .iter()
-        .find(|row| int(row, 0) == Some(remote))
-        .ok_or("The destination jump array does not exist.")?;
-    if int(a, 1) != Some(i64::from(corp)) || int(b, 1) != Some(i64::from(corp)) {
-        return Err("Both jump arrays must belong to your corporation.".into());
-    }
-    if int(a, 2) != Some(i64::from(system)) || int(b, 2) != Some(remote_system) {
-        return Err("Those jump arrays are not in the specified systems.".into());
-    }
-    if [a, b]
-        .iter()
-        .any(|row| !matches!(int(row, 3), Some(1 | 4 | 5)))
-    {
-        return Err("Both jump arrays must be anchored before linking them.".into());
-    }
-    let distance = jumps::light_years(ctx, i64::from(system), remote_system)
-        .await
-        .ok_or("Those systems could not be found.")?;
-    if distance > float(a, 4).unwrap_or(0.0).min(float(b, 4).unwrap_or(0.0)) {
-        return Err("The destination is beyond the jump arrays' range.".into());
-    }
-    let linked=tx.query_one(r#"SELECT count(*) FROM "jumpBridgeLinks" WHERE "sourceID"=ANY($1) OR "destinationID"=ANY($1)"#,
-        &[&vec![local as i32,remote as i32]]).await.map_err(db_error)?.get::<_,i64>(0);
-    if linked != 0 {
-        return Err("Unlink the existing bridge before making another link.".into());
-    }
-    tx.execute(
-        r#"INSERT INTO "jumpBridgeLinks" ("sourceID","destinationID") VALUES ($1,$2),($2,$1)"#,
-        &[&(local as i32), &(remote as i32)],
-    )
-    .await
-    .map_err(db_error)?;
-    tx.commit().await.map_err(db_error)
+    // Read before the write (it reads the store itself); only refused, if
+    // the systems are not found, where the checks below come to it.
+    let distance = jumps::light_years(ctx, system, remote_system).await;
+    ctx.store
+        .write(|tx| -> Result<(), Refused> {
+            let db = tx.db();
+            let types = crate::sde::get().types_in_group(GROUP_ARRAY);
+            // (owner, system, state, type) of an array.
+            let array = |id: i64| {
+                let e = db.table("entity").get_id(id).filter(|e| e.int("typeID").is_some_and(|t| types.contains(&(t as i32))))?;
+                let p = db.table("posStructures").get_id(id)?;
+                Some((e.int("ownerID"), e.int("locationID"), p.int("state"), e.int("typeID")))
+            };
+            let a = array(local).ok_or("The local jump array does not exist.")?;
+            let b = array(remote).ok_or("The destination jump array does not exist.")?;
+            if a.0 != Some(corp) || b.0 != Some(corp) {
+                return Err("Both jump arrays must belong to your corporation.".into());
+            }
+            if a.1 != Some(system) || b.1 != Some(remote_system) {
+                return Err("Those jump arrays are not in the specified systems.".into());
+            }
+            if [a, b].iter().any(|row| !matches!(row.2, Some(1 | 4 | 5))) {
+                return Err("Both jump arrays must be anchored before linking them.".into());
+            }
+            let distance = distance.ok_or("Those systems could not be found.")?;
+            let range = |row: &(Option<i64>, Option<i64>, Option<i64>, Option<i64>)| row.3.and_then(|t| type_attrib(t, 867)).unwrap_or(0.0);
+            if distance > range(&a).min(range(&b)) {
+                return Err("The destination is beyond the jump arrays' range.".into());
+            }
+            let links = db.table("jumpBridgeLinks");
+            let linked = [local, remote].iter().any(|id| {
+                links.get_id(*id).is_some() || links.find_one(&["destinationID"], &[store::Value::Int(*id)]).is_some()
+            });
+            if linked {
+                return Err("Unlink the existing bridge before making another link.".into());
+            }
+            for (from, to) in [(local, remote), (remote, local)] {
+                tx.insert(
+                    "jumpBridgeLinks",
+                    &[("sourceID", store::Value::Int(from)), ("destinationID", store::Value::Int(to))],
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|Refused(reason)| reason)
 }
 
 pub async fn uninstall(ctx: &Ctx<'_>, local: i64) -> Outcome {
-    let result:Result<i64,String>=async {
-        let (corp,system)=may_configure(ctx)?;
-        let mut db=crate::db::connect(ctx.db_url).await.map_err(db_error)?;
-        let tx=db.transaction().await.map_err(db_error)?;
-        let local_row=tx.query_opt(r#"SELECT e."itemID" FROM entity e JOIN "posStructures" p ON p."itemID"=e."itemID"
-            WHERE e."itemID"=$1 AND e."ownerID"=$2 AND e."locationID"=$3 FOR UPDATE OF p"#,
-            &[&(local as i32),&corp,&system]).await.map_err(db_error)?;
-        if local_row.is_none() { return Err("That is not your corporation's local jump array.".into()); }
-        let peers=tx.query(r#"DELETE FROM "jumpBridgeLinks" WHERE "sourceID"=$1 OR "destinationID"=$1 RETURNING "destinationID""#,
-            &[&(local as i32)]).await.map_err(db_error)?;
-        let remote=peers.iter().filter_map(|row|int(row,0)).find(|id|*id!=local).unwrap_or(0);
-        tx.commit().await.map_err(db_error)?;
-        Ok(remote)
-    }.await;
+    let result: Result<i64, String> = may_configure(ctx).and_then(|(corp, system)| {
+        ctx.store
+            .write(|tx| -> Result<i64, Refused> {
+                let db = tx.db();
+                let local_row = db
+                    .table("entity")
+                    .get_id(local)
+                    .filter(|e| e.int("ownerID") == Some(corp) && e.int("locationID") == Some(system))
+                    .filter(|_| db.table("posStructures").get_id(local).is_some());
+                if local_row.is_none() {
+                    return Err("That is not your corporation's local jump array.".into());
+                }
+                let links = db.table("jumpBridgeLinks");
+                let mut ids: Vec<store::RowId> = links.get_id(local).map(|l| l.id).into_iter().collect();
+                ids.extend(links.find(&["destinationID"], &[store::Value::Int(local)]).map(|l| l.id));
+                ids.dedup();
+                let peers: Vec<i64> = ids.iter().filter_map(|id| links.row(*id)?.int("destinationID")).collect();
+                for id in ids {
+                    tx.delete("jumpBridgeLinks", id)?;
+                }
+                Ok(peers.into_iter().find(|id| *id != local).unwrap_or(0))
+            })
+            .map_err(|Refused(reason)| reason)
+    });
     match result {
         Ok(remote) => {
             refresh(ctx, local, remote).await;
@@ -228,23 +249,27 @@ pub async fn uninstall(ctx: &Ctx<'_>, local: i64) -> Outcome {
 }
 
 async fn refresh(ctx: &Ctx<'_>, local: i64, remote: i64) {
-    let rows = ctx
-        .query(
-            r#"SELECT e."itemID",e."locationID",other."itemID",other."locationID",other."typeID"
-        FROM entity e LEFT JOIN "jumpBridgeLinks" l ON l."sourceID"=e."itemID"
-        LEFT JOIN entity other ON other."itemID"=l."destinationID" WHERE e."itemID"=ANY($1)"#,
-            &[&vec![local as i32, remote as i32]],
-        )
-        .await;
+    // Each structure's (ID, system) and the (ID, system, type) it links to.
+    let rows: Vec<((i64, i64), Option<(i64, i64, i64)>)> = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        let ids = if local == remote { vec![local] } else { vec![local, remote] };
+        ids.into_iter()
+            .filter_map(|id| {
+                let e = entity.get_id(id)?;
+                let other = db
+                    .table("jumpBridgeLinks")
+                    .get_id(id)
+                    .and_then(|l| entity.get_id(l.int("destinationID")?))
+                    .and_then(|o| Some((o.int("itemID")?, o.int("locationID")?, o.int("typeID")?)));
+                Some(((e.int("itemID")?, e.int("locationID")?), other))
+            })
+            .collect()
+    });
     let mut world = ctx.world.lock();
-    for row in rows {
-        let (id, system) = (int(&row, 0).unwrap(), int(&row, 1).unwrap());
+    for ((id, system), other) in rows {
         let entry = world.parks.get_mut(&system).and_then(|park| {
             let structure = park.structures.get_mut(&id)?;
-            structure.bridge = match (int(&row, 2), int(&row, 3), int(&row, 4)) {
-                (Some(id), Some(system), Some(type_id)) => Some((id, system, type_id)),
-                _ => None,
-            };
+            structure.bridge = other;
             Some(crate::pos::slim_change(park.tick, structure))
         });
         if let Some(entry) = entry {
@@ -253,7 +278,7 @@ async fn refresh(ctx: &Ctx<'_>, local: i64, remote: i64) {
     }
 }
 
-fn db_error(error: tokio_postgres::Error) -> String {
+fn db_error(error: StoreError) -> String {
     tracing::error!("jump bridge: {}", crate::logging::chain(&error));
     "The jump bridge operation could not be completed.".into()
 }
@@ -287,35 +312,26 @@ pub async fn prepare(ctx: &Ctx<'_>, local: i64, remote: i64, to: i64) -> Result<
         }
         ship.stats.mass
     };
-    let row=ctx.db.query_opt(r#"SELECT b.x,b.y,b.z,b."typeID",p.state,q.state
-        FROM "jumpBridgeLinks" link JOIN entity a ON a."itemID"=link."sourceID"
-        JOIN entity b ON b."itemID"=link."destinationID"
-        JOIN "posStructures" p ON p."itemID"=a."itemID" JOIN "posStructures" q ON q."itemID"=b."itemID"
-        WHERE a."itemID"=$1 AND b."itemID"=$2 AND a."locationID"=$3 AND b."locationID"=$4"#,&[&(local as i32),&(remote as i32),&(system as i32),&(to as i32)]).await.map_err(db_error)?
-        .ok_or("That jump bridge link no longer exists.")?;
-    if !matches!(int(&row, 4), Some(4 | 5)) || !matches!(int(&row, 5), Some(4 | 5)) {
+    // The far array's position and type, and both arrays' states.
+    let link = ctx.store.read(|db| {
+        let entity = db.table("entity");
+        let structures = db.table("posStructures");
+        db.table("jumpBridgeLinks").get_id(local).filter(|l| l.int("destinationID") == Some(remote))?;
+        entity.get_id(local).filter(|a| a.int("locationID") == Some(system))?;
+        let b = entity.get_id(remote).filter(|b| b.int("locationID") == Some(to))?;
+        let (p, q) = (structures.get_id(local)?, structures.get_id(remote)?);
+        Some((
+            Vec3::new(b.float("x").unwrap_or(0.0), b.float("y").unwrap_or(0.0), b.float("z").unwrap_or(0.0)),
+            b.int("typeID").unwrap_or(0),
+            p.int("state"),
+            q.int("state"),
+        ))
+    });
+    let (destination, array_type, near, far) = link.ok_or("That jump bridge link no longer exists.")?;
+    if !matches!(near, Some(4 | 5)) || !matches!(far, Some(4 | 5)) {
         return Err("Both jump arrays must be online.".into());
     }
-    let destination = Vec3::new(
-        float(&row, 0).unwrap(),
-        float(&row, 1).unwrap(),
-        float(&row, 2).unwrap(),
-    );
-    let attributes = ctx.db
-        .query(
-            r#"SELECT "attributeID",value::float8 FROM "dgmTypeAttribs"
-        WHERE "typeID"=$1 AND "attributeID" IN (866,868,1001)"#,
-            &[&(int(&row, 3).unwrap() as i32)],
-        )
-        .await
-        .map_err(db_error)?;
-    let attr = |id: i64| {
-        attributes
-            .iter()
-            .find(|row| int(row, 0) == Some(id))
-            .and_then(|row| float(row, 1))
-            .unwrap_or(0.0)
-    };
+    let attr = |id: i64| type_attrib(array_type, id).unwrap_or(0.0);
     let fuel = attr(866) as i32;
     let distance = jumps::light_years(ctx, system, to)
         .await
@@ -338,7 +354,6 @@ mod tests {
     use crate::ballpark::{Park, Pilot, Ship, ShipStats};
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
     async fn bridge_links_survive_reload_and_validate_endpoint_and_fuel() {
         let database = crate::test_support::Database::load().await;
         let corp = database.id().await;
@@ -347,26 +362,19 @@ mod tests {
         let remote = database.id().await;
         let fuel = database.id().await;
         let ship_id = database.id().await;
-        for (id, location) in [(local, 30000142), (remote, 30000143)] {
-            database.db.execute(r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity,singleton)
-                VALUES ($1,27897,$2,$3,1,1)"#, &[&id,&corp,&location]).await.unwrap();
-            database
-                .db
-                .execute(
-                    r#"INSERT INTO "posStructures" ("itemID",state) VALUES ($1,4)"#,
-                    &[&id],
-                )
-                .await
-                .unwrap();
-        }
+        let int = |v: i32| store::Value::Int(i64::from(v));
         database
-            .db
-            .execute(
-                r#"INSERT INTO entity ("itemID","typeID","ownerID","locationID",quantity)
-            VALUES ($1,16273,$2,$3,10)"#,
-                &[&fuel, &corp, &local],
-            )
-            .await
+            .store
+            .write(|tx| {
+                for (id, location) in [(local, 30000142), (remote, 30000143)] {
+                    tx.insert(
+                        "entity",
+                        &[("itemID", int(id)), ("typeID", int(27897)), ("ownerID", int(corp)), ("locationID", int(location)), ("quantity", int(1)), ("singleton", int(1))],
+                    )?;
+                    tx.insert("posStructures", &[("itemID", int(id)), ("state", int(4))])?;
+                }
+                tx.insert("entity", &[("itemID", int(fuel)), ("typeID", int(16273)), ("ownerID", int(corp)), ("locationID", int(local)), ("quantity", int(10))])
+            })
             .unwrap();
         let mut session = crate::session::Session {
             char_id: Some(i64::from(owner)),
@@ -402,7 +410,7 @@ mod tests {
             |value| matches!(&value.seq().unwrap()[1],Value::Dict(entries) if entries.len()==1)
         ));
         assert_eq!(linkable(&ctx).await, Value::List(Vec::new()));
-        let loaded = crate::pos::load(&database.db, 30000142).await.unwrap();
+        let loaded = database.store.read(|db| crate::pos::load(db, 30000142)).unwrap();
         let structure = loaded
             .into_iter()
             .find(|structure| structure.id == i64::from(local))
@@ -438,31 +446,19 @@ mod tests {
         assert_eq!(quote.fuel.quantity,1);
         assert_eq!(quote.fuel.cargo,i64::from(local));
         assert_eq!(quote.fuel.flag,None);
-        let left = database
-            .db
-            .query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#, &[&fuel])
-            .await
-            .unwrap()
-            .get::<_, i32>(0);
-        assert_eq!(left, 10,"preparation never pays before arrival");
+        let left = || database.store.read(|db| db.table("entity").get_id(i64::from(fuel)).and_then(|e| e.int("quantity")));
+        assert_eq!(left(), Some(10),"preparation never pays before arrival");
         database
-            .db
-            .execute(
-                r#"UPDATE "posStructures" SET state=1 WHERE "itemID"=$1"#,
-                &[&remote],
-            )
-            .await
+            .store
+            .write(|tx| {
+                let row = tx.table("posStructures").get_id(i64::from(remote)).unwrap().id;
+                tx.update("posStructures", row, &[("state", int(1))])
+            })
             .unwrap();
         assert!(prepare(&ctx, i64::from(local), i64::from(remote), 30000143)
             .await
             .is_err());
-        let left = database
-            .db
-            .query_one(r#"SELECT quantity FROM entity WHERE "itemID"=$1"#, &[&fuel])
-            .await
-            .unwrap()
-            .get::<_, i32>(0);
-        assert_eq!(left, 10, "failed jumps do not consume fuel");
+        assert_eq!(left(), Some(10), "failed jumps do not consume fuel");
         assert!(matches!(
             uninstall(&ctx, i64::from(local)).await,
             Outcome::Value(Value::None)

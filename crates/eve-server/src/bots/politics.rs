@@ -21,13 +21,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tokio_postgres::Client;
 use tracing::info;
 
 use super::behaviour::{self, Atlas, Bot, Role};
 use super::presence::Identity;
 use crate::combat::Rng;
-use crate::svc::rows::{int, text};
+use crate::store::{RowId, Store, StoreError, Tx, Value};
 
 const KIND_INDUSTRIAL_CORP: i16 = 1;
 const KIND_COMBAT_CORP: i16 = 2;
@@ -177,53 +176,88 @@ fn filetime_now() -> i64 {
 }
 
 /// What the database holds of bot politics, if it has been formed.
-pub async fn load(db: &Client, atlas: &Atlas, clock: u32, speed: f64) -> Result<Politics, tokio_postgres::Error> {
+pub async fn load(store: &Store, atlas: &Atlas, clock: u32, speed: f64) -> Result<Politics, StoreError> {
     let mut p = Politics::new(atlas);
     p.speed = speed;
-    let sql = r#"SELECT g."ownerID", g."kind", g."regionID", co."allianceID", co."memberCount"
-                   FROM "botGroups" g LEFT JOIN "corporation" co ON co."corporationID" = g."ownerID""#;
-    for r in db.query(sql, &[]).await? {
-        let (id, kind) = (int(&r, 0).unwrap_or(0) as i32, int(&r, 1).unwrap_or(0) as i16);
-        if kind >= KIND_NULL_ALLIANCE {
-            p.alliances.insert(id, Alliance { kind, region: int(&r, 2).map(|v| v as i32) });
-        } else {
-            let alliance = int(&r, 3).map(|v| v as i32).filter(|v| *v != 0);
-            p.corps.insert(id, Corp { kind, alliance, members: int(&r, 4).unwrap_or(0) as u32 });
-        }
-    }
-    let sql = r#"SELECT w."warID", w."declaredByID", w."againstID", COALESCE(w."timeFinished", 0)
-                   FROM "crpWars" w JOIN "botGroups" g ON g."ownerID" = w."declaredByID"
-                  WHERE w."retracted" IS NULL"#;
     let now = filetime_now();
-    for r in db.query(sql, &[]).await? {
-        let left = ((int(&r, 3).unwrap_or(now) - now) as f64 / SECOND_FT as f64 * speed).max(0.0) as u32;
-        p.wars.push(War { id: int(&r, 0).unwrap_or(0) as i32, a: int(&r, 1).unwrap_or(0) as i32, b: int(&r, 2).unwrap_or(0) as i32, ends: clock + left, kills: 0 });
-    }
+    store.read(|db| {
+        let corps = db.table("corporation");
+        for g in db.table("botGroups").rows() {
+            let (id, kind) = (g.int("ownerID").unwrap_or(0) as i32, g.int("kind").unwrap_or(0) as i16);
+            if kind >= KIND_NULL_ALLIANCE {
+                p.alliances.insert(id, Alliance { kind, region: g.int("regionID").map(|v| v as i32) });
+            } else {
+                let co = corps.get_id(i64::from(id));
+                let alliance = co.and_then(|c| c.int("allianceID")).map(|v| v as i32).filter(|v| *v != 0);
+                p.corps.insert(id, Corp { kind, alliance, members: co.and_then(|c| c.int("memberCount")).unwrap_or(0) as u32 });
+            }
+        }
+        let groups = db.table("botGroups");
+        for w in db.table("crpWars").rows() {
+            if w.int("retracted").is_some() || !w.int("declaredByID").is_some_and(|d| groups.get_id(d).is_some()) {
+                continue;
+            }
+            let left = ((w.int("timeFinished").unwrap_or(0) - now) as f64 / SECOND_FT as f64 * speed).max(0.0) as u32;
+            let (id, a, b) = (w.int("warID").unwrap_or(0) as i32, w.int("declaredByID").unwrap_or(0) as i32, w.int("againstID").unwrap_or(0) as i32);
+            p.wars.push(War { id, a, b, ends: clock + left, kills: 0 });
+        }
+    });
     // Wars made before bot wars were dated back (see `start_wars`).
-    let sql = r#"UPDATE "crpWars" w SET "timeDeclared" = $1
-                  WHERE w."timeDeclared" > $1 AND w."retracted" IS NULL AND w."mutual" = 1
-                    AND EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = w."declaredByID")"#;
-    if db.execute(sql, &[&(now - crate::svc::war::DAY)]).await? > 0 {
-        crate::svc::war::refresh(db).await;
+    let since = now - crate::svc::war::DAY;
+    let redated = store.write(|tx| {
+        let rows: Vec<RowId> = {
+            let groups = tx.table("botGroups");
+            tx.table("crpWars")
+                .rows()
+                .filter(|w| w.int("timeDeclared").is_some_and(|t| t > since) && w.int("retracted").is_none() && w.int("mutual") == Some(1))
+                .filter(|w| w.int("declaredByID").is_some_and(|d| groups.get_id(d).is_some()))
+                .map(|w| w.id)
+                .collect()
+        };
+        for row in &rows {
+            tx.update("crpWars", *row, &[("timeDeclared", Value::Int(since))])?;
+        }
+        Ok::<_, StoreError>(rows.len())
+    })?;
+    if redated > 0 {
+        store.read(crate::svc::war::refresh);
     }
-    paint_logos(db).await?;
+    paint_logos(store).await?;
     Ok(p)
 }
 
 /// Gives bot corporations without one a logo: two or three shapes from the
 /// corporation paint shop's (graphics 415 on, 163 of them) in its colours
 /// (671 on, 15), picked from the corporation's ID so they stay the same.
-async fn paint_logos(db: &Client) -> Result<(), tokio_postgres::Error> {
-    let sql = r#"UPDATE "corporation" co SET
-                     "shape1" = 415 + (co."corporationID" % 163),
-                     "shape2" = 415 + ((co."corporationID" / 163) % 163),
-                     "shape3" = CASE WHEN co."corporationID" % 3 = 0 THEN NULL ELSE 415 + ((co."corporationID" / 26569) % 163) END,
-                     "color1" = 671 + (co."corporationID" % 15),
-                     "color2" = 671 + ((co."corporationID" / 15) % 15),
-                     "color3" = 671 + ((co."corporationID" / 225) % 15)
-                  FROM "botGroups" g
-                 WHERE g."ownerID" = co."corporationID" AND co."shape1" IS NULL"#;
-    let painted = db.execute(sql, &[]).await?;
+async fn paint_logos(store: &Store) -> Result<(), StoreError> {
+    let painted = store.write(|tx| {
+        let rows: Vec<(RowId, i64)> = {
+            let corps = tx.table("corporation");
+            tx.table("botGroups")
+                .rows()
+                .filter_map(|g| corps.get_id(g.int("ownerID")?))
+                .filter(|co| co.int("shape1").is_none())
+                .map(|co| (co.id, co.int("corporationID").unwrap_or(0)))
+                .collect()
+        };
+        for (row, id) in &rows {
+            let id = *id;
+            let shape3 = if id % 3 == 0 { Value::Null } else { Value::Int(415 + (id / 26569) % 163) };
+            tx.update(
+                "corporation",
+                *row,
+                &[
+                    ("shape1", Value::Int(415 + id % 163)),
+                    ("shape2", Value::Int(415 + (id / 163) % 163)),
+                    ("shape3", shape3),
+                    ("color1", Value::Int(671 + id % 15)),
+                    ("color2", Value::Int(671 + (id / 15) % 15)),
+                    ("color3", Value::Int(671 + (id / 225) % 15)),
+                ],
+            )?;
+        }
+        Ok::<_, StoreError>(rows.len())
+    })?;
     if painted > 0 {
         info!("bots: {painted} corporation logos drawn");
     }
@@ -337,18 +371,18 @@ fn regions_of(atlas: &Atlas, min: usize, keep: impl Fn(f32) -> bool) -> Vec<i32>
 
 /// Forms bot politics from scratch: corporations, alliances, homes, wars.
 #[allow(clippy::too_many_arguments)]
-pub async fn form(db: &mut Client, atlas: &Atlas, bots: &mut [Bot], ids: &mut [Identity], rng: &mut Rng, clock: u32, speed: f64) -> Result<Politics, tokio_postgres::Error> {
+pub async fn form(store: &Store, atlas: &Atlas, bots: &mut [Bot], ids: &mut [Identity], rng: &mut Rng, clock: u32, speed: f64) -> Result<Politics, StoreError> {
     let started = std::time::Instant::now();
     let mut names: HashSet<String> = HashSet::new();
     let mut tickers: HashSet<String> = HashSet::new();
-    for r in db.query(r#"SELECT lower("corporationName"), lower("tickerName") FROM "corporation""#, &[]).await? {
-        names.extend(text(&r, 0));
-        tickers.extend(text(&r, 1));
-    }
-    for r in db.query(r#"SELECT lower("allianceName"), lower("shortName") FROM "alliances""#, &[]).await? {
-        names.extend(text(&r, 0));
-        tickers.extend(text(&r, 1));
-    }
+    store.read(|db| {
+        for (table, name, ticker) in [("corporation", "corporationName", "tickerName"), ("alliances", "allianceName", "shortName")] {
+            for r in db.table(table).rows() {
+                names.extend(r.text(name).map(str::to_lowercase));
+                tickers.extend(r.text(ticker).map(str::to_lowercase));
+            }
+        }
+    });
 
     // Corporations, of members drawn at random.
     let mut joining: Vec<u32> = (0..bots.len() as u32).filter(|_| rng.unit() < IN_CORPS).collect();
@@ -443,150 +477,130 @@ pub async fn form(db: &mut Client, atlas: &Atlas, bots: &mut [Bot], ids: &mut [I
     }
 
     // Into the database, all at once.
-    let tx = db.transaction().await?;
-    let new_ids: Vec<i32> = tx
-        .query("SELECT nextval('dyn_id_seq')::int FROM generate_series(1, $1)", &[&((corps.len() + used.len()) as i32)])
-        .await?
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    let (corp_ids, rest_ids) = new_ids.split_at(corps.len());
-    let mut alliance_id: HashMap<usize, i32> = HashMap::new();
-    let mut used_sorted: Vec<usize> = used.iter().copied().collect();
-    used_sorted.sort_unstable();
-    for (n, a) in used_sorted.iter().enumerate() {
-        alliance_id.insert(*a, rest_ids[n]);
-    }
     let now = filetime_now();
-    // The biggest member corporation leads each alliance.
-    let mut executor: HashMap<usize, (usize, i32)> = HashMap::new();
-    for (c, corp) in corps.iter().enumerate() {
-        if let Some(a) = corp.alliance {
-            let e = executor.entry(a).or_insert((0, corp_ids[c]));
-            if corp.members.len() > e.0 {
-                *e = (corp.members.len(), corp_ids[c]);
-            }
-        }
-    }
     let homes: HashMap<u32, (i32, i32)> = moves.iter().map(|(i, h, t)| (*i, (*h, *t))).collect();
     let hq = |c: &NewCorp| {
         let ceo = c.members[0];
         homes.get(&ceo).map_or(bots[ceo as usize].home, |h| h.0)
     };
-    let (a_ids, a_names, a_tickers, a_exec, a_count): (Vec<i32>, Vec<&str>, Vec<&str>, Vec<i32>, Vec<i32>) = {
-        let mut v = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for a in &used_sorted {
-            v.0.push(alliance_id[a]);
-            v.1.push(alliances[*a].name.as_str());
-            v.2.push(alliances[*a].ticker.as_str());
-            v.3.push(executor[a].1);
-            v.4.push(corps.iter().filter(|c| c.alliance == Some(*a)).count() as i32);
+    let mut used_sorted: Vec<usize> = used.iter().copied().collect();
+    used_sorted.sort_unstable();
+    let (corp_ids, alliance_id) = store.write(|tx| -> Result<(Vec<i32>, HashMap<usize, i32>), StoreError> {
+        let mut new_ids = Vec::with_capacity(corps.len() + used.len());
+        for _ in 0..corps.len() + used.len() {
+            new_ids.push(tx.nextval("dyn_id_seq")? as i32);
         }
-        v
-    };
-    let a_ceo: Vec<i32> = used_sorted
-        .iter()
-        .map(|a| {
-            let corp = corp_ids.iter().position(|c| *c == executor[a].1).unwrap_or(0);
-            bots[corps[corp].members[0] as usize].id
-        })
-        .collect();
-    tx.execute(
-        r#"INSERT INTO "alliances" ("allianceID","allianceName","shortName","description","url","executorCorpID","creatorCorpID","creatorCharID","startDate","memberCount")
-           SELECT u.id, u.name, u.ticker, '', '', u.exec, u.exec, u.ceo, $6, u.n
-             FROM unnest($1::int[], $2::text[], $3::text[], $4::int[], $5::int[], $7::int[]) AS u(id, name, ticker, exec, ceo, n)"#,
-        &[&a_ids, &a_names, &a_tickers, &a_exec, &a_ceo, &now, &a_count],
-    )
-    .await?;
-    // alliance_shortnames follows by trigger (sync_alliance_shortnames).
-
-    let c_names: Vec<&str> = corps.iter().map(|c| c.name.as_str()).collect();
-    let c_tickers: Vec<&str> = corps.iter().map(|c| c.ticker.as_str()).collect();
-    let c_ceo: Vec<i32> = corps.iter().map(|c| bots[c.members[0] as usize].id).collect();
-    let c_station: Vec<i32> = corps.iter().map(hq).collect();
-    let c_alliance: Vec<Option<i32>> = corps.iter().map(|c| c.alliance.map(|a| alliance_id[&a])).collect();
-    let c_members: Vec<i32> = corps.iter().map(|c| c.members.len() as i32).collect();
-    let c_balance: Vec<f64> = corps.iter().map(|c| c.members.len() as f64 * 5.0e6 * rng.range(0.5, 2.0)).collect();
-    // Member counts start at nothing: joining (`join_corps`) counts them in.
-    tx.execute(
-        r#"INSERT INTO "corporation" ("corporationID","corporationName","tickerName","description","url","creatorID","ceoID","stationID",
-                                      "raceID","allianceID","memberCount","memberLimit","balance")
-           SELECT u.id, u.name, u.ticker, '', '', u.ceo, u.ceo, u.station, c."raceID", COALESCE(u.alliance, 0), 0, 5000, u.balance
-             FROM unnest($1::int[], $2::text[], $3::text[], $4::int[], $5::int[], $6::int[], $7::int[], $8::float8[])
-                  AS u(id, name, ticker, ceo, station, alliance, members, balance)
-             JOIN "character_" c ON c."characterID" = u.ceo"#,
-        &[&corp_ids, &c_names, &c_tickers, &c_ceo, &c_station, &c_alliance, &c_members, &c_balance],
-    )
-    .await?;
-    let (m_alliance, m_corp, m_exec): (Vec<i32>, Vec<i32>, Vec<i32>) = {
-        let mut v = (Vec::new(), Vec::new(), Vec::new());
+        let (corp_ids, rest_ids) = new_ids.split_at(corps.len());
+        let mut alliance_id: HashMap<usize, i32> = HashMap::new();
+        for (n, a) in used_sorted.iter().enumerate() {
+            alliance_id.insert(*a, rest_ids[n]);
+        }
+        // The biggest member corporation leads each alliance.
+        let mut executor: HashMap<usize, (usize, i32)> = HashMap::new();
         for (c, corp) in corps.iter().enumerate() {
             if let Some(a) = corp.alliance {
-                v.0.push(alliance_id[&a]);
-                v.1.push(corp_ids[c]);
-                v.2.push(executor[&a].1);
+                let e = executor.entry(a).or_insert((0, corp_ids[c]));
+                if corp.members.len() > e.0 {
+                    *e = (corp.members.len(), corp_ids[c]);
+                }
             }
-        }
-        v
-    };
-    tx.execute(
-        r#"INSERT INTO "allianceMembers" ("allianceID","corporationID","chosenExecutorID","startDate")
-           SELECT u.a, u.c, u.e, $4 FROM unnest($1::int[], $2::int[], $3::int[]) AS u(a, c, e)"#,
-        &[&m_alliance, &m_corp, &m_exec, &now],
-    )
-    .await?;
-
-    // The members leave their NPC corporations for the new ones.
-    let (who, into): (Vec<i32>, Vec<i32>) = {
-        let mut v = (Vec::new(), Vec::new());
-        for (c, corp) in corps.iter().enumerate() {
-            for &i in &corp.members {
-                v.0.push(bots[i as usize].id);
-                v.1.push(corp_ids[c]);
-            }
-        }
-        v
-    };
-    join_corps(&tx, &who, &into, now).await?;
-
-    let (g_id, g_kind, g_region): (Vec<i32>, Vec<i16>, Vec<Option<i32>>) = {
-        let mut v = (Vec::new(), Vec::new(), Vec::new());
-        for (c, corp) in corps.iter().enumerate() {
-            v.0.push(corp_ids[c]);
-            v.1.push(corp.kind);
-            v.2.push(None);
         }
         for a in &used_sorted {
-            v.0.push(alliance_id[a]);
-            v.1.push(alliances[*a].kind);
-            v.2.push(alliances[*a].region);
+            let exec = executor[a].1;
+            let corp = corp_ids.iter().position(|c| *c == exec).unwrap_or(0);
+            let ceo = bots[corps[corp].members[0] as usize].id;
+            let members = corps.iter().filter(|c| c.alliance == Some(*a)).count();
+            // alliance_shortnames follows by trigger (sync_alliance_shortnames).
+            tx.insert(
+                "alliances",
+                &[
+                    ("allianceID", Value::Int(i64::from(alliance_id[a]))),
+                    ("allianceName", Value::Text(alliances[*a].name.as_str().into())),
+                    ("shortName", Value::Text(alliances[*a].ticker.as_str().into())),
+                    ("description", Value::Text("".into())),
+                    ("url", Value::Text("".into())),
+                    ("executorCorpID", Value::Int(i64::from(exec))),
+                    ("creatorCorpID", Value::Int(i64::from(exec))),
+                    ("creatorCharID", Value::Int(i64::from(ceo))),
+                    ("startDate", Value::Int(now)),
+                    ("memberCount", Value::Int(members as i64)),
+                ],
+            )?;
         }
-        v
-    };
-    tx.execute(
-        r#"INSERT INTO "botGroups" ("ownerID","kind","regionID") SELECT * FROM unnest($1::int[], $2::smallint[], $3::int[])"#,
-        &[&g_id, &g_kind, &g_region],
-    )
-    .await?;
 
-    let m_who: Vec<i32> = moves.iter().map(|(i, _, _)| bots[*i as usize].id).collect();
-    let m_home: Vec<i32> = moves.iter().map(|(_, h, _)| *h).collect();
-    let m_turf: Vec<i32> = moves.iter().map(|(_, _, t)| *t).collect();
-    tx.execute(
-        r#"UPDATE "bots" b SET "homeStationID" = u.home, "turf" = u.turf FROM unnest($1::int[], $2::int[], $3::int[]) AS u(id, home, turf)
-            WHERE b."characterID" = u.id"#,
-        &[&m_who, &m_home, &m_turf],
-    )
-    .await?;
-    tx.execute(
-        r#"UPDATE "character_" c SET "stationID" = s."stationID", "solarSystemID" = s."solarSystemID",
-                  "constellationID" = s."constellationID", "regionID" = s."regionID"
-             FROM unnest($1::int[], $2::int[]) AS u(id, home) JOIN "staStations" s ON s."stationID" = u.home
-            WHERE c."characterID" = u.id"#,
-        &[&m_who, &m_home],
-    )
-    .await?;
-    tx.commit().await?;
+        let balances: Vec<f64> = corps.iter().map(|c| c.members.len() as f64 * 5.0e6 * rng.range(0.5, 2.0)).collect();
+        // Member counts start at nothing: joining (`join_corps`) counts them in.
+        for (c, corp) in corps.iter().enumerate() {
+            let ceo = bots[corp.members[0] as usize].id;
+            let Some(race) = tx.table("character_").get_id(i64::from(ceo)).map(|r| r.value("raceID").clone()) else { continue };
+            tx.insert(
+                "corporation",
+                &[
+                    ("corporationID", Value::Int(i64::from(corp_ids[c]))),
+                    ("corporationName", Value::Text(corp.name.as_str().into())),
+                    ("tickerName", Value::Text(corp.ticker.as_str().into())),
+                    ("description", Value::Text("".into())),
+                    ("url", Value::Text("".into())),
+                    ("creatorID", Value::Int(i64::from(ceo))),
+                    ("ceoID", Value::Int(i64::from(ceo))),
+                    ("stationID", Value::Int(i64::from(hq(corp)))),
+                    ("raceID", race),
+                    ("allianceID", Value::Int(corp.alliance.map_or(0, |a| i64::from(alliance_id[&a])))),
+                    ("memberCount", Value::Int(0)),
+                    ("memberLimit", Value::Int(5000)),
+                    ("balance", Value::Float(balances[c])),
+                ],
+            )?;
+        }
+        for (c, corp) in corps.iter().enumerate() {
+            if let Some(a) = corp.alliance {
+                tx.insert(
+                    "allianceMembers",
+                    &[
+                        ("allianceID", Value::Int(i64::from(alliance_id[&a]))),
+                        ("corporationID", Value::Int(i64::from(corp_ids[c]))),
+                        ("chosenExecutorID", Value::Int(i64::from(executor[&a].1))),
+                        ("startDate", Value::Int(now)),
+                    ],
+                )?;
+            }
+        }
+
+        // The members leave their NPC corporations for the new ones.
+        let (who, into): (Vec<i32>, Vec<i32>) = {
+            let mut v = (Vec::new(), Vec::new());
+            for (c, corp) in corps.iter().enumerate() {
+                for &i in &corp.members {
+                    v.0.push(bots[i as usize].id);
+                    v.1.push(corp_ids[c]);
+                }
+            }
+            v
+        };
+        join_corps(tx, &who, &into, now)?;
+
+        for (c, corp) in corps.iter().enumerate() {
+            tx.insert("botGroups", &[("ownerID", Value::Int(i64::from(corp_ids[c]))), ("kind", Value::Int(i64::from(corp.kind))), ("regionID", Value::Null)])?;
+        }
+        for a in &used_sorted {
+            let region = alliances[*a].region.map_or(Value::Null, |r| Value::Int(i64::from(r)));
+            tx.insert("botGroups", &[("ownerID", Value::Int(i64::from(alliance_id[a]))), ("kind", Value::Int(i64::from(alliances[*a].kind))), ("regionID", region)])?;
+        }
+
+        for (i, home, turf) in &moves {
+            let id = i64::from(bots[*i as usize].id);
+            if let Some(row) = tx.table("bots").get_id(id).map(|r| r.id) {
+                tx.update("bots", row, &[("homeStationID", Value::Int(i64::from(*home))), ("turf", Value::Int(i64::from(*turf)))])?;
+            }
+            let station = tx.table("staStations").get_id(i64::from(*home)).map(|s| {
+                [("stationID", s.value("stationID")), ("solarSystemID", s.value("solarSystemID")), ("constellationID", s.value("constellationID")), ("regionID", s.value("regionID"))]
+                    .map(|(c, v)| (c, v.clone()))
+            });
+            let (Some(sets), Some(row)) = (station, tx.table("character_").get_id(id).map(|r| r.id)) else { continue };
+            tx.update("character_", row, &sets)?;
+        }
+        Ok((corp_ids.to_vec(), alliance_id))
+    })?;
 
     // And in memory.
     let mut p = Politics::new(atlas);
@@ -611,36 +625,51 @@ pub async fn form(db: &mut Client, atlas: &Atlas, bots: &mut [Bot], ids: &mut [I
             bot.system = atlas.station_system.get(&home).copied().unwrap_or(bot.system);
         }
     }
-    start_wars(&mut p, db, rng, clock, speed).await?;
+    start_wars(&mut p, store, rng, clock, speed).await?;
     info!("bots: politics formed in {:.1}s: {}", started.elapsed().as_secs_f64(), p.summary());
-    paint_logos(db).await?;
+    paint_logos(store).await?;
     Ok(p)
 }
 
 /// Moves characters into corporations: member counts, the character rows
 /// and their employment history.
-async fn join_corps(db: &impl tokio_postgres::GenericClient, who: &[i32], into: &[i32], now: i64) -> Result<(), tokio_postgres::Error> {
-    db.execute(
-        r#"WITH u AS (SELECT * FROM unnest($1::int[], $2::int[]) AS u(id, corp)),
-                leaving AS (SELECT c."corporationID" AS corp, -count(*)::int AS n FROM "character_" c JOIN u ON c."characterID" = u.id GROUP BY 1),
-                coming AS (SELECT u.corp, count(*)::int AS n FROM u GROUP BY 1),
-                delta AS (SELECT corp, sum(n)::int AS n FROM (SELECT * FROM leaving UNION ALL SELECT * FROM coming) d GROUP BY 1)
-           UPDATE "corporation" co SET "memberCount" = GREATEST(0, co."memberCount" + delta.n) FROM delta WHERE co."corporationID" = delta.corp"#,
-        &[&who, &into],
-    )
-    .await?;
-    db.execute(
-        r#"UPDATE "character_" c SET "corporationID" = u.corp, "corporationDateTime" = $3
-             FROM unnest($1::int[], $2::int[]) AS u(id, corp) WHERE c."characterID" = u.id"#,
-        &[&who, &into, &now],
-    )
-    .await?;
-    db.execute(
-        r#"INSERT INTO "chrEmployment" ("characterID","corporationID","startDate","deleted") SELECT u.id, u.corp, $3, 0 FROM unnest($1::int[], $2::int[]) AS u(id, corp)"#,
-        &[&who, &into, &now],
-    )
-    .await?;
+fn join_corps(tx: &mut Tx<'_>, who: &[i32], into: &[i32], now: i64) -> Result<(), StoreError> {
+    // Each corporation's members: less those leaving, plus those coming.
+    let mut delta: HashMap<i64, i64> = HashMap::new();
+    {
+        let characters = tx.table("character_");
+        for id in who {
+            if let Some(corp) = characters.get_id(i64::from(*id)).and_then(|c| c.int("corporationID")) {
+                *delta.entry(corp).or_default() -= 1;
+            }
+        }
+    }
+    for corp in into {
+        *delta.entry(i64::from(*corp)).or_default() += 1;
+    }
+    for (corp, n) in delta {
+        let Some(co) = tx.table("corporation").get_id(corp) else { continue };
+        let (row, count) = (co.id, co.int("memberCount").unwrap_or(0));
+        tx.update("corporation", row, &[("memberCount", Value::Int((count + n).max(0)))])?;
+    }
+    for (id, corp) in who.iter().zip(into) {
+        if let Some(row) = tx.table("character_").get_id(i64::from(*id)).map(|r| r.id) {
+            tx.update("character_", row, &[("corporationID", Value::Int(i64::from(*corp))), ("corporationDateTime", Value::Int(now))])?;
+        }
+    }
+    for (id, corp) in who.iter().zip(into) {
+        tx.insert(
+            "chrEmployment",
+            &[("characterID", Value::Int(i64::from(*id))), ("corporationID", Value::Int(i64::from(*corp))), ("startDate", Value::Int(now)), ("deleted", Value::Int(0))],
+        )?;
+    }
     Ok(())
+}
+
+/// Ends a war now (`retracted` and `timeFinished`).
+pub(super) fn retract_war(tx: &mut Tx<'_>, war: i32, now: i64) -> Result<(), StoreError> {
+    let Some(row) = tx.table("crpWars").get_id(i64::from(war)).map(|w| w.id) else { return Ok(()) };
+    tx.update("crpWars", row, &[("retracted", Value::Int(now)), ("timeFinished", Value::Int(now))])
 }
 
 // ---- moving along ----------------------------------------------------------------------------
@@ -648,7 +677,7 @@ async fn join_corps(db: &impl tokio_postgres::GenericClient, who: &[i32], into: 
 /// Every ten minutes of the bots' clock: wars end and start, and bots in NPC
 /// corporations join bot ones.
 #[allow(clippy::too_many_arguments)]
-pub async fn tick(p: &mut Politics, db: &Client, bots: &[Bot], ids: &mut [Identity], rng: &mut Rng, clock: u32, speed: f64) -> Result<(), tokio_postgres::Error> {
+pub async fn tick(p: &mut Politics, store: &Store, bots: &[Bot], ids: &mut [Identity], rng: &mut Rng, clock: u32, speed: f64) -> Result<(), StoreError> {
     let now = filetime_now();
     let ended: Vec<War> = {
         let (gone, kept): (Vec<War>, Vec<War>) = std::mem::take(&mut p.wars).into_iter().partition(|w| w.ends <= clock);
@@ -656,13 +685,13 @@ pub async fn tick(p: &mut Politics, db: &Client, bots: &[Bot], ids: &mut [Identi
         gone
     };
     for w in &ended {
-        db.execute(r#"UPDATE "crpWars" SET "retracted" = $2, "timeFinished" = $2 WHERE "warID" = $1"#, &[&w.id, &now]).await?;
+        store.write(|tx| retract_war(tx, w.id, now))?;
         info!("bots: war {} of {} on {} is over, {} lost", w.id, w.a, w.b, w.kills);
     }
     let before = p.wars.len();
-    start_wars(p, db, rng, clock, speed).await?;
+    start_wars(p, store, rng, clock, speed).await?;
     if !ended.is_empty() || p.wars.len() != before {
-        crate::svc::war::refresh(db).await;
+        store.read(crate::svc::war::refresh);
     }
 
     // Recruiting: some of the bots still in NPC corporations join.
@@ -685,13 +714,13 @@ pub async fn tick(p: &mut Politics, db: &Client, bots: &[Bot], ids: &mut [Identi
                 c.members += 1;
             }
         }
-        join_corps(db, &who, &into, now).await?;
+        store.write(|tx| join_corps(tx, &who, &into, now))?;
     }
     Ok(())
 }
 
 /// Wars until each null-sec alliance has about one, and pirates their prey.
-async fn start_wars(p: &mut Politics, db: &Client, rng: &mut Rng, clock: u32, speed: f64) -> Result<(), tokio_postgres::Error> {
+async fn start_wars(p: &mut Politics, store: &Store, rng: &mut Rng, clock: u32, speed: f64) -> Result<(), StoreError> {
     let null: Vec<(i32, Option<i32>)> = p.alliances.iter().filter(|(_, a)| a.kind == KIND_NULL_ALLIANCE).map(|(id, a)| (*id, a.region)).collect();
     let pirates: Vec<i32> = p.alliances.iter().filter(|(_, a)| a.kind == KIND_PIRATE_ALLIANCE).map(|(id, _)| *id).collect();
     let others: Vec<i32> = p.alliances.keys().copied().filter(|a| !pirates.contains(a)).collect();
@@ -719,27 +748,34 @@ async fn start_wars(p: &mut Politics, db: &Client, rng: &mut Rng, clock: u32, sp
             continue;
         }
         let days = WAR_DAYS.0 + rng.below((WAR_DAYS.1 - WAR_DAYS.0 + 1) as usize) as u32;
-        war_between(p, db, a, b, days, clock, speed).await?;
+        war_between(p, store, a, b, days, clock, speed).await?;
     }
     Ok(())
 }
 
 /// A bot war between two sides, for `days` of the bots' clock. Returns its ID.
-pub async fn war_between(p: &mut Politics, db: &Client, a: i32, b: i32, days: u32, clock: u32, speed: f64) -> Result<i32, tokio_postgres::Error> {
+pub async fn war_between(p: &mut Politics, store: &Store, a: i32, b: i32, days: u32, clock: u32, speed: f64) -> Result<i32, StoreError> {
     let length = days * DAY;
     let now = filetime_now();
     let finished = now + (length as f64 / speed.max(0.001)) as i64 * SECOND_FT;
     // Dated a day back: bot wars are fought from the start, not after the
     // day's notice a declared war gives.
     let declared = now - crate::svc::war::DAY;
-    let id: i32 = db
-        .query_one(
-            r#"INSERT INTO "crpWars" ("warID","declaredByID","againstID","timeDeclared","timeFinished","mutual")
-               VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, 1) RETURNING "warID""#,
-            &[&a, &b, &declared, &finished],
-        )
-        .await?
-        .get(0);
+    let id = store.write(|tx| {
+        let id = tx.nextval("dyn_id_seq")?;
+        tx.insert(
+            "crpWars",
+            &[
+                ("warID", Value::Int(id)),
+                ("declaredByID", Value::Int(i64::from(a))),
+                ("againstID", Value::Int(i64::from(b))),
+                ("timeDeclared", Value::Int(declared)),
+                ("timeFinished", Value::Int(finished)),
+                ("mutual", Value::Int(1)),
+            ],
+        )?;
+        Ok::<_, StoreError>(id as i32)
+    })?;
     info!("bots: war {id}: {a} against {b}, for {days} days");
     p.wars.push(War { id, a, b, ends: clock + length, kills: 0 });
     Ok(id)

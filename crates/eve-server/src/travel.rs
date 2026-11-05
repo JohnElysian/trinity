@@ -1,7 +1,7 @@
 //! Space arrivals are provisional until their last source combat state is
 //! durable. Receipts outlive hulls, so a delayed callback cannot replay a trip.
 use crate::{ballpark::{Ship,Vec3},conn::Server,losses::Loss,world::World};
-use tokio_postgres::{Client,GenericClient,Transaction};
+use crate::store::{Db,Store,StoreError,Tx,Value};
 
 mod storage;
 #[cfg(test)] mod tests;
@@ -30,23 +30,21 @@ pub enum Final {Healthy {ship:Ship,tick:i64},Lost(Loss)}
 #[derive(Debug,Clone)]
 pub struct Pending {marker:Marker,final_state:Option<Final>,busy:bool,claim:u64}
 
-pub async fn begin(tx:&Transaction<'_>,pilot:i64,ship:i64,source:Place,destination:Place)->Result<Marker,tokio_postgres::Error> {
-    storage::begin(tx,pilot,ship,source,destination).await
+pub fn begin(tx:&mut Tx<'_>,pilot:i64,ship:i64,source:Place,destination:Place)->Result<Marker,StoreError> {
+    storage::begin(tx,pilot,ship,source,destination)
 }
 
-/// This read uses a fresh transaction in the standard custody lock order.
 /// Unknown is deliberately not a refund or permission to load the old hull.
-pub async fn resolve(db:&mut Client,marker:&Marker)->Result<Resolution,String> {
+pub async fn resolve(store:&Store,marker:&Marker)->Result<Resolution,String> {
     if !marker.valid(){return Ok(Resolution::Unknown);}
-    let tx=db.transaction().await.map_err(failed)?;
-    Ok(storage::locked(&tx,*marker).await?.resolution)
+    Ok(store.read(|db|storage::locked(db,*marker)).resolution)
 }
 
-pub async fn blocked(db:&impl GenericClient,ship:i64)->Result<bool,tokio_postgres::Error> {
-    Ok(db.query_one(r#"SELECT EXISTS(SELECT 1 FROM "travelReceipts" WHERE "shipID"=$1 AND state=0)"#,&[&(ship as i32)]).await?.get(0))
+pub fn blocked(db:&Db,ship:i64)->Result<bool,StoreError> {
+    Ok(storage::pending(db,"shipID",ship))
 }
-pub async fn blocked_character(db:&impl GenericClient,pilot:i64)->Result<bool,tokio_postgres::Error> {
-    Ok(db.query_one(r#"SELECT EXISTS(SELECT 1 FROM "travelReceipts" WHERE "characterID"=$1 AND state=0)"#,&[&(pilot as i32)]).await?.get(0))
+pub fn blocked_character(db:&Db,pilot:i64)->Result<bool,StoreError> {
+    Ok(storage::pending(db,"characterID",pilot))
 }
 pub fn blocked_in_memory(world:&World,ship:i64)->bool {
     world.lock().pending_travel.values().any(|p|p.marker.ship==ship)
@@ -94,9 +92,18 @@ fn decoded_loss(raw:&str,m:Marker)->Option<Loss> {
     let loss:Loss=serde_json::from_str(raw).ok()?;
     valid_final(m,&Final::Lost(loss.clone())).then_some(loss)
 }
-fn failed(error:tokio_postgres::Error)->String {
+fn failed(error:StoreError)->String {
     tracing::warn!("travel finalization remains pending: {}",crate::logging::chain(&error));
     "The travel outcome could not be confirmed and remains quarantined.".into()
+}
+/// A refused finalization: returned from the store write, it undoes what the
+/// write did, as dropping the uncommitted transaction did.
+struct Refused(String);
+impl From<StoreError> for Refused {
+    fn from(error:StoreError)->Self {Refused(failed(error))}
+}
+impl From<&str> for Refused {
+    fn from(error:&str)->Self {Refused(error.into())}
 }
 fn next_claim()->u64 {
     static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
@@ -109,9 +116,10 @@ impl Drop for Busy {
     }
 }
 
-/// Store the known final snapshot before awaiting SQL. No success or retry
-/// publishes a session move; the current connection or a later login does so.
-pub async fn finalize(server:&Server,db:&mut Client,marker:Marker,final_state:Final)->Result<(),String> {
+/// Keep the known final snapshot in memory before writing it, so a refused
+/// write is retried. No success or retry publishes a session move; the
+/// current connection or a later login does so.
+pub async fn finalize(server:&Server,store:&Store,marker:Marker,final_state:Final)->Result<(),String> {
     if !valid_final(marker,&final_state){return Err("The final travel snapshot is invalid and cannot be accepted.".into());}
     let pending={
         let mut w=server.world.lock();
@@ -121,12 +129,12 @@ pub async fn finalize(server:&Server,db:&mut Client,marker:Marker,final_state:Fi
         if p.final_state.is_none(){p.final_state=Some(final_state);}
         p.busy=true;p.claim=next_claim();p.clone()
     };
-    perform(server,db,pending).await
+    perform(server,store,pending)
 }
 
-async fn perform(server:&Server,db:&mut Client,pending:Pending)->Result<(),String> {
+fn perform(server:&Server,store:&Store,pending:Pending)->Result<(),String> {
     let _busy=Busy {world:server.world.clone(),generation:pending.marker.generation,claim:pending.claim};
-    let result=attempt(db,&pending).await;
+    let result=attempt(store,&pending);
     if result.is_ok() {
         let mut w=server.world.lock();
         if w.pending_travel.get(&pending.marker.generation).is_some_and(|p|p.claim==pending.claim && p.marker==pending.marker) {
@@ -136,67 +144,62 @@ async fn perform(server:&Server,db:&mut Client,pending:Pending)->Result<(),Strin
     result
 }
 
-async fn attempt(db:&mut Client,pending:&Pending)->Result<(),String> {
+fn attempt(store:&Store,pending:&Pending)->Result<(),String> {
     let m=pending.marker;
     let final_state=pending.final_state.as_ref().ok_or("The last source combat state is unknown; travel remains quarantined.")?;
     if let Final::Lost(loss)=final_state {
         // First retain the immutable confirmed loss. If the subsequent staging
-        // transaction fails, restart can still recover this known outcome.
+        // write is refused, restart can still recover this known outcome.
         let raw=serde_json::to_string(loss).map_err(|_|"The final travel loss could not be encoded.")?;
         if decoded_loss(&raw,m).is_none(){return Err("The final travel loss is invalid.".into());}
-        let tx=db.transaction().await.map_err(failed)?;
-        let locked=storage::locked(&tx,m).await?;
+        let done=store.write(|tx|->Result<bool,Refused> {
+            match storage::locked(tx.db(),m).resolution {
+                Resolution::Finalized=>return Ok(true),
+                Resolution::Accepted=>{},
+                _=>return Err("The accepted travel custody could not be verified.".into()),
+            }
+            storage::retain_loss(tx,m.generation,&raw)?;
+            Ok(false)
+        }).map_err(|Refused(e)|e)?;
+        if done {return Ok(());}
+    }
+    store.write(|tx|->Result<(),Refused> {
+        let locked=storage::locked(tx.db(),m);
         match locked.resolution {
             Resolution::Finalized=>return Ok(()),
             Resolution::Accepted=>{},
             _=>return Err("The accepted travel custody could not be verified.".into()),
         }
-        tx.execute(r#"UPDATE "travelReceipts" SET loss=COALESCE(loss,$2) WHERE generation=$1 AND state=0"#,
-            &[&m.generation,&raw]).await.map_err(failed)?;
-        tx.commit().await.map_err(failed)?;
-    }
-    let tx=db.transaction().await.map_err(failed)?;
-    let locked=storage::locked(&tx,m).await?;
-    match locked.resolution {
-        Resolution::Finalized=>return Ok(()),
-        Resolution::Accepted=>{},
-        _=>return Err("The accepted travel custody could not be verified.".into()),
-    }
-    if let Some(raw)=locked.loss {
-        let loss=decoded_loss(&raw,m).ok_or("The durable travel loss is corrupt and remains quarantined.")?;
-        if !crate::losses::journal::stage(&tx,&loss).await.map_err(failed)? {
-            return Err("The arriving loss could not be staged under its current custody.".into());
-        }
-    }else if let Final::Healthy{ship,tick}=final_state {
-        if !crate::space_state::write_arrival(&tx,m.destination.system,ship,*tick).await.map_err(failed)? {
-            return Err("The final arrival checkpoint could not be validated.".into());
-        }
-    }else{return Err("The final travel loss has no durable payload.".into());}
-    tx.execute(r#"UPDATE "travelReceipts" SET state=1,"completedAt"=$2 WHERE generation=$1 AND state=0"#,
-        &[&m.generation,&crate::combat::now_ms()]).await.map_err(failed)?;
-    tx.commit().await.map_err(failed)?;
-    Ok(())
+        if let Some(raw)=locked.loss {
+            let loss=decoded_loss(&raw,m).ok_or("The durable travel loss is corrupt and remains quarantined.")?;
+            if !crate::losses::journal::stage(tx,&loss)? {
+                return Err("The arriving loss could not be staged under its current custody.".into());
+            }
+        }else if let Final::Healthy{ship,tick}=final_state {
+            if !crate::space_state::write_arrival(tx,m.destination.system,ship,*tick)? {
+                return Err("The final arrival checkpoint could not be validated.".into());
+            }
+        }else{return Err("The final travel loss has no durable payload.".into());}
+        storage::complete(tx,m.generation,crate::combat::now_ms())?;
+        Ok(())
+    }).map_err(|Refused(e)|e)
 }
 
-pub async fn retry(server:&Server,db:&mut Client) {
+pub async fn retry(server:&Server,store:&Store) {
     let mut keys:Vec<_>=server.world.lock().pending_travel.iter().filter(|(_,p)|p.final_state.is_some()).map(|(k,_)|*k).collect();
     keys.sort_unstable();
     for generation in keys {
         let pending={let mut w=server.world.lock();w.pending_travel.get_mut(&generation).filter(|p|!p.busy).map(|p|{
             p.busy=true;p.claim=next_claim();p.clone()})};
-        if let Some(p)=pending {if let Err(error)=perform(server,db,p).await {tracing::warn!(generation,"travel remains pending: {error}");}}
+        if let Some(p)=pending {if let Err(error)=perform(server,store,p) {tracing::warn!(generation,"travel remains pending: {error}");}}
     }
     let cursor=server.world.lock().travel_retry_cursor;
-    let rows=match db.query(r#"SELECT generation,"characterID","shipID","shipTypeID",source,destination,loss FROM "travelReceipts"
-        WHERE state=0 AND loss IS NOT NULL ORDER BY CASE WHEN generation>$1 THEN 0 ELSE 1 END,generation LIMIT 64"#,&[&cursor]).await {
-        Ok(rows)=>rows,Err(error)=>{tracing::warn!("reading travel recovery receipts: {}",crate::logging::chain(&error));return;}
-    };
-    for row in rows {
-        let generation:i64=row.get(0);server.world.lock().travel_retry_cursor=generation;
+    let rows=store.read(|db|storage::with_losses(db,cursor,64));
+    for (generation,marker,raw) in rows {
+        server.world.lock().travel_retry_cursor=generation;
         if server.world.lock().pending_travel.contains_key(&generation){continue;}
-        let Some(marker)=storage::marker(&row) else {tracing::warn!(generation,"invalid travel receipt remains quarantined");continue;};
-        let raw:String=row.get(6);
+        let Some(marker)=marker else {tracing::warn!(generation,"invalid travel receipt remains quarantined");continue;};
         let Some(loss)=decoded_loss(&raw,marker) else {tracing::warn!(generation,"invalid travel loss remains quarantined");continue;};
-        if let Err(error)=finalize(server,db,marker,Final::Lost(loss)).await {tracing::warn!(generation,"durable travel loss remains pending: {error}");}
+        if let Err(error)=finalize(server,store,marker,Final::Lost(loss)).await {tracing::warn!(generation,"durable travel loss remains pending: {error}");}
     }
 }

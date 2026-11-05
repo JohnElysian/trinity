@@ -14,7 +14,8 @@ use tracing::{debug, warn};
 use crate::ballpark::{Celestial, Command, Park, Ship, Vec3};
 use crate::destiny::{self, flags, mode, Ball};
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::rows::{float, int, key_val, rowset, text};
+use crate::store::{self, Db};
+use crate::svc::rows::{key_val, rowset};
 use crate::world::WorldState;
 
 const TYPE_SOLAR_SYSTEM: i64 = 5;
@@ -124,7 +125,7 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
     if ctx.world.lock().parks.contains_key(&solar_system_id) {
         return;
     }
-    let celestials = load_celestials(ctx, solar_system_id).await;
+    let celestials = ctx.store.read(|db| load_celestials(db, solar_system_id));
     let launched_drones = crate::drones::load(ctx, solar_system_id).await.unwrap_or_else(|e| {
         warn!("drones in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
         Vec::new()
@@ -134,31 +135,34 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
         Vec::new()
     });
     let now = crate::combat::now_ms();
-    if let Err(e) = crate::loot::ensure_table(ctx.db).await {
-        warn!("no loot table: {}", crate::logging::chain(&e));
-    }
-    let cans = crate::loot::load_cans(ctx.db, solar_system_id, now).await.unwrap_or_else(|e| {
-        warn!("cans in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
-        Vec::new()
-    });
-    let structures = crate::pos::load(ctx.db, solar_system_id).await.unwrap_or_else(|e| {
-        warn!("structures in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
-        Vec::new()
-    });
-    let wildlife = match crate::npc::load(ctx.db, solar_system_id).await {
-        Ok(w) => w,
-        Err(e) => {
-            warn!("system {solar_system_id} gets no belt life: {}", crate::logging::chain(&e));
-            Default::default()
+    let (cans, structures, wildlife, complexes, faction) = ctx.store.read(|db| {
+        if let Err(e) = crate::loot::ensure_table(db) {
+            warn!("no loot table: {}", crate::logging::chain(&e));
         }
-    };
-    let complexes = crate::complexes::load(ctx.db, solar_system_id).await;
-    let faction = ctx
-        .query_one(r#"SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $1"#, &[&(wildlife.corp_id as i32)])
-        .await
-        .and_then(|r| text(&r, 0))
-        .map(|n| n.split_whitespace().next().unwrap_or("Pirate").trim_end_matches("'s").to_string())
-        .unwrap_or_else(|| "Pirate".into());
+        let cans = crate::loot::load_cans(db, solar_system_id, now).unwrap_or_else(|e| {
+            warn!("cans in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
+            Vec::new()
+        });
+        let structures = crate::pos::load(db, solar_system_id).unwrap_or_else(|e| {
+            warn!("structures in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
+            Vec::new()
+        });
+        let wildlife = match crate::npc::load(db, solar_system_id) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("system {solar_system_id} gets no belt life: {}", crate::logging::chain(&e));
+                Default::default()
+            }
+        };
+        let complexes = crate::complexes::load(db, solar_system_id);
+        let faction = db
+            .table("corporation")
+            .get_id(wildlife.corp_id)
+            .and_then(|r| r.text("corporationName"))
+            .map(|n| n.split_whitespace().next().unwrap_or("Pirate").trim_end_matches("'s").to_string())
+            .unwrap_or_else(|| "Pirate".into());
+        (cans, structures, wildlife, complexes, faction)
+    });
     let created = {
     let mut world = ctx.world.lock();
     if let std::collections::hash_map::Entry::Vacant(entry) = world.parks.entry(solar_system_id) {
@@ -180,28 +184,28 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
     }
 }
 
-async fn load_celestials(ctx: &Ctx<'_>, solar_system_id: i64) -> Vec<Celestial> {
-    let sql = r#"SELECT d."itemID", d."typeID", d."groupID", COALESCE(d."itemName", ''),
-                        d."x", d."y", d."z", COALESCE(d."radius", 0),
-                        j."celestialID", dest."solarSystemID"
-                   FROM "mapDenormalize" d
-                   LEFT JOIN "mapJumps" j ON j."stargateID" = d."itemID"
-                   LEFT JOIN "mapDenormalize" dest ON dest."itemID" = j."celestialID"
-                  WHERE d."solarSystemID" = $1 AND d."groupID" = ANY($2)
-                  ORDER BY d."itemID""#;
-    let rows = ctx.query(sql, &[&(solar_system_id as i32), &&CELESTIAL_GROUPS[..]]).await;
+fn load_celestials(db: &Db, solar_system_id: i64) -> Vec<Celestial> {
+    let map = db.table("mapDenormalize");
+    let mut rows: Vec<_> = map
+        .find(&["solarSystemID"], &[store::Value::Int(solar_system_id)])
+        .filter(|d| d.int("groupID").is_some_and(|g| CELESTIAL_GROUPS.contains(&(g as i32))))
+        .collect();
+    rows.sort_by_key(|d| d.int("itemID"));
+    // Where each stargate leads (mapJumps), and the system of the gate at
+    // the other end.
+    let jumps = crate::sde::table("mapJumps");
     rows.iter()
-        .map(|r| Celestial {
-            id: int(r, 0).unwrap_or(0),
-            type_id: int(r, 1).unwrap_or(0),
-            group_id: int(r, 2).unwrap_or(0),
-            name: text(r, 3).unwrap_or_default(),
-            pos: Vec3::new(float(r, 4).unwrap_or(0.0), float(r, 5).unwrap_or(0.0), float(r, 6).unwrap_or(0.0)),
-            radius: float(r, 7).unwrap_or(0.0),
-            jump: match (int(r, 9), int(r, 8)) {
-                (Some(system), Some(gate)) => Some((system, gate)),
-                _ => None,
-            },
+        .map(|r| {
+            let gate = r.int("itemID").and_then(|id| jumps.get("stargateID", id)?.int("celestialID"));
+            Celestial {
+                id: r.int("itemID").unwrap_or(0),
+                type_id: r.int("typeID").unwrap_or(0),
+                group_id: r.int("groupID").unwrap_or(0),
+                name: r.text("itemName").unwrap_or_default().to_string(),
+                pos: Vec3::new(r.float("x").unwrap_or(0.0), r.float("y").unwrap_or(0.0), r.float("z").unwrap_or(0.0)),
+                radius: r.float("radius").unwrap_or(0.0),
+                jump: gate.and_then(|gate| Some((map.get_id(gate)?.int("solarSystemID")?, gate))),
+            }
         })
         .collect()
 }
@@ -726,11 +730,13 @@ pub fn special_fx(tick: i64, ship_id: i64, target_id: Option<i64>, guid: &str) -
 
 /// Stations' owning corporations, for their slims.
 pub async fn station_owners(ctx: &Ctx<'_>, solar_system_id: i64) -> Vec<(i64, i64)> {
-    let sql = r#"SELECT "stationID", "corporationID" FROM "staStations" WHERE "solarSystemID" = $1"#;
-    ctx.query(sql, &[&(solar_system_id as i32)])
-        .await
-        .iter()
-        .filter_map(|r| Some((int(r, 0)?, int(r, 1)?)))
+    ctx.store.read(|db| owners_in(db, solar_system_id))
+}
+
+fn owners_in(db: &Db, solar_system_id: i64) -> Vec<(i64, i64)> {
+    db.table("staStations")
+        .find(&["solarSystemID"], &[store::Value::Int(solar_system_id)])
+        .filter_map(|r| Some((r.int("stationID")?, r.int("corporationID")?)))
         .collect()
 }
 
@@ -822,18 +828,9 @@ pub(crate) async fn push_set_state(ctx: &Ctx<'_>) {
 /// A capacitor-limited warp can choose a shorter exit at entry. Rebuild the
 /// native state for every client that already has this park, preserving each
 /// observer's visibility and the original entry stamp/distance. Called only
-/// after releasing the simulation lock; no world lock spans database I/O.
-pub async fn resync_after_warp_limit(db: &tokio_postgres::Client, world: &crate::world::World, system: i64) {
-    let owners = match db.query(r#"SELECT "stationID","corporationID" FROM "staStations" WHERE "solarSystemID"=$1"#,
-        &[&(system as i32)]).await {
-        Ok(rows) => rows.iter().filter_map(|r|Some((int(r,0)?,int(r,1)?))).collect::<Vec<_>>(),
-        Err(error) => {
-            // A missing station label must not leave the client following the
-            // old, longer warp. The ordinary reset path also tolerates no owners.
-            warn!("warp resync station owners in {system}: {}",crate::logging::chain(&error));
-            Vec::new()
-        }
-    };
+/// after releasing the simulation lock.
+pub fn resync_after_warp_limit(db: &Db, world: &crate::world::World, system: i64) {
+    let owners = owners_in(db, system);
     resync_warp_views(&world.lock(),system,&owners);
 }
 
@@ -897,7 +894,7 @@ async fn movement(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         return Outcome::UserError { msg: "ShipNotYours".into(), args: Vec::new() };
     };
     if call.method == "WarpToStuff" && call.arg_text(0).as_deref() == Some("tutorial") {
-        return Outcome::custom("Your personal tutorial site is not available.");
+        return warp_to_tutorial(ctx, call, system, ship_id);
     }
     let Some(order) = parse_order(ctx, call).await else {
         return Outcome::custom("Invalid movement command or unavailable destination.");
@@ -954,6 +951,31 @@ pub fn warp_to_point(ctx: &Ctx<'_>, at: Vec3, radius: f64, range: f64, why: &str
         return Outcome::custom("The destination is unavailable or too close to warp to.");
     };
     steer(ctx, system, ship_id, Order::Command(command), why)
+}
+
+/// The client's tutorial warps a new pilot to their personal tutorial site
+/// (tutorialsvc.py WarpToTutorial): opened a short warp away, with a few
+/// weak rats to practise on, the first time they ask.
+fn warp_to_tutorial(ctx: &Ctx<'_>, call: &Call, system: i64, ship_id: i64) -> Outcome {
+    let Some(char_id) = ctx.session.char_id else { return Outcome::custom("Select a character first.") };
+    let range = match call.kwarg("minRange") {
+        Some(v) => match finite_number(v) {
+            Some(r) => r,
+            None => return Outcome::custom("Invalid movement command or unavailable destination."),
+        },
+        None => DEFAULT_WARP_RANGE,
+    };
+    let (at, radius) = {
+        let mut world = ctx.world.lock();
+        let Some(park) = world.parks.get_mut(&system) else { return Outcome::custom("Your ship is not in space.") };
+        let Some(near) = park.ships.get(&ship_id).map(|s| s.pos) else { return Outcome::custom("Your ship is not in space.") };
+        let (at, radius, entries) = crate::sites::tutorial(park, char_id, near, crate::combat::now_ms());
+        if !entries.is_empty() {
+            broadcast(&world, system, None, entries);
+        }
+        (at, radius)
+    };
+    warp_to_point(ctx, at, radius, range, "WarpToStuff")
 }
 
 /// Flies the caller's ship straight to `at`.
@@ -1078,11 +1100,10 @@ fn valid_order(park: &Park, ship_id: i64, order: &Order) -> bool {
 /// the system, a bookmark, or another character's ship.
 async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> {
     let system = ctx.session.solar_system_id?;
-    let db_id = i32::try_from(id).ok()?;
-    let db_system = i32::try_from(system).ok()?;
-    let point = |r: &tokio_postgres::Row, i: usize| {
-        Some(Vec3::new(float(r, i)?, float(r, i + 1)?, float(r, i + 2)?))
-    };
+    // IDs beyond an integer name nothing.
+    i32::try_from(id).ok()?;
+    i32::try_from(system).ok()?;
+    let point = |r: &store::Row, [x, y, z]: [&str; 3]| Some(Vec3::new(r.float(x)?, r.float(y)?, r.float(z)?));
     match kind {
         "item" => {
             if let Some(ball) = ctx.world.lock().parks.get(&system).and_then(|p| {
@@ -1090,9 +1111,10 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> 
             }) {
                 return Some(ball);
             }
-            let sql = r#"SELECT "x","y","z", COALESCE("radius", 0) FROM "mapDenormalize" WHERE "itemID" = $1 AND "solarSystemID" = $2"#;
-            let r = ctx.query_one(sql, &[&db_id, &db_system]).await?;
-            Some((point(&r, 0)?, float(&r, 3).unwrap_or(0.0)))
+            ctx.store.read(|db| {
+                let r = db.table("mapDenormalize").get_id(id).filter(|r| r.int("solarSystemID") == Some(system))?;
+                Some((point(&r, ["x", "y", "z"])?, r.float("radius").unwrap_or(0.0)))
+            })
         }
         "bookmark" => {
             // A celestial in this system warps to the celestial; a coordinate
@@ -1100,23 +1122,31 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> 
             // A system, constellation or region is never a warp target --
             // its mapDenormalize x/y/z are galactic, and older bookmarks of
             // one were filed under the system the pilot was in.
-            let sql = r#"SELECT b."x", b."y", b."z",
-                                CASE WHEN d."groupID" IN (3,4,5) THEN NULL ELSE d."x" END,
-                                d."y", d."z", COALESCE(d."radius", 0)
-                           FROM bookmarks b
-                           LEFT JOIN "mapDenormalize" d ON d."itemID" = b."itemID"
-                          WHERE b."bookmarkID" = $1 AND b."ownerID" = $2 AND b."locationID" = $3
-                            AND (d."itemID" IS NULL
-                                 OR (d."groupID" NOT IN (3,4,5) AND d."solarSystemID" = $3)
-                                 OR (d."groupID" IN (3,4,5) AND b."itemID" = b."locationID"
-                                     AND b."x" IS DISTINCT FROM d."x"))"#;
-            let owner = ctx.session.char_id? as i32;
-            let r = ctx.query_one(sql, &[&db_id, &owner, &db_system]).await?;
-            // A bookmark of a celestial carries the celestial's position.
-            match point(&r, 3) {
-                Some(at) => Some((at, float(&r, 6).unwrap_or(0.0))),
-                None => Some((point(&r, 0)?, 0.0)),
-            }
+            let owner = ctx.session.char_id?;
+            ctx.store.read(|db| {
+                let b = db
+                    .table("bookmarks")
+                    .get_id(id)
+                    .filter(|b| b.int("ownerID") == Some(owner) && b.int("locationID") == Some(system))?;
+                let d = b.int("itemID").and_then(|item| db.table("mapDenormalize").get_id(item));
+                let galactic = |g: i64| matches!(g, 3..=5);
+                if let Some(d) = &d {
+                    let kept = match d.int("groupID") {
+                        Some(g) if !galactic(g) => d.int("solarSystemID") == Some(system),
+                        Some(_) => b.int("itemID") == b.int("locationID") && b.float("x") != d.float("x"),
+                        None => false,
+                    };
+                    if !kept {
+                        return None;
+                    }
+                }
+                // A bookmark of a celestial carries the celestial's position.
+                let celestial = d.filter(|d| !d.int("groupID").is_some_and(galactic)).and_then(|d| Some((point(&d, ["x", "y", "z"])?, d.float("radius").unwrap_or(0.0))));
+                match celestial {
+                    Some(found) => Some(found),
+                    None => Some((point(&b, ["x", "y", "z"])?, 0.0)),
+                }
+            })
         }
         "char" => {
             let world = ctx.world.lock();
@@ -1195,62 +1225,110 @@ mod movement_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TRINITY_TEST_DATABASE with imported static data"]
+    async fn the_tutorial_warp_opens_a_personal_site_with_rats_once_and_clearing_it_is_only_practice() {
+        let database=crate::test_support::Database::load().await;
+        let system=30004971;
+        let pilot=database.id().await as i64;
+        let session=crate::session::Session{char_id:Some(pilot),ship_id:Some(1),solar_system_id:Some(system),..Default::default()};
+        let ctx=database.ctx(&session);
+        ensure_park(&ctx,system).await;
+        database.world.lock().parks.get_mut(&system).unwrap().ships.insert(1,ship(1,pilot,0.0));
+        let warp=Call{service:"beyonce".into(),method:"WarpToStuff".into(),args:vec![Value::bytes("tutorial"),Value::None],kwargs:vec![]};
+        assert!(matches!(movement(&ctx,&warp).await,Outcome::Value(_)));
+        let (site,rats,command)={
+            let w=database.world.lock();let park=&w.parks[&system];
+            let site=park.sites.values().find(|s|s.char_id==pilot).unwrap().clone();
+            (site.clone(),site.rats.clone(),park.ships[&1].command.clone())
+        };
+        assert_eq!(site.mission_id,crate::sites::TUTORIAL);
+        assert!(!rats.is_empty(),"weak rats to practise on");
+        assert!((site.pos.len()-5.0e9).abs()<1.0,"a short warp from the pilot");
+        assert!(matches!(command,crate::ballpark::Command::Warp{..}),"the ship warps there");
+        // Asking again warps to the same site.
+        assert!(matches!(movement(&ctx,&warp).await,Outcome::Value(_)));
+        assert_eq!(database.world.lock().parks[&system].sites.values().filter(|s|s.char_id==pilot).count(),1);
+        // Its last rat dying clears nothing but itself: no mission job.
+        let mut out=crate::heartbeat::Out::default();
+        {
+            let mut w=database.world.lock();let park=w.parks.get_mut(&system).unwrap();
+            for rat in &rats {let dead=park.ships.remove(rat).unwrap();crate::npc::killed(park,&dead,0,&mut out);}
+        }
+        assert!(out.jobs.is_empty());
+        assert!(database.world.lock().parks[&system].sites[&site.id].rats.is_empty());
+        // A cleared site opens afresh for more practice.
+        assert!(matches!(movement(&ctx,&warp).await,Outcome::Value(_)));
+        let w=database.world.lock();let mine:Vec<_>=w.parks[&system].sites.values().filter(|s|s.char_id==pilot).collect();
+        assert_eq!(mine.len(),1);
+        assert!(mine[0].id!=site.id && !mine[0].rats.is_empty());
+    }
+
+    #[tokio::test]
     async fn warp_destinations_respect_system_ownership_and_fleet_membership() {
         let database=crate::test_support::Database::load().await;
-        let local=database.db.query_one(r#"SELECT "itemID","solarSystemID" FROM "mapDenormalize" WHERE "groupID"=10 ORDER BY "itemID" LIMIT 1"#,&[]).await.unwrap();
-        let local_id:i32=local.get(0);let system:i32=local.get(1);
-        let remote=database.db.query_one(r#"SELECT "itemID","solarSystemID" FROM "mapDenormalize" WHERE "groupID"=10 AND "solarSystemID"<>$1 ORDER BY "itemID" LIMIT 1"#,&[&system]).await.unwrap();
-        let remote_id:i32=remote.get(0);let remote_system:i32=remote.get(1);
+        let gates=database.store.read(|db|{
+            let mut gates:Vec<(i64,i64)>=db.table("mapDenormalize").rows().filter(|d|d.int("groupID")==Some(10))
+                .filter_map(|d|Some((d.int("itemID")?,d.int("solarSystemID")?))).collect();
+            gates.sort();gates
+        });
+        let (local_id,system)=gates[0];
+        let (remote_id,remote_system)=*gates.iter().find(|g|g.1!=system).unwrap();
         let owner=database.id().await;let ally=database.id().await;
-        let session=crate::session::Session{char_id:Some(owner as i64),ship_id:Some(1),solar_system_id:Some(system as i64),..Default::default()};
+        let session=crate::session::Session{char_id:Some(owner as i64),ship_id:Some(1),solar_system_id:Some(system),..Default::default()};
         let ctx=database.ctx(&session);
-        let mut park=Park::new(system as i64,vec![],destiny::tick_now());
+        let mut park=Park::new(system,vec![],destiny::tick_now());
         park.ships.insert(1,ship(1,owner as i64,0.0));park.ships.insert(2,ship(2,ally as i64,1.0e6));
-        database.world.lock().parks.insert(system as i64,park);
-        assert!(warp_target(&ctx,"item",local_id as i64).await.is_some());
-        assert!(warp_target(&ctx,"item",remote_id as i64).await.is_none());
+        database.world.lock().parks.insert(system,park);
+        assert!(warp_target(&ctx,"item",local_id).await.is_some());
+        assert!(warp_target(&ctx,"item",remote_id).await.is_none());
         assert!(warp_target(&ctx,"item",i64::MAX).await.is_none());
-        database.world.lock().parks.get_mut(&(system as i64)).unwrap().beacons.insert(99,
+        database.world.lock().parks.get_mut(&system).unwrap().beacons.insert(99,
             crate::beacons::Beacon::new(99,19728,None,"Hidden signature",Vec3::new(1.0e6,0.0,0.0),1.0,
                 crate::beacons::Kind::Complex {complex_id:99}).hidden());
         assert!(warp_target(&ctx,"item",99).await.is_none(),"hidden signature requires an authorized scan result");
         assert!(warp_target(&ctx,"char",ally as i64).await.is_none());
         database.world.lock().gangs.test_members(vec![owner as i64,ally as i64]);
         assert_eq!(warp_target(&ctx,"char",ally as i64).await,Some((Vec3::new(1.0e6,0.0,0.0),37.0)));
-        database.world.lock().parks.get_mut(&(system as i64)).unwrap().ships.get_mut(&2).unwrap().cloaked=true;
+        database.world.lock().parks.get_mut(&system).unwrap().ships.get_mut(&2).unwrap().cloaked=true;
         assert!(warp_target(&ctx,"char",ally as i64).await.is_none());
-        database.world.lock().scan_results.insert(owner as i64,vec![super::super::scan::Found{id:99,signal:100.0,pos:Vec3::new(1.0e6,0.0,0.0),accuracy:0.0,system:remote_system as i64}]);
+        database.world.lock().scan_results.insert(owner as i64,vec![super::super::scan::Found{id:99,signal:100.0,pos:Vec3::new(1.0e6,0.0,0.0),accuracy:0.0,system:remote_system}]);
         assert!(warp_target(&ctx,"scan",99).await.is_none());
-        database.world.lock().scan_results.get_mut(&(owner as i64)).unwrap()[0].system=system as i64;
+        database.world.lock().scan_results.get_mut(&(owner as i64)).unwrap()[0].system=system;
         assert!(warp_target(&ctx,"scan",99).await.is_some());
-        let bookmark:i32=database.db.query_one(r#"INSERT INTO bookmarks ("ownerID","itemID","typeID",memo,created,x,y,z,"locationID") VALUES ($1,$2,5,'warp test',0,1000000,0,0,$3) RETURNING "bookmarkID""#,&[&owner,&system,&remote_system]).await.unwrap().get(0);
-        assert!(warp_target(&ctx,"bookmark",bookmark as i64).await.is_none());
-        database.db.execute(r#"UPDATE bookmarks SET "locationID"=$2 WHERE "bookmarkID"=$1"#,&[&bookmark,&system]).await.unwrap();
-        assert!(warp_target(&ctx,"bookmark",bookmark as i64).await.is_some());
-        database.db.execute(r#"UPDATE bookmarks SET "ownerID"=$2 WHERE "bookmarkID"=$1"#,&[&bookmark,&ally]).await.unwrap();
-        assert!(warp_target(&ctx,"bookmark",bookmark as i64).await.is_none());
-        database.db.execute(r#"DELETE FROM bookmarks WHERE "bookmarkID"=$1"#,&[&bookmark]).await.unwrap();
+        let bookmark=database.store.write(|tx|{
+            let row=tx.insert("bookmarks",&[("ownerID",store::Value::Int(owner as i64)),("itemID",store::Value::Int(system)),("typeID",store::Value::Int(5)),
+                ("memo",store::Value::Text("warp test".into())),("created",store::Value::Int(0)),("x",store::Value::Float(1_000_000.0)),
+                ("y",store::Value::Float(0.0)),("z",store::Value::Float(0.0)),("locationID",store::Value::Int(remote_system))])?;
+            Ok::<_,crate::store::StoreError>(tx.table("bookmarks").row(row).unwrap().int("bookmarkID").unwrap())
+        }).unwrap();
+        let set_bookmark=|column:&str,value:i64|database.store.write(|tx|{
+            let row=tx.table("bookmarks").get_id(bookmark).unwrap().id;tx.update("bookmarks",row,&[(column,store::Value::Int(value))])
+        }).unwrap();
+        assert!(warp_target(&ctx,"bookmark",bookmark).await.is_none());
+        set_bookmark("locationID",system);
+        assert!(warp_target(&ctx,"bookmark",bookmark).await.is_some());
+        set_bookmark("ownerID",ally as i64);
+        assert!(warp_target(&ctx,"bookmark",bookmark).await.is_none());
+        database.store.write(|tx|tx.delete_where("bookmarks",&["bookmarkID"],&[store::Value::Int(bookmark)])).unwrap();
         {
-            let mut world=database.world.lock();let park=world.parks.get_mut(&(system as i64)).unwrap();
+            let mut world=database.world.lock();let park=world.parks.get_mut(&system).unwrap();
             let ally_ship=park.ships.get_mut(&2).unwrap();ally_ship.pos.x=1_000.0;ally_ship.cloaked=false;
             park.ships.insert(3,ship(3,owner as i64+1_000_000,2_000.0));
         }
         let fleet_call=Call{service:"beyonce".into(),method:"WarpToStuff".into(),args:vec![],kwargs:vec![(Value::bytes("minRange"),Value::Int(0)),(Value::bytes("gang"),Value::Bool(true))]};
-        assert!(matches!(gang_warp(&ctx,system as i64,1,Order::Command(Command::Warp{target:Vec3::new(1.0e9,0.0,0.0),range:37.0}),&fleet_call),Outcome::Value(Value::None)));
+        assert!(matches!(gang_warp(&ctx,system,1,Order::Command(Command::Warp{target:Vec3::new(1.0e9,0.0,0.0),range:37.0}),&fleet_call),Outcome::Value(Value::None)));
         {
-            let mut world=database.world.lock();let park=world.parks.get_mut(&(system as i64)).unwrap();
+            let mut world=database.world.lock();let park=world.parks.get_mut(&system).unwrap();
             assert!(park.ships[&1].warping() && park.ships[&2].warping());
             assert_eq!(park.ships[&3].command,Command::Stop);
             park.command(1,Command::Stop);park.command(2,Command::Stop);
         }
         let member_session=crate::session::Session{char_id:Some(ally as i64),ship_id:Some(2),..session.clone()};
-        assert!(matches!(gang_warp(&database.ctx(&member_session),system as i64,2,Order::Command(Command::Warp{target:Vec3::new(1.0e9,0.0,0.0),range:37.0}),&fleet_call),Outcome::UserError{..}));
+        assert!(matches!(gang_warp(&database.ctx(&member_session),system,2,Order::Command(Command::Warp{target:Vec3::new(1.0e9,0.0,0.0),range:37.0}),&fleet_call),Outcome::UserError{..}));
         let call=Call{service:"beyonce".into(),method:"GotoDirection".into(),args:vec![Value::Double(f64::NAN),Value::Int(0),Value::Int(0)],kwargs:vec![]};
         assert!(matches!(movement(&ctx,&call).await,Outcome::UserError{..}));
         let stale_session=crate::session::Session{char_id:Some(ally as i64),..session.clone()};
-        assert!(matches!(steer(&database.ctx(&stale_session),system as i64,1,Order::Command(Command::Stop),"Stop"),Outcome::UserError{..}));
-        assert_eq!(database.world.lock().parks[&(system as i64)].ships[&1].command,Command::Stop);
+        assert!(matches!(steer(&database.ctx(&stale_session),system,1,Order::Command(Command::Stop),"Stop"),Outcome::UserError{..}));
+        assert_eq!(database.world.lock().parks[&system].ships[&1].command,Command::Stop);
     }
 }
 
@@ -1264,23 +1342,19 @@ pub struct Jump {
 }
 
 pub async fn resolve_jump(ctx: &Ctx<'_>, solar_system_id: i64, from_gate: i64, to_gate: i64) -> Option<Jump> {
-    let sql = r#"
-        SELECT d."solarSystemID", d."constellationID", d."regionID",
-               d."x", d."y", d."z", COALESCE(d."radius", 0)
-          FROM "mapJumps" j
-          JOIN "mapDenormalize" g ON g."itemID" = j."stargateID"
-          JOIN "mapDenormalize" d ON d."itemID" = j."celestialID"
-         WHERE j."stargateID" = $1 AND j."celestialID" = $2
-           AND g."solarSystemID" = $3 AND g."groupID" = $4"#;
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
-        [&(from_gate as i32), &(to_gate as i32), &(solar_system_id as i32), &(GROUP_STARGATE as i32)];
-    let r = ctx.query_one(sql, &params).await?;
-    let gate = Vec3::new(float(&r, 3)?, float(&r, 4)?, float(&r, 5)?);
-    Some(Jump {
-        solar_system_id: int(&r, 0)?,
-        constellation_id: int(&r, 1)?,
-        region_id: int(&r, 2)?,
-        arrival: arrival_point(gate, float(&r, 6).unwrap_or(0.0)),
+    // Only a gate pair mapJumps joins.
+    crate::sde::table("mapJumps").get("stargateID", from_gate).filter(|j| j.int("celestialID") == Some(to_gate))?;
+    ctx.store.read(|db| {
+        let map = db.table("mapDenormalize");
+        map.get_id(from_gate).filter(|g| g.int("solarSystemID") == Some(solar_system_id) && g.int("groupID") == Some(GROUP_STARGATE))?;
+        let d = map.get_id(to_gate)?;
+        let gate = Vec3::new(d.float("x")?, d.float("y")?, d.float("z")?);
+        Some(Jump {
+            solar_system_id: d.int("solarSystemID")?,
+            constellation_id: d.int("constellationID")?,
+            region_id: d.int("regionID")?,
+            arrival: arrival_point(gate, d.float("radius").unwrap_or(0.0)),
+        })
     })
 }
 
@@ -1305,17 +1379,19 @@ const UNDOCK_ALONG_MIN_COS: f64 = 0.25;
 /// undocking ship into the station; those leave straight out from the centre
 /// through the entry instead.
 pub async fn undock_point(ctx: &Ctx<'_>, station_id: i64) -> Option<(Vec3, Vec3)> {
-    let sql = r#"SELECT d."x", d."y", d."z",
-                        st."dockEntryX", st."dockEntryY", st."dockEntryZ",
-                        st."dockOrientationX", st."dockOrientationY", st."dockOrientationZ"
-                   FROM "staStations" s
-                   JOIN "mapDenormalize" d ON d."itemID" = s."stationID"
-                   LEFT JOIN "staStationTypes" st ON st."stationTypeID" = s."stationTypeID"
-                  WHERE s."stationID" = $1"#;
-    let r = ctx.query_one(sql, &[&(station_id as i32)]).await?;
-    let v = |i: usize| Vec3::new(float(&r, i).unwrap_or(0.0), float(&r, i + 1).unwrap_or(0.0), float(&r, i + 2).unwrap_or(0.0));
-    let (station, entry) = (v(0), v(3));
-    Some((station + entry, undock_heading(entry, v(6))))
+    let (station, station_type) = ctx.store.read(|db| {
+        let s = db.table("staStations").get_id(station_id)?;
+        let d = db.table("mapDenormalize").get_id(station_id)?;
+        Some((Vec3::new(d.float("x").unwrap_or(0.0), d.float("y").unwrap_or(0.0), d.float("z").unwrap_or(0.0)), s.int("stationTypeID")))
+    })?;
+    // A station type the static data does not know docks at the centre.
+    let st = station_type.and_then(|t| crate::sde::table("staStationTypes").get("stationTypeID", t));
+    let v = |[x, y, z]: [&str; 3]| {
+        let c = |col: &str| st.and_then(|s| s.float(col)).unwrap_or(0.0);
+        Vec3::new(c(x), c(y), c(z))
+    };
+    let entry = v(["dockEntryX", "dockEntryY", "dockEntryZ"]);
+    Some((station + entry, undock_heading(entry, v(["dockOrientationX", "dockOrientationY", "dockOrientationZ"]))))
 }
 
 /// See `undock_point`: the orientation if it leads away from the station,
