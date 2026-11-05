@@ -10004,6 +10004,66 @@
      "unique": true
     }
    ]
+  },
+  {
+   "name": "skillTraining",
+   "columns": [
+    {
+     "name": "characterID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "skillID",
+     "type": "integer",
+     "notNull": true
+    },
+    {
+     "name": "startedAt",
+     "type": "bigint",
+     "notNull": true
+    },
+    {
+     "name": "startPoints",
+     "type": "double",
+     "notNull": true
+    },
+    {
+     "name": "endsAt",
+     "type": "bigint",
+     "notNull": true
+    }
+   ],
+   "primaryKey": [
+    "characterID"
+   ],
+   "indexes": [
+    {
+     "name": "skillTraining_skill",
+     "columns": [
+      "skillID"
+     ],
+     "unique": true
+    },
+    {
+     "name": "skillTraining_due",
+     "columns": [
+      "endsAt"
+     ]
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "skillID"
+     ],
+     "references": "entity",
+     "referencedColumns": [
+      "itemID"
+     ],
+     "onDelete": "cascade"
+    }
+   ]
   }
  ]
 }

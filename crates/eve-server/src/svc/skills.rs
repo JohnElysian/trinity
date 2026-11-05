@@ -1,5 +1,5 @@
 use eve_marshal::Value;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::items::{ItemTxn, NewItem};
 use crate::services::{Call, Ctx, Outcome};
@@ -49,6 +49,15 @@ pub fn levels(
     Ok(out)
 }
 
+mod training;
+
+pub use training::run as run_training;
+
+/// At start, see `training::ensure`.
+pub fn ensure(tx: &mut crate::store::Tx<'_>) -> Result<(), StoreError> {
+    training::ensure(tx)
+}
+
 pub async fn skill_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     Some(method_call(&call.method, &call.args, ctx).await)
 }
@@ -56,109 +65,17 @@ pub async fn skill_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 async fn method_call(method: &str, args: &[Value], ctx: &Ctx<'_>) -> Outcome {
     let item_id = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
     match method {
-        "GetEndOfTraining" => Outcome::Value(end_of_training(ctx, item_id).await),
-        "CharStartTrainingSkill" => Outcome::Value(start_training(ctx, item_id).await),
-        "CharStopTrainingSkill" => Outcome::Value(stop_training(ctx, item_id).await),
+        "GetEndOfTraining" => {
+            let char_id = ctx.session.char_id.unwrap_or(0);
+            Outcome::Value(ctx.store.read(|db| training::end_of(db, char_id, item_id)).map_or(Value::None, Value::Long))
+        }
+        "CharStartTrainingSkill" => Outcome::Value(training::start(ctx, item_id).await),
+        "CharStopTrainingSkill" => Outcome::Value(training::stop(ctx, item_id).await),
         "CharAddImplant" => change_implant(ctx, item_id, false).await,
         "CharUseBooster" => super::boosters::consume(ctx,args).await,
         "RemoveImplantFromCharacter" => change_implant(ctx, item_id, true).await,
         _ => Outcome::Unknown(format!("{}::{}", SERVICE, method)),
     }
-}
-
-async fn end_of_training(ctx: &Ctx<'_>, skill_id: i64) -> Value {
-    let Some(char_id) = ctx.session.char_id else {
-        return Value::None;
-    };
-    let Some(it) = item(ctx, skill_id).await else {
-        return Value::None;
-    };
-    if it.owner_id != char_id || it.flag != FLAG_SKILL_IN_TRAINING {
-        return Value::None;
-    }
-    match training_eta(ctx, char_id, skill_id, it.type_id).await {
-        Some(eta) => Value::Long(eta),
-        None => Value::None,
-    }
-}
-
-async fn start_training(ctx: &Ctx<'_>, skill_id: i64) -> Value {
-    let Some(char_id) = ctx.session.char_id else {
-        return Value::None;
-    };
-    let Some(it) = item(ctx, skill_id).await else {
-        warn!("CharStartTrainingSkill: no item {skill_id}");
-        return Value::None;
-    };
-    if it.owner_id != char_id || it.category_id != CATEGORY_SKILL {
-        warn!("CharStartTrainingSkill: {skill_id} is not {char_id}'s skill");
-        return Value::None;
-    }
-    let level = attr(ctx, skill_id, it.type_id, ATTR_SKILL_LEVEL)
-        .await
-        .unwrap_or(0.0);
-    if level >= 5.0 {
-        return Value::None;
-    }
-
-    let halt = ctx.store.write(|tx| {
-        let training: Vec<store::RowId> = tx
-            .table("entity")
-            .find(&["ownerID"], &[store::Value::Int(char_id)])
-            .filter(|e| e.int("flag") == Some(i64::from(FLAG_SKILL_IN_TRAINING)) && e.int("itemID") != Some(skill_id))
-            .map(|e| e.id)
-            .collect();
-        for id in training {
-            tx.update("entity", id, &[("flag", store::Value::Int(i64::from(FLAG_SKILL)))])?;
-        }
-        Ok::<_, StoreError>(())
-    });
-    if let Err(e) = halt {
-        error!(
-            "CharStartTrainingSkill (halt): {err}",
-            err = crate::logging::chain(&e)
-        );
-        return Value::None;
-    }
-
-    let start = ctx.store.write(|tx| {
-        let skill = tx.table("entity").get_id(skill_id).filter(|e| e.int("ownerID") == Some(char_id)).map(|e| e.id);
-        if let Some(id) = skill {
-            tx.update("entity", id, &[("flag", store::Value::Int(i64::from(FLAG_SKILL_IN_TRAINING)))])?;
-        }
-        Ok::<_, StoreError>(())
-    });
-    if let Err(e) = start {
-        error!(
-            "CharStartTrainingSkill (start): {err}",
-            err = crate::logging::chain(&e)
-        );
-    }
-    Value::None
-}
-
-async fn stop_training(ctx: &Ctx<'_>, skill_id: i64) -> Value {
-    let Some(char_id) = ctx.session.char_id else {
-        return Value::None;
-    };
-    let stop = ctx.store.write(|tx| {
-        let skill = tx
-            .table("entity")
-            .get_id(skill_id)
-            .filter(|e| e.int("ownerID") == Some(char_id) && e.int("flag") == Some(i64::from(FLAG_SKILL_IN_TRAINING)))
-            .map(|e| e.id);
-        if let Some(id) = skill {
-            tx.update("entity", id, &[("flag", store::Value::Int(i64::from(FLAG_SKILL)))])?;
-        }
-        Ok::<_, StoreError>(())
-    });
-    if let Err(e) = stop {
-        error!(
-            "CharStopTrainingSkill: {err}",
-            err = crate::logging::chain(&e)
-        );
-    }
-    Value::None
 }
 
 async fn change_implant(ctx: &Ctx<'_>, item_id: i64, remove: bool) -> Outcome {
@@ -291,42 +208,6 @@ async fn refresh_implant_ship(ctx: &Ctx<'_>) {
     }
 }
 
-async fn training_eta(ctx: &Ctx<'_>, char_id: i64, skill_id: i64, type_id: i64) -> Option<i64> {
-    let stc = attr(ctx, skill_id, type_id, ATTR_SKILL_TIME_CONSTANT)
-        .await
-        .unwrap_or(0.0);
-    let sp = attr(ctx, skill_id, type_id, ATTR_SKILL_POINTS)
-        .await
-        .unwrap_or(0.0);
-    let level = attr(ctx, skill_id, type_id, ATTR_SKILL_LEVEL)
-        .await
-        .unwrap_or(0.0);
-    let sp_hi = sp_for_level(stc * 250.0, level)?;
-
-    let primary = attr(ctx, skill_id, type_id, ATTR_PRIMARY)
-        .await
-        .unwrap_or(0.0) as i32;
-    let secondary = attr(ctx, skill_id, type_id, ATTR_SECONDARY)
-        .await
-        .unwrap_or(0.0) as i32;
-    let mut spm = 0.0;
-    if primary != 0 {
-        spm += char_attr(ctx, char_id, primary).await;
-    }
-    if secondary != 0 {
-        spm += char_attr(ctx, char_id, secondary).await / 2.0;
-    }
-    if spm.is_nan() || spm <= 0.0 {
-        return None;
-    }
-
-    let minutes = ((sp_hi - sp) / spm).max(0.0);
-    if !minutes.is_finite() {
-        return None;
-    }
-    Some(crate::bulkdata::filetime_now() + (minutes * 60.0 * 10_000_000.0) as i64)
-}
-
 fn sp_for_level(stc: f64, level: f64) -> Option<f64> {
     if level >= 5.0 {
         None
@@ -337,29 +218,6 @@ fn sp_for_level(stc: f64, level: f64) -> Option<f64> {
     } else {
         Some(stc * 2.0f64.powf(2.5 * level))
     }
-}
-
-struct Item {
-    type_id: i64,
-    owner_id: i64,
-    flag: i32,
-    category_id: i32,
-}
-
-async fn item(ctx: &Ctx<'_>, item_id: i64) -> Option<Item> {
-    let (type_id, owner_id, flag) = ctx.store.read(|db| {
-        let r = db.table("entity").get_id(item_id)?;
-        Some((r.int("typeID").unwrap_or(0), r.int("ownerID").unwrap_or(0), r.int("flag").unwrap_or(0)))
-    })?;
-    // An item of a type the static data does not know (or whose group it
-    // does not know) is none, as joining on it found none.
-    let (_, category_id) = crate::sde::get().group_and_category(type_id)?;
-    Some(Item {
-        type_id,
-        owner_id,
-        flag: flag as i32,
-        category_id: category_id as i32,
-    })
 }
 
 #[cfg(test)]
@@ -609,34 +467,3 @@ fn own_attr(db: &Db, item_id: i64, attribute_id: i32) -> Option<f64> {
     row.float("valueFloat").or_else(|| row.float("valueInt"))
 }
 
-async fn attr(ctx: &Ctx<'_>, item_id: i64, type_id: i64, attribute_id: i32) -> Option<f64> {
-    // The item's own value, else its type's, else the attribute's default.
-    ctx.store.read(|db| own_attr(db, item_id, attribute_id)).or_else(|| {
-        crate::sde::get().type_attribute(type_id, attribute_id).or_else(|| {
-            crate::sde::table("dgmAttributeTypes").get("attributeID", attribute_id as i64)?.float("defaultValue")
-        })
-    })
-}
-
-async fn char_attr(ctx: &Ctx<'_>, char_id: i64, attribute_id: i32) -> f64 {
-    if let Some(v) = ctx.store.read(|db| own_attr(db, char_id, attribute_id)) {
-        return v;
-    }
-
-    let column = match attribute_id {
-        164 => "charisma",
-        165 => "intelligence",
-        166 => "memory",
-        167 => "perception",
-        168 => "willpower",
-        _ => return 0.0,
-    };
-    let bloodline = ctx.store.read(|db| db.table("character_").get_id(char_id).and_then(|c| c.int("bloodlineID")));
-    // A bloodline the static data does not know gives nothing, as joining
-    // on it found nothing.
-    bloodline
-        .and_then(|b| crate::sde::table("chrBloodlines").get("bloodlineID", b))
-        .and_then(|b| b.int(column))
-        .map(|v| v as f64)
-        .unwrap_or(0.0)
-}

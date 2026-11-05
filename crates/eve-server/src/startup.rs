@@ -87,6 +87,7 @@ pub fn ensure(store: &Store, t: &Tables) -> Result<(), StoreError> {
         crate::svc::outposts::ensure_management_schema(tx)?;
         crate::svc::corp::ensure_office_schema(tx)?;
         crate::conn::logout::ensure(tx)?;
+        crate::svc::skills::ensure(tx)?;
         timed("module fix-ups", s);
         Ok(())
     })

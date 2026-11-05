@@ -215,7 +215,8 @@ pub(super) fn write_snapshot(dir: &Path, generation: u64, db: &Db) -> Result<(),
     serde_json::to_writer(&mut out, &json!({ "sequences": sequences_json(db) })).map_err(|e| e.to_string())?;
     out.write_all(b"\n").map_err(io)?;
     for t in &db.tables {
-        serde_json::to_writer(&mut out, &json!({ "table": &*t.def.name, "rows": t.len() })).map_err(|e| e.to_string())?;
+        let columns: Vec<&str> = t.def.columns.iter().map(|c| &*c.name).collect();
+        serde_json::to_writer(&mut out, &json!({ "table": &*t.def.name, "rows": t.len(), "columns": columns })).map_err(|e| e.to_string())?;
         out.write_all(b"\n").map_err(io)?;
         for r in t.rows() {
             serde_json::to_writer(&mut out, &encode_row(r.cells())).map_err(|e| e.to_string())?;
@@ -234,29 +235,58 @@ pub(super) fn write_snapshot(dir: &Path, generation: u64, db: &Db) -> Result<(),
 fn read_snapshot(path: &Path, db: &mut Db) -> Result<(), String> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut lines = BufReader::new(GzDecoder::new(file)).lines();
-    let mut next = || -> Result<Json, String> {
-        let line = lines.next().ok_or("the snapshot ends early")?.map_err(|e| e.to_string())?;
-        serde_json::from_str(&line).map_err(|e| e.to_string())
+    // None at the end of the file.
+    let mut next = || -> Result<Option<Json>, String> {
+        match lines.next() {
+            None => Ok(None),
+            Some(line) => serde_json::from_str(&line.map_err(|e| e.to_string())?).map(Some).map_err(|e| e.to_string()),
+        }
     };
-    let head = next()?;
+    let head = next()?.ok_or("an empty snapshot")?;
     for (k, v) in head["sequences"].as_object().ok_or("a snapshot without sequences")? {
         if let Some(slot) = db.sequences.get_mut(k.as_str()) {
             *slot = v.as_i64();
         }
     }
-    for _ in 0..db.tables.len() {
-        let head = next()?;
+    // The tables, to the end of the file (a snapshot is renamed into place
+    // whole, so its end is the end of its tables). A table the schema no
+    // longer has is skipped; one it gained since starts empty.
+    while let Some(head) = next()? {
         let name = head["table"].as_str().ok_or("a table without a name")?;
         let rows = head["rows"].as_u64().ok_or("a table without a row count")?;
-        // A table the schema no longer has is skipped; one it gained since
-        // starts empty.
         let t = db.tables.iter().position(|t| &*t.def.name == name);
-        for _ in 0..rows {
-            let row = next()?;
-            if let Some(t) = t {
-                let def = db.tables[t].def.clone();
-                db.table_mut(t).put(None, decode_row(&def, &row)?);
+        // Where each of the schema's columns is in the snapshot's rows: by
+        // name where the snapshot names them (a column gained since takes
+        // its default, one dropped is skipped), else in the schema's order.
+        let layout: Option<Vec<Option<usize>>> = match (t, head.get("columns").and_then(Json::as_array)) {
+            (Some(t), Some(names)) => {
+                let names: Vec<&str> = names.iter().filter_map(Json::as_str).collect();
+                Some(db.tables[t].def.columns.iter().map(|c| names.iter().position(|n| *n == &*c.name)).collect())
             }
+            _ => None,
+        };
+        for _ in 0..rows {
+            let row = next()?.ok_or("the snapshot ends inside a table")?;
+            let Some(t) = t else { continue };
+            let def = db.tables[t].def.clone();
+            let cells = match &layout {
+                None => decode_row(&def, &row)?,
+                Some(layout) => {
+                    let values = row.as_array().ok_or("a row is not an array")?;
+                    let mut cells = Vec::with_capacity(def.columns.len());
+                    for (col, from) in def.columns.iter().zip(layout) {
+                        cells.push(match from {
+                            Some(i) => decode_value(values.get(*i).unwrap_or(&Json::Null), col.ty).map_err(|e| format!("{}.{}: {e}", def.name, col.name))?,
+                            None => match &col.default {
+                                Some(super::schema::Default::Value(v)) => v.clone(),
+                                _ => Value::Null,
+                            },
+                        });
+                    }
+                    cells.into()
+                }
+            };
+            db.table_mut(t).put(None, cells);
         }
     }
     Ok(())

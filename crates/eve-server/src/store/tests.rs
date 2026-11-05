@@ -210,6 +210,45 @@ fn committed_data_survives_a_restart_and_a_torn_log_line() {
     drop(store);
     let store = Store::open(&dir, || panic!("the data is there")).unwrap();
     assert_eq!(store.read(|db| db.table("entity").get_id(900).unwrap().int("flag")), Some(5));
+    // A snapshot of fewer tables and columns than the schema has now (one
+    // written before they were added) reads, the new ones empty/defaulted.
+    store.checkpoint().unwrap();
+    {
+        let snap = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.to_string_lossy().ends_with(".json.gz")).max().unwrap();
+        let text = { let mut t = String::new(); std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(std::fs::File::open(&snap).unwrap()), &mut t).unwrap(); t };
+        let mut kept = Vec::new();
+        let mut lines = text.lines();
+        kept.push(lines.next().unwrap().to_string());
+        while let Some(head) = lines.next() {
+            let h: serde_json::Value = serde_json::from_str(head).unwrap();
+            let rows: Vec<&str> = (0..h["rows"].as_u64().unwrap()).map(|_| lines.next().unwrap()).collect();
+            match h["table"].as_str().unwrap() {
+                "skillTraining" => continue,
+                "entity" => {
+                    // Without its last column, as if it were added since.
+                    let mut h = h.clone();
+                    let cols = h["columns"].as_array_mut().unwrap();
+                    cols.pop();
+                    kept.push(h.to_string());
+                    for r in rows {
+                        let mut r: Vec<serde_json::Value> = serde_json::from_str(r).unwrap();
+                        r.pop();
+                        kept.push(serde_json::Value::Array(r).to_string());
+                    }
+                }
+                _ => {
+                    kept.push(head.to_string());
+                    kept.extend(rows.iter().map(|r| r.to_string()));
+                }
+            }
+        }
+        let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(&snap).unwrap(), flate2::Compression::fast());
+        gz.write_all((kept.join("\n") + "\n").as_bytes()).unwrap();
+        gz.finish().unwrap();
+    }
+    drop(store);
+    let store = Store::open(&dir, || panic!("the data is there")).unwrap();
+    assert_eq!(store.read(|db| db.table("entity").get_id(900).unwrap().int("flag")), Some(5));
     // And again, after a snapshot and more changes.
     store.checkpoint().unwrap();
     store.write(|tx| { let id = tx.table("entity").get_id(901).unwrap().id; tx.delete("entity", id) }).unwrap();
