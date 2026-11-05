@@ -699,6 +699,40 @@ pub fn stacking_penalised(factors: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_hold_is_its_type_capacity_and_a_cargo_expander_grows_it() {
+        use crate::store::{StoreError, Value as V};
+        let fixture = crate::test_support::Database::load().await;
+        let (pilot, ship, expander) = (fixture.id().await as i64, fixture.id().await as i64, fixture.id().await as i64);
+        fixture.store.write(|tx| -> Result<(), StoreError> {
+            let item = |id: i64, type_id: i64, location: i64, flag: i64| {
+                [("itemID", V::Int(id)), ("typeID", V::Int(type_id)), ("ownerID", V::Int(pilot)), ("locationID", V::Int(location)),
+                    ("flag", V::Int(flag)), ("quantity", V::Int(1)), ("singleton", V::Int(1))]
+            };
+            tx.insert("entity", &item(pilot, 1373, 60014689, 0))?;
+            tx.insert("entity", &item(ship, 606, 60014689, 4))?;
+            Ok(())
+        })
+        .unwrap();
+        let capacity = |fixture: &crate::test_support::Database| {
+            fixture.store.read(|db| {
+                let loadout = Loadout::load(db, &fixture.dogma, pilot, Some(ship), &HashSet::new()).unwrap();
+                loadout.value(loadout.find(ship).unwrap(), 38)
+            })
+        };
+        // The Velator's 120 m3 comes from invTypes, not dgmTypeAttributes.
+        assert_eq!(capacity(&fixture), 120.0);
+        fixture.store.write(|tx| -> Result<(), StoreError> {
+            tx.insert("entity", &[("itemID", V::Int(expander)), ("typeID", V::Int(1317)), ("ownerID", V::Int(pilot)), ("locationID", V::Int(ship)),
+                ("flag", V::Int(11)), ("quantity", V::Int(1)), ("singleton", V::Int(1))])?;
+            tx.insert("entity_attributes", &[("itemID", V::Int(expander)), ("attributeID", V::Int(attr::IS_ONLINE as i64)), ("valueInt", V::Int(1))])?;
+            Ok(())
+        })
+        .unwrap();
+        // An online Expanded Cargohold I multiplies it by 1.175.
+        assert!((capacity(&fixture) - 141.0).abs() < 1e-9);
+    }
+
     #[test]
     fn the_strongest_bonus_counts_in_full_and_the_rest_less() {
         let one = stacking_penalised(&[1.1]);

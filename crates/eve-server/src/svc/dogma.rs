@@ -407,6 +407,14 @@ fn attributes_for(
                 out.entry(item).or_default().insert(attr, v);
             }
         }
+        // The attributes invTypes keeps as columns (a hold's capacity): the
+        // client reads a live item's from what it is sent, with 0 for none.
+        let sde = crate::sde::get();
+        for (attr, _) in crate::sde::TYPE_COLUMN_ATTRIBUTES {
+            if let Some(v) = sde.type_attribute(type_id, *attr) {
+                out.entry(item).or_default().entry(*attr).or_insert(v);
+            }
+        }
     }
     out
 }

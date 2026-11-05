@@ -195,6 +195,9 @@ fn read_tables() -> Result<Tables, String> {
     })
 }
 
+/// The attributes invTypes keeps as columns (attributeCategory 9).
+pub const TYPE_COLUMN_ATTRIBUTES: &[(i32, &str)] = &[(4, "mass"), (38, "capacity"), (161, "volume"), (162, "radius"), (195, "raceID")];
+
 fn key(id: i64) -> Option<i32> {
     i32::try_from(id).ok()
 }
@@ -254,6 +257,22 @@ impl Sde {
         for r in t("dgmTypeAttributes")?.rows() {
             if let Some(v) = r.float("valueFloat").or_else(|| r.float("valueInt")) {
                 type_attributes.entry(int32(&r, "typeID")?).or_default().push((int32(&r, "attributeID")?, v));
+            }
+        }
+        // Mass, capacity, volume, radius and race are attributes too, kept in
+        // invTypes' columns rather than dgmTypeAttributes (attributeCategory
+        // 9): an item's cargo hold is its capacity attribute, which cargo
+        // expanders modify.
+        for r in t("invTypes")?.rows() {
+            let Some(type_id) = r.int("typeID") else { continue };
+            let attrs = type_attributes.entry(type_id as i32).or_default();
+            for (attr, column) in TYPE_COLUMN_ATTRIBUTES {
+                let value = if *column == "raceID" { r.int(column).map(|v| v as f64) } else { r.float(column) };
+                if let Some(v) = value {
+                    if !attrs.iter().any(|(a, _)| a == attr) {
+                        attrs.push((*attr, v));
+                    }
+                }
             }
         }
         let mut type_effects: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -455,6 +474,9 @@ mod tests {
         assert!(sde.types_in_category(6).contains(&587));
         assert_eq!(&*sde.group(25).unwrap().name, "Frigate");
         assert_eq!(sde.type_attribute(587, 9), Some(336.0));
+        // The Velator's cargo hold, from invTypes' capacity column.
+        assert_eq!(sde.type_attribute(606, 38), Some(120.0));
+        assert!(sde.type_attribute(606, 4).is_some_and(|m| m > 0.0));
         assert_eq!(&*sde.effect(234).unwrap().name, "warpdriveoperationSkillBoostWarpCapacitorNeedBonus");
         assert!(sde.effect_modifiers("warpdriveoperationSkillBoostWarpCapacitorNeedBonus").any(|m| m.type_id == 3455));
         assert!(sde.attribute_types().any(|(id, _)| id == 2));
